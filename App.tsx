@@ -20,11 +20,16 @@
  *   - The notification has a "Stop" action so the user can stop recording without ever
  *     opening the app again.
  *   - The JS side is purely informational; if the JS thread dies, recording continues.
+ *
+ * Event delivery + polling fallback:
+ *   - Native events (location / duration / state / saved / error) are delivered via
+ *     DeviceEventEmitter.
+ *   - As a reliability fallback, we also poll GpsRecorder.getState() every 2 seconds
+ *     while recording. This guarantees the UI stays in sync even if events are dropped.
  */
 
 import React, { useEffect, useRef, useState, useCallback } from 'react';
 import {
-  Alert,
   AppState,
   Platform,
   Pressable,
@@ -41,6 +46,7 @@ import {
   type GpsLocationEvent,
   type GpsStateEvent,
   type GpsSavedEvent,
+  type GpsFullState,
 } from './src/NativeGpsRecorder';
 
 type RecordingState = 'idle' | 'recording' | 'stopping';
@@ -68,31 +74,55 @@ function App(): React.ReactElement {
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const startTimeRef = useRef<number | null>(null);
 
-  // On mount: check permissions + sync UI with whatever the service is doing
-  // (in case the app was killed and reopened while recording was still active).
+  // Sync state from native via getState(). Called on mount, on foreground, and every 2s.
+  const syncStateFromNative = useCallback(async () => {
+    try {
+      const state: GpsFullState = await GpsRecorder.getState();
+      if (state.isRecording) {
+        setRecordingState((prev) => (prev === 'stopping' ? prev : 'recording'));
+        setPointCount(state.pointCount);
+        setElapsedMs(state.elapsedMs);
+        if (state.lastFix) {
+          setLastFix(state.lastFix);
+        }
+        if (startTimeRef.current == null) {
+          startTimeRef.current = Date.now() - state.elapsedMs;
+        }
+      } else {
+        setRecordingState((prev) => (prev === 'stopping' ? prev : 'idle'));
+      }
+    } catch {
+      // ignore — will retry on next poll
+    }
+  }, []);
+
   useEffect(() => {
     let mounted = true;
 
     (async () => {
       try {
-        const granted = await GpsRecorder.hasPermissions();
+        // Auto-request permissions on first launch.
+        let granted = await GpsRecorder.hasPermissions();
+        if (!granted) {
+          await GpsRecorder.requestPermissions();
+          await new Promise((r) => setTimeout(r, 800));
+          granted = await GpsRecorder.hasPermissions();
+        }
         if (!mounted) return;
         setHasPermissions(granted);
-
-        const isRec = await GpsRecorder.isRecording();
-        if (!mounted) return;
-        if (isRec) {
-          setRecordingState('recording');
-        }
-      } catch (e) {
+        await syncStateFromNative();
+      } catch {
         // ignore
       }
     })();
 
-    // Subscriptions
+    // Event subscriptions (real-time updates)
     const subs = [
       subscribe('location', (ev: GpsLocationEvent) => {
         setLastFix(ev);
+        if (ev.pointCount != null) {
+          setPointCount(ev.pointCount);
+        }
       }),
       subscribe('duration', (ev) => {
         setElapsedMs(ev.elapsedMs);
@@ -117,56 +147,50 @@ function App(): React.ReactElement {
         setLastSavedPath(ev.filePath);
         setPointCount(0);
         setElapsedMs(0);
+        setLastFix(null);
         setRecordingState('idle');
         startTimeRef.current = null;
       }),
       subscribe('error', (ev) => {
         setErrorMsg(ev.message);
-        // An error during recording usually means the service stopped itself.
         setRecordingState('idle');
       }),
     ];
 
-    // If the app is launched fresh while a recording is in progress, our local
-    // 'elapsedMs' state will be stale until the next duration tick (1s). Listen for
-    // AppState changes and re-sync if we come back to the foreground.
-    const sub = AppState.addEventListener('change', (state) => {
+    // Re-sync when coming back to foreground
+    const appStateSub = AppState.addEventListener('change', (state) => {
       if (state === 'active') {
-        GpsRecorder.isRecording().then((rec) => {
-          if (rec) setRecordingState('recording');
-        });
+        syncStateFromNative();
         GpsRecorder.hasPermissions().then(setHasPermissions);
       }
     });
 
+    // Polling fallback: every 2 seconds, sync state from native.
+    // This guarantees point count / latest fix / duration are always fresh
+    // even if the event emitter drops events.
+    const pollInterval = setInterval(() => {
+      syncStateFromNative();
+    }, 2000);
+
     return () => {
       mounted = false;
       subs.forEach((s) => s.remove());
-      sub.remove();
+      appStateSub.remove();
+      clearInterval(pollInterval);
     };
-  }, []);
+  }, [syncStateFromNative]);
 
   const handleStart = useCallback(async () => {
     setErrorMsg(null);
     try {
       let granted = await GpsRecorder.hasPermissions();
       if (!granted) {
-        granted = await GpsRecorder.requestPermissions();
-        // requestPermissions returns whether permissions are already granted; the actual
-        // dialog is async. We'll re-check in a moment.
-        setTimeout(async () => {
-          const ok = await GpsRecorder.hasPermissions();
-          setHasPermissions(ok);
-        }, 500);
-      }
-      setHasPermissions(granted);
-      if (!granted) {
-        // Still let the user try; the service will emit an 'error' event if it can't start.
-        // This way they see a clear error message.
+        await GpsRecorder.requestPermissions();
+        await new Promise((r) => setTimeout(r, 800));
+        granted = await GpsRecorder.hasPermissions();
+        setHasPermissions(granted);
       }
 
-      // Best-effort: ask the user to disable battery optimizations. If they decline,
-      // recording still works, it's just less reliable on some devices during Doze.
       try {
         await GpsRecorder.requestIgnoreBatteryOptimizations();
       } catch {
@@ -181,29 +205,29 @@ function App(): React.ReactElement {
 
       await GpsRecorder.start();
       setRecordingState('recording');
+      syncStateFromNative();
     } catch (e: any) {
       setErrorMsg(e?.message ?? String(e));
       setRecordingState('idle');
     }
-  }, []);
+  }, [syncStateFromNative]);
 
   const handleStop = useCallback(async () => {
     setErrorMsg(null);
     setRecordingState('stopping');
     try {
       await GpsRecorder.stop();
-      // The 'saved' event will set recordingState back to 'idle' and update lastSavedPath.
+      setTimeout(() => syncStateFromNative(), 1000);
     } catch (e: any) {
       setErrorMsg(e?.message ?? String(e));
       setRecordingState('recording');
     }
-  }, []);
+  }, [syncStateFromNative]);
 
   const handleGrantPermissions = useCallback(async () => {
     await GpsRecorder.requestPermissions();
-    setTimeout(async () => {
-      setHasPermissions(await GpsRecorder.hasPermissions());
-    }, 500);
+    await new Promise((r) => setTimeout(r, 800));
+    setHasPermissions(await GpsRecorder.hasPermissions());
   }, []);
 
   const isRecording = recordingState === 'recording';
@@ -333,212 +357,72 @@ function StatCard({ label, value }: { label: string; value: string }): React.Rea
 }
 
 const styles = StyleSheet.create({
-  container: {
-    flex: 1,
-    backgroundColor: '#0F172A',
-  },
-  scrollContent: {
-    padding: 20,
-    paddingBottom: 60,
-  },
-  header: {
-    alignItems: 'center',
-    marginTop: 8,
-    marginBottom: 24,
-  },
-  headerTitle: {
-    fontSize: 28,
-    fontWeight: '700',
-    color: '#F8FAFC',
-    letterSpacing: 0.5,
-  },
-  headerSubtitle: {
-    fontSize: 13,
-    color: '#94A3B8',
-    marginTop: 4,
-  },
-  durationCard: {
-    alignItems: 'center',
-    marginBottom: 24,
-  },
-  durationLabel: {
-    fontSize: 12,
-    color: '#64748B',
-    letterSpacing: 2,
-    fontWeight: '600',
-  },
+  container: { flex: 1, backgroundColor: '#0F172A' },
+  scrollContent: { padding: 20, paddingBottom: 60 },
+  header: { alignItems: 'center', marginTop: 8, marginBottom: 24 },
+  headerTitle: { fontSize: 28, fontWeight: '700', color: '#F8FAFC', letterSpacing: 0.5 },
+  headerSubtitle: { fontSize: 13, color: '#94A3B8', marginTop: 4 },
+  durationCard: { alignItems: 'center', marginBottom: 24 },
+  durationLabel: { fontSize: 12, color: '#64748B', letterSpacing: 2, fontWeight: '600' },
   durationValue: {
-    fontSize: 64,
-    color: '#F8FAFC',
-    fontWeight: '200',
-    fontVariant: ['tabular-nums'],
-    marginVertical: 4,
+    fontSize: 64, color: '#F8FAFC', fontWeight: '200',
+    fontVariant: ['tabular-nums'], marginVertical: 4,
   },
   statusPill: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    paddingHorizontal: 12,
-    paddingVertical: 6,
-    borderRadius: 16,
-    marginTop: 8,
+    flexDirection: 'row', alignItems: 'center',
+    paddingHorizontal: 12, paddingVertical: 6, borderRadius: 16, marginTop: 8,
   },
-  statusPillOn: {
-    backgroundColor: 'rgba(34, 197, 94, 0.18)',
-  },
-  statusPillOff: {
-    backgroundColor: 'rgba(148, 163, 184, 0.15)',
-  },
-  statusDot: {
-    width: 8,
-    height: 8,
-    borderRadius: 4,
-    marginRight: 6,
-  },
-  dotOn: {
-    backgroundColor: '#22C55E',
-  },
-  dotOff: {
-    backgroundColor: '#64748B',
-  },
-  statusText: {
-    color: '#E2E8F0',
-    fontSize: 11,
-    fontWeight: '700',
-    letterSpacing: 1.5,
-  },
+  statusPillOn: { backgroundColor: 'rgba(34, 197, 94, 0.18)' },
+  statusPillOff: { backgroundColor: 'rgba(148, 163, 184, 0.15)' },
+  statusDot: { width: 8, height: 8, borderRadius: 4, marginRight: 6 },
+  dotOn: { backgroundColor: '#22C55E' },
+  dotOff: { backgroundColor: '#64748B' },
+  statusText: { color: '#E2E8F0', fontSize: 11, fontWeight: '700', letterSpacing: 1.5 },
   bigButton: {
-    height: 220,
-    borderRadius: 110,
-    alignItems: 'center',
-    justifyContent: 'center',
-    marginVertical: 16,
-    elevation: 8,
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 6 },
-    shadowOpacity: 0.3,
-    shadowRadius: 12,
+    height: 220, borderRadius: 110, alignItems: 'center', justifyContent: 'center',
+    marginVertical: 16, elevation: 8,
+    shadowColor: '#000', shadowOffset: { width: 0, height: 6 },
+    shadowOpacity: 0.3, shadowRadius: 12,
   },
-  bigButtonStart: {
-    backgroundColor: '#22C55E',
-  },
-  bigButtonStop: {
-    backgroundColor: '#EF4444',
-  },
-  bigButtonPressed: {
-    transform: [{ scale: 0.98 }],
-  },
-  bigButtonStopping: {
-    backgroundColor: '#64748B',
-  },
-  bigButtonText: {
-    color: '#FFFFFF',
-    fontSize: 36,
-    fontWeight: '800',
-    letterSpacing: 4,
-  },
+  bigButtonStart: { backgroundColor: '#22C55E' },
+  bigButtonStop: { backgroundColor: '#EF4444' },
+  bigButtonPressed: { transform: [{ scale: 0.98 }] },
+  bigButtonStopping: { backgroundColor: '#64748B' },
+  bigButtonText: { color: '#FFFFFF', fontSize: 36, fontWeight: '800', letterSpacing: 4 },
   permissionButton: {
-    backgroundColor: '#1E293B',
-    borderRadius: 12,
-    paddingVertical: 14,
-    alignItems: 'center',
-    marginBottom: 16,
-    borderWidth: 1,
-    borderColor: '#334155',
+    backgroundColor: '#1E293B', borderRadius: 12, paddingVertical: 14,
+    alignItems: 'center', marginBottom: 16, borderWidth: 1, borderColor: '#334155',
   },
-  permissionButtonText: {
-    color: '#F8FAFC',
-    fontSize: 14,
-    fontWeight: '600',
-  },
-  statsGrid: {
-    flexDirection: 'row',
-    gap: 10,
-    marginBottom: 16,
-  },
+  permissionButtonText: { color: '#F8FAFC', fontSize: 14, fontWeight: '600' },
+  statsGrid: { flexDirection: 'row', gap: 10, marginBottom: 16 },
   statCard: {
-    flex: 1,
-    backgroundColor: '#1E293B',
-    borderRadius: 12,
-    padding: 14,
-    alignItems: 'center',
+    flex: 1, backgroundColor: '#1E293B', borderRadius: 12, padding: 14, alignItems: 'center',
   },
-  statLabel: {
-    fontSize: 10,
-    color: '#64748B',
-    letterSpacing: 1.5,
-    fontWeight: '600',
-  },
+  statLabel: { fontSize: 10, color: '#64748B', letterSpacing: 1.5, fontWeight: '600' },
   statValue: {
-    fontSize: 20,
-    color: '#F8FAFC',
-    fontWeight: '600',
-    marginTop: 4,
+    fontSize: 20, color: '#F8FAFC', fontWeight: '600', marginTop: 4,
     fontVariant: ['tabular-nums'],
   },
-  fixCard: {
-    backgroundColor: '#1E293B',
-    borderRadius: 12,
-    padding: 16,
-    marginBottom: 16,
-  },
-  fixTitle: {
-    fontSize: 11,
-    color: '#64748B',
-    letterSpacing: 1.5,
-    fontWeight: '700',
-    marginBottom: 8,
-  },
-  fixLine: {
-    fontSize: 14,
-    color: '#E2E8F0',
-    marginVertical: 2,
-    fontVariant: ['tabular-nums'],
-  },
-  fixLabel: {
-    color: '#64748B',
-    fontWeight: '600',
-  },
+  fixCard: { backgroundColor: '#1E293B', borderRadius: 12, padding: 16, marginBottom: 16 },
+  fixTitle: { fontSize: 11, color: '#64748B', letterSpacing: 1.5, fontWeight: '700', marginBottom: 8 },
+  fixLine: { fontSize: 14, color: '#E2E8F0', marginVertical: 2, fontVariant: ['tabular-nums'] },
+  fixLabel: { color: '#64748B', fontWeight: '600' },
   savedCard: {
-    backgroundColor: '#1E293B',
-    borderRadius: 12,
-    padding: 16,
-    marginBottom: 16,
-    borderWidth: 1,
-    borderColor: '#334155',
+    backgroundColor: '#1E293B', borderRadius: 12, padding: 16, marginBottom: 16,
+    borderWidth: 1, borderColor: '#334155',
   },
-  savedTitle: {
-    fontSize: 11,
-    color: '#22C55E',
-    letterSpacing: 1.5,
-    fontWeight: '700',
-    marginBottom: 6,
-  },
+  savedTitle: { fontSize: 11, color: '#22C55E', letterSpacing: 1.5, fontWeight: '700', marginBottom: 6 },
   savedPath: {
-    fontSize: 13,
-    color: '#E2E8F0',
+    fontSize: 13, color: '#E2E8F0',
     fontFamily: Platform.select({ ios: 'Menlo', android: 'monospace' }),
   },
   errorCard: {
-    backgroundColor: 'rgba(239, 68, 68, 0.12)',
-    borderRadius: 12,
-    padding: 14,
-    marginBottom: 16,
-    borderWidth: 1,
-    borderColor: 'rgba(239, 68, 68, 0.4)',
+    backgroundColor: 'rgba(239, 68, 68, 0.12)', borderRadius: 12, padding: 14,
+    marginBottom: 16, borderWidth: 1, borderColor: 'rgba(239, 68, 68, 0.4)',
   },
-  errorText: {
-    color: '#FCA5A5',
-    fontSize: 13,
-  },
-  footerNote: {
-    marginTop: 8,
-  },
-  footerText: {
-    color: '#475569',
-    fontSize: 12,
-    lineHeight: 18,
-    textAlign: 'center',
-  },
+  errorText: { color: '#FCA5A5', fontSize: 13 },
+  footerNote: { marginTop: 8 },
+  footerText: { color: '#475569', fontSize: 12, lineHeight: 18, textAlign: 'center' },
 });
 
 export default App;

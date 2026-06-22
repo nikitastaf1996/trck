@@ -47,7 +47,7 @@ class GpsRecorderModule(private val reactContext: ReactApplicationContext) :
         @Volatile private var instance: GpsRecorderModule? = null
 
         // ---- Event emitters called from GpsRecorderService ----
-        fun emitLocation(lat: Double, lon: Double, alt: Double?, speed: Float?, accuracy: Float?, timestamp: Long) {
+        fun emitLocation(lat: Double, lon: Double, alt: Double?, speed: Float?, accuracy: Float?, timestamp: Long, pointCount: Int) {
             val module = instance ?: return
             val map = Arguments.createMap().apply {
                 putDouble("lat", lat)
@@ -56,6 +56,7 @@ class GpsRecorderModule(private val reactContext: ReactApplicationContext) :
                 if (speed != null) putDouble("speed", speed.toDouble()) else putNull("speed")
                 if (accuracy != null) putDouble("accuracy", accuracy.toDouble()) else putNull("accuracy")
                 putDouble("timestamp", timestamp.toDouble())
+                putInt("pointCount", pointCount)
             }
             module.send("location", map)
         }
@@ -142,6 +143,50 @@ class GpsRecorderModule(private val reactContext: ReactApplicationContext) :
     fun isRecording(promise: Promise) {
         val prefs = reactContext.getSharedPreferences("gps_recorder_state", Context.MODE_PRIVATE)
         promise.resolve(prefs.getBoolean("is_recording", false))
+    }
+
+    /**
+     * Returns the current recording state, point count, elapsed time, and last GPS fix.
+     * JS calls this on mount and every 2 seconds while recording as a reliable fallback
+     * in case the event emitter is not delivering events.
+     */
+    @ReactMethod
+    fun getState(promise: Promise) {
+        try {
+            val prefs = reactContext.getSharedPreferences("gps_recorder_state", Context.MODE_PRIVATE)
+            val isRec = prefs.getBoolean("is_recording", false)
+            val startTime = prefs.getLong("start_time_ms", 0L)
+            val count = prefs.getInt("point_count", 0)
+            val elapsed = if (isRec && startTime > 0) System.currentTimeMillis() - startTime else 0L
+
+            val map = Arguments.createMap().apply {
+                putBoolean("isRecording", isRec)
+                putInt("pointCount", count)
+                putDouble("elapsedMs", elapsed.toDouble())
+
+                val lastLat = prefs.getString("last_lat", null)
+                val lastLon = prefs.getString("last_lon", null)
+                if (lastLat != null && lastLon != null) {
+                    val fix = Arguments.createMap().apply {
+                        putDouble("lat", lastLat.toDouble())
+                        putDouble("lon", lastLon.toDouble())
+                        val alt = prefs.getString("last_alt", "")?.takeIf { it.isNotEmpty() }
+                        if (alt != null) putDouble("alt", alt.toDouble()) else putNull("alt")
+                        val spd = prefs.getString("last_speed", "")?.takeIf { it.isNotEmpty() }
+                        if (spd != null) putDouble("speed", spd.toDouble()) else putNull("speed")
+                        val acc = prefs.getString("last_accuracy", "")?.takeIf { it.isNotEmpty() }
+                        if (acc != null) putDouble("accuracy", acc.toDouble()) else putNull("accuracy")
+                        putDouble("timestamp", prefs.getLong("last_time_ms", 0L).toDouble())
+                    }
+                    putMap("lastFix", fix)
+                } else {
+                    putNull("lastFix")
+                }
+            }
+            promise.resolve(map)
+        } catch (e: Exception) {
+            promise.reject("E_STATE", e.message ?: "getState error", e)
+        }
     }
 
     @ReactMethod

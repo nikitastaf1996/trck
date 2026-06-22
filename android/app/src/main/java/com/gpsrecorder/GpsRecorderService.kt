@@ -66,12 +66,19 @@ class GpsRecorderService : Service(), LocationListener {
         const val NOTIFICATION_ID = 0xC0DE
         const val CHANNEL_ID = "gps_recorder_channel"
 
-        // SharedPreferences keys for crash/restart recovery
+        // SharedPreferences keys for crash/restart recovery + live state queries
         private const val PREFS_NAME = "gps_recorder_state"
         private const val KEY_IS_RECORDING = "is_recording"
         private const val KEY_START_TIME = "start_time_ms"
         private const val KEY_POINT_COUNT = "point_count"
         private const val KEY_TEMP_FILE_NAME = "temp_file_name"
+        // Last fix (updated on every GPS callback so JS can poll via getState())
+        private const val KEY_LAST_LAT = "last_lat"
+        private const val KEY_LAST_LON = "last_lon"
+        private const val KEY_LAST_ALT = "last_alt"
+        private const val KEY_LAST_SPEED = "last_speed"
+        private const val KEY_LAST_ACCURACY = "last_accuracy"
+        private const val KEY_LAST_TIME_MS = "last_time_ms"
 
         // GPS request parameters
         private const val MIN_TIME_MS = 1000L          // 1 second
@@ -416,8 +423,37 @@ class GpsRecorderService : Service(), LocationListener {
             pointBuffer.add(pt)
             pointCount = pointBuffer.size
         }
-        GpsRecorderModule.emitLocation(pt.lat, pt.lon, pt.alt, pt.speed, pt.accuracy, pt.timeMs)
+        // Save current state to SharedPreferences so JS can poll via getState()
+        // even if the event emitter is not delivering events reliably.
+        saveLiveState(pt)
+        // Emit the event with pointCount included so the JS UI updates in real time.
+        GpsRecorderModule.emitLocation(pt.lat, pt.lon, pt.alt, pt.speed, pt.accuracy, pt.timeMs, pointCount)
         updateNotification()
+    }
+
+    /**
+     * Writes the current recording state + last fix to SharedPreferences.
+     * Called on every GPS fix so that [GpsRecorderModule.getState] can return fresh data.
+     */
+    private fun saveLiveState(lastFix: GpsPoint? = null) {
+        try {
+            val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit()
+            prefs.putBoolean(KEY_IS_RECORDING, isRecording)
+            prefs.putLong(KEY_START_TIME, startTimeMs)
+            prefs.putInt(KEY_POINT_COUNT, pointCount)
+            val fix = lastFix ?: synchronized(pointBufferLock) { pointBuffer.lastOrNull() }
+            if (fix != null) {
+                prefs.putString(KEY_LAST_LAT, fix.lat.toString())
+                prefs.putString(KEY_LAST_LON, fix.lon.toString())
+                prefs.putString(KEY_LAST_ALT, fix.alt?.toString() ?: "")
+                prefs.putString(KEY_LAST_SPEED, fix.speed?.toString() ?: "")
+                prefs.putString(KEY_LAST_ACCURACY, fix.accuracy?.toString() ?: "")
+                prefs.putLong(KEY_LAST_TIME_MS, fix.timeMs)
+            }
+            prefs.apply()
+        } catch (e: Exception) {
+            Log.w(TAG, "saveLiveState failed", e)
+        }
     }
 
     // Required overrides for older Android API levels

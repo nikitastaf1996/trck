@@ -5,7 +5,7 @@
  *   android/app/src/main/java/com/gpsrecorder/GpsRecorderModule.kt
  */
 
-import { NativeModules, NativeEventEmitter, EmitterSubscription } from 'react-native';
+import { NativeModules, DeviceEventEmitter, EmitterSubscription } from 'react-native';
 
 export type GpsLocationEvent = {
   lat: number;
@@ -14,6 +14,7 @@ export type GpsLocationEvent = {
   speed: number | null; // m/s
   accuracy: number | null; // meters
   timestamp: number; // epoch ms
+  pointCount: number;
 };
 
 export type GpsDurationEvent = {
@@ -35,6 +36,13 @@ export type GpsErrorEvent = {
   message: string;
 };
 
+export type GpsFullState = {
+  isRecording: boolean;
+  pointCount: number;
+  elapsedMs: number;
+  lastFix: GpsLocationEvent | null;
+};
+
 export type GpsRecorderEvents = {
   location: GpsLocationEvent;
   duration: GpsDurationEvent;
@@ -47,6 +55,7 @@ type GpsRecorderNativeType = {
   start(): Promise<void>;
   stop(): Promise<void>;
   isRecording(): Promise<boolean>;
+  getState(): Promise<GpsFullState>;
   requestPermissions(): Promise<boolean>;
   hasPermissions(): Promise<boolean>;
   requestIgnoreBatteryOptimizations(): Promise<boolean>;
@@ -59,6 +68,7 @@ const NativeGpsRecorder = (NativeModules.GpsRecorder as GpsRecorderNativeType) |
   start: async () => {},
   stop: async () => {},
   isRecording: async () => false,
+  getState: async () => ({ isRecording: false, pointCount: 0, elapsedMs: 0, lastFix: null }),
   requestPermissions: async () => false,
   hasPermissions: async () => false,
   requestIgnoreBatteryOptimizations: async () => false,
@@ -71,19 +81,23 @@ export const GpsRecorder = {
   start: () => NativeGpsRecorder.start(),
   stop: () => NativeGpsRecorder.stop(),
   isRecording: () => NativeGpsRecorder.isRecording(),
+  getState: () => NativeGpsRecorder.getState(),
   requestPermissions: () => NativeGpsRecorder.requestPermissions(),
   hasPermissions: () => NativeGpsRecorder.hasPermissions(),
   requestIgnoreBatteryOptimizations: () => NativeGpsRecorder.requestIgnoreBatteryOptimizations(),
   openAppSettings: () => NativeGpsRecorder.openAppSettings(),
 };
 
-export const GpsRecorderEmitter = new NativeEventEmitter(
-  NativeModules.GpsRecorder as unknown as { addListener: (e: string) => void; removeListeners: (n: number) => void }
-);
-
+/**
+ * Subscribe to a native event.
+ *
+ * Uses DeviceEventEmitter directly (instead of NativeEventEmitter) because it is
+ * the most reliable event delivery mechanism on Android — the Kotlin side emits
+ * via RCTDeviceEventEmitter, which maps 1:1 to DeviceEventEmitter on JS.
+ */
 export function subscribe<K extends keyof GpsRecorderEvents>(
   event: K,
   handler: (payload: GpsRecorderEvents[K]) => void
 ): EmitterSubscription {
-  return GpsRecorderEmitter.addListener(event, handler as (p: unknown) => void);
+  return DeviceEventEmitter.addListener(event, handler as (p: unknown) => void);
 }

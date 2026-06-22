@@ -4,7 +4,6 @@ import android.Manifest
 import android.content.pm.PackageManager
 import android.os.Build
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import com.facebook.react.ReactActivity
 import com.facebook.react.ReactActivityDelegate
@@ -25,6 +24,8 @@ class MainActivity : ReactActivity() {
             activity?.requestAllPermissions()
         }
     }
+
+    private var hasRequestedPermissionsOnLaunch = false
 
     private val requiredPermissions: Array<String> by lazy {
         val base = mutableListOf(
@@ -49,7 +50,11 @@ class MainActivity : ReactActivity() {
                     ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) ==
                         PackageManager.PERMISSION_GRANTED
                 if (fineGranted) {
-                    backgroundLocationLauncher.launch(Manifest.permission.ACCESS_BACKGROUND_LOCATION)
+                    try {
+                        backgroundLocationLauncher.launch(Manifest.permission.ACCESS_BACKGROUND_LOCATION)
+                    } catch (e: Exception) {
+                        // Some devices throw if the activity state is wrong; ignore.
+                    }
                 }
             }
         }
@@ -65,11 +70,26 @@ class MainActivity : ReactActivity() {
     override fun onResume() {
         super.onResume()
         instance = this
+        // Auto-request permissions on the first resume so the user doesn't have to
+        // grant them manually from Android Settings.
+        if (!hasRequestedPermissionsOnLaunch) {
+            hasRequestedPermissionsOnLaunch = true
+            if (!hasAllPermissions()) {
+                requestAllPermissions()
+            }
+        }
     }
 
-    override fun onPause() {
-        super.onPause()
-        // Don't null out - we want to keep the reference for the service to call back.
+    private fun hasAllPermissions(): Boolean {
+        val fineGranted = ContextCompat.checkSelfPermission(
+            this, Manifest.permission.ACCESS_FINE_LOCATION
+        ) == PackageManager.PERMISSION_GRANTED
+        val notifGranted = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            ContextCompat.checkSelfPermission(
+                this, Manifest.permission.POST_NOTIFICATIONS
+            ) == PackageManager.PERMISSION_GRANTED
+        } else true
+        return fineGranted && notifGranted
     }
 
     fun requestAllPermissions() {
