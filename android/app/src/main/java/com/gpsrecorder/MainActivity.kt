@@ -62,7 +62,7 @@ class MainActivity : ReactActivity() {
     private val backgroundLocationLauncher =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { _ -> /* result ignored */ }
 
-    override fun getMainComponentName(): String = "GpsRecorder"
+    override fun getMainComponentName(): String = "trck"
 
     override fun createReactActivityDelegate(): ReactActivityDelegate =
         DefaultReactActivityDelegate(this, mainComponentName, fabricEnabled)
@@ -72,10 +72,18 @@ class MainActivity : ReactActivity() {
         instance = this
         // Auto-request permissions on the first resume so the user doesn't have to
         // grant them manually from Android Settings.
+        //
+        // We post this to the decorView's message queue so that the activity is fully
+        // attached and resumed before we try to launch the permission contract.
+        // Launching the contract synchronously inside onResume can silently fail on
+        // some Android versions because the activity is not yet in STARTED state
+        // from the ActivityResultRegistry's point of view.
         if (!hasRequestedPermissionsOnLaunch) {
             hasRequestedPermissionsOnLaunch = true
-            if (!hasAllPermissions()) {
-                requestAllPermissions()
+            window.decorView.post {
+                if (!hasAllPermissions()) {
+                    requestAllPermissions()
+                }
             }
         }
     }
@@ -94,7 +102,15 @@ class MainActivity : ReactActivity() {
 
     fun requestAllPermissions() {
         try {
-            locationPermissionLauncher.launch(requiredPermissions)
+            // Post again to be extra-safe: launching from a non-resumed state throws
+            // IllegalStateException on some devices.
+            window.decorView.post {
+                try {
+                    locationPermissionLauncher.launch(requiredPermissions)
+                } catch (e: Exception) {
+                    // ignore
+                }
+            }
         } catch (e: Exception) {
             // Some devices throw if the activity is not in a state to launch.
         }

@@ -185,10 +185,24 @@ function App(): React.ReactElement {
     try {
       let granted = await GpsRecorder.hasPermissions();
       if (!granted) {
+        // Trigger the native permission request (which now also fires from onResume,
+        // but we call it explicitly here in case that was missed).
         await GpsRecorder.requestPermissions();
-        await new Promise((r) => setTimeout(r, 800));
-        granted = await GpsRecorder.hasPermissions();
+        // Wait for the user to respond to the system dialog. We poll hasPermissions
+        // for up to ~30 seconds.
+        for (let i = 0; i < 30; i++) {
+          await new Promise((r) => setTimeout(r, 1000));
+          granted = await GpsRecorder.hasPermissions();
+          if (granted) break;
+        }
         setHasPermissions(granted);
+      }
+
+      if (!granted) {
+        setErrorMsg(
+          'Location and notification permissions are required. Please grant them in Android Settings.'
+        );
+        return;
       }
 
       try {
@@ -241,7 +255,7 @@ function App(): React.ReactElement {
         keyboardShouldPersistTaps="handled"
       >
         <View style={styles.header}>
-          <Text style={styles.headerTitle}>GPS Recorder</Text>
+          <Text style={styles.headerTitle}>trck</Text>
           <Text style={styles.headerSubtitle}>
             Background GPX recorder · foreground service
           </Text>

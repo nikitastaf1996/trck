@@ -471,7 +471,7 @@ class GpsRecorderService : Service(), LocationListener {
     private fun acquireWakeLock() {
         if (wakeLock?.isHeld == true) return
         val pm = getSystemService(POWER_SERVICE) as PowerManager
-        wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "GpsRecorder:Recording")
+        wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "trck:Recording")
         wakeLock?.setReferenceCounted(false)
         try {
             wakeLock?.acquire(6 * 60 * 60 * 1000L) /* 6 hours max, just in case */
@@ -567,7 +567,7 @@ class GpsRecorderService : Service(), LocationListener {
 
         val timestamp = SimpleDateFormat("yyyy-MM-dd_HH-mm-ss", Locale.US)
             .format(Date(startTimeMs))
-        val fileName = "gps_recording_$timestamp.gpx"
+        val fileName = "trck_$timestamp.gpx"
 
         val gpxContent = buildString {
             append(gpxHeader())
@@ -612,9 +612,9 @@ class GpsRecorderService : Service(), LocationListener {
         val values = android.content.ContentValues().apply {
             put(MediaStore.MediaColumns.DISPLAY_NAME, fileName)
             put(MediaStore.MediaColumns.MIME_TYPE, "application/gpx+xml")
-            // Put it under Downloads/GpsRecorder/ so it's easy to find.
+            // Put it under Downloads/trck/ so it's easy to find.
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/GpsRecorder")
+                put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/trck")
                 put(MediaStore.MediaColumns.IS_PENDING, 1)
             }
         }
@@ -634,13 +634,13 @@ class GpsRecorderService : Service(), LocationListener {
             val done = android.content.ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) }
             resolver.update(uri, done, null, null)
         }
-        return "Downloads/GpsRecorder/$fileName"
+        return "Downloads/trck/$fileName"
     }
 
     private fun saveViaLegacyFile(fileName: String, bytes: ByteArray): String {
         @Suppress("DEPRECATION")
         val downloadsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
-        val targetDir = File(downloadsDir, "GpsRecorder").apply { if (!exists()) mkdirs() }
+        val targetDir = File(downloadsDir, "trck").apply { if (!exists()) mkdirs() }
         val f = File(targetDir, fileName)
         FileOutputStream(f).use { it.write(bytes) }
         return f.absolutePath

@@ -80,7 +80,7 @@ and re-commit it.** See the workflow below.
 The release APK is committed at:
 
 ```
-apk/GpsRecorder-release.apk
+apk/trck-release.apk
 ```
 
 This single path is overwritten on every rebuild so the repo doesn't grow
@@ -119,11 +119,11 @@ working Android build environment) editing this repo:
    ```bash
    cd /path/to/repo/root
    mkdir -p apk
-   cp android/app/build/outputs/apk/release/app-release.apk apk/GpsRecorder-release.apk
+   cp android/app/build/outputs/apk/release/app-release.apk apk/trck-release.apk
    ```
 6. **Commit and push the APK**:
    ```bash
-   git add apk/GpsRecorder-release.apk
+   git add apk/trck-release.apk
    git commit -m "Rebuild APK: <one-line summary of the source change>"
    git push
    ```

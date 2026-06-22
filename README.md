@@ -1,9 +1,9 @@
-# GPS Recorder
+# trck
 
 A small **React Native** Android app that records GPS tracks in the background
-and saves them as `.gpx` files to the public `Downloads/GpsRecorder/` folder.
+and saves them as `.gpx` files to the public `Downloads/trck/` folder.
 
-> The APK is committed in [`apk/GpsRecorder-release.apk`](./apk/GpsRecorder-release.apk)
+> The APK is committed in [`apk/trck-release.apk`](./apk/trck-release.apk)
 > because the developer's PC is down and they cannot build it themselves.
 > See [`AGENTS.md`](./AGENTS.md) for the full explanation and the rebuild workflow.
 
@@ -13,20 +13,20 @@ and saves them as `.gpx` files to the public `Downloads/GpsRecorder/` folder.
 - Duration of recording, ticking every second.
 - Persistent **foreground-service notification** with a **Stop** action — you
   can stop the recording without ever opening the app again.
-- GPS fixes saved as a GPX 1.1 file under `Downloads/GpsRecorder/`.
+- GPS fixes saved as a GPX 1.1 file under `Downloads/trck/`.
 - Recording survives the app being backgrounded, swiped away from recents,
   the screen turning off, and (best-effort) the system killing the process.
 
 ## How to install
 
-1. Download `apk/GpsRecorder-release.apk` from this repo.
+1. Download `apk/trck-release.apk` from this repo.
 2. On your Android phone, open the file (e.g. from the Files app or a browser
    download notification).
 3. Allow "install from unknown sources" if prompted.
 4. Open the app, grant the location and notification permissions, and tap
    **START**.
 
-GPX files will appear under `Downloads/GpsRecorder/`.
+GPX files will appear under `Downloads/trck/`.
 
 ## How to build (for agents / future me)
 

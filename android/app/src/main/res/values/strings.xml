@@ -1,5 +1,5 @@
 <resources>
-    <string name="app_name">GPS Recorder</string>
+    <string name="app_name">trck</string>
 
     <!-- Notification -->
     <string name="notification_channel_name">GPS Recording</string>
