@@ -1,0 +1,10 @@
+<resources>
+    <string name="app_name">GPS Recorder</string>
+
+    <!-- Notification -->
+    <string name="notification_channel_name">GPS Recording</string>
+    <string name="notification_channel_desc">Ongoing notification while GPS is being recorded in the background.</string>
+    <string name="notification_title">Recording GPS…</string>
+    <string name="notification_text">%1$d points · %2$s</string>
+    <string name="notification_action_stop">Stop</string>
+</resources>
