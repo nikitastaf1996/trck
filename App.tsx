@@ -1,32 +1,33 @@
 /**
- * GPS Recorder
+ * trck — a no-frills GPS recorder for runners.
  *
- * A no-frills GPS recording app for runners:
- *   - Big Start / Stop button
- *   - Duration of recording
- *   - Distance traveled + current pace (min/km)
- *   - Live GPS fix info (lat / lon / accuracy / GNSS status / speed)
- *   - Number of points recorded
- *   - Path to the saved GPX file
+ * UI inspired by minimalist running watches / running apps: large, centered
+ * numbers, generous whitespace, one accent color, no clutter.
  *
- * Stability / lifecycle behaviour:
+ *   - Big circular START / STOP button at the bottom
+ *   - Pre-recording GNSS status pill (always visible, updates live)
+ *   - TIME · DISTANCE · PACE · AVG PACE
+ *   - Saved-file toast when a recording finishes
+ *
+ * Stability / lifecycle behaviour (unchanged from previous versions):
  *   - Recording is owned by a native foreground service (GpsRecorderService.kt).
- *   - The service survives: app being backgrounded, app being swiped away from recents,
- *     the screen turning off, and (best-effort) the system killing the process for memory.
- *   - The service is START_STICKY so the system will restart it if it has to kill it.
- *   - A partial wake lock keeps the CPU awake so we keep getting GPS fixes while the
- *     screen is off.
- *   - Points are flushed to a temp file every 5 seconds, so a crash mid-recording still
- *     yields a usable (partial) GPX file.
- *   - The notification has a "Stop" action so the user can stop recording without ever
- *     opening the app again.
- *   - The JS side is purely informational; if the JS thread dies, recording continues.
+ *   - The service survives: app being backgrounded, app being swiped away from
+ *     recents, the screen turning off, and (best-effort) the system killing the
+ *     process for memory. It is START_STICKY and uses a PARTIAL_WAKE_LOCK.
+ *   - Points are flushed to a temp file every 5 seconds so a crash mid-recording
+ *     still yields a usable (partial) GPX file.
+ *   - The notification has a "Stop" action so the user can stop recording
+ *     without re-opening the app.
+ *   - The JS side is purely informational; if the JS thread dies, recording
+ *     continues.
  *
- * Event delivery + polling fallback:
- *   - Native events (location / duration / state / saved / error) are delivered via
- *     DeviceEventEmitter.
- *   - As a reliability fallback, we also poll GpsRecorder.getState() every 2 seconds
- *     while recording. This guarantees the UI stays in sync even if events are dropped.
+ * Live GNSS monitor:
+ *   - On mount, we call GpsRecorder.startGnssMonitor() so the native module
+ *     starts listening to GPS + GnssStatus and emits 'gnss' events with the
+ *     current fix type / accuracy / satellite counts. This works regardless of
+ *     whether recording is running, so the user sees their fix status before
+ *     pressing START.
+ *   - The monitor is stopped on unmount.
  */
 
 import React, { useEffect, useRef, useState, useCallback } from 'react';
@@ -49,9 +50,35 @@ import {
   type GpsSavedEvent,
   type GpsFullState,
   type GpsFixType,
+  type GpsGnssEvent,
 } from './src/NativeGpsRecorder';
 
 type RecordingState = 'idle' | 'recording' | 'stopping';
+
+// ---- Palette (light, minimalist, inspired by the reference screenshot) ----
+const COLOR = {
+  bg: '#FFFFFF',
+  primary: '#0A2463',        // deep navy — for all numerals
+  secondary: '#6B7280',      // medium gray — for labels
+  divider: '#E5E7EB',        // very light gray — for dividers
+  accentStart: '#0A2463',    // navy — START button
+  accentStop: '#DC2626',     // red — STOP button
+  accentStopping: '#9CA3AF', // gray — STOPPING state
+  gnssGreen: '#16A34A',
+  gnssAmber: '#D97706',
+  gnssRed: '#DC2626',
+  gnssGray: '#9CA3AF',
+  errorBg: '#FEF2F2',
+  errorBorder: '#FECACA',
+  errorText: '#991B1B',
+  savedBg: '#F0FDF4',
+  savedBorder: '#BBF7D0',
+  savedText: '#166534',
+};
+
+function pad2(n: number): string {
+  return n < 10 ? `0${n}` : String(n);
+}
 
 function formatDuration(ms: number): string {
   const totalSec = Math.max(0, Math.floor(ms / 1000));
@@ -62,39 +89,44 @@ function formatDuration(ms: number): string {
   return `${pad2(m)}:${pad2(s)}`;
 }
 
-function pad2(n: number): string {
-  return n < 10 ? `0${n}` : String(n);
+/**
+ * Formats a distance in meters as a runner-friendly string with the unit
+ * separated, so the UI can render the number largely and the unit small:
+ *   - < 1000 m  -> { value: "123", unit: "m" }
+ *   - >= 1000 m -> { value: "1.23", unit: "km" }
+ */
+function formatDistance(distanceM: number): { value: string; unit: string } {
+  if (!distanceM || distanceM <= 0) return { value: '0', unit: 'm' };
+  if (distanceM < 1000) return { value: String(Math.round(distanceM)), unit: 'm' };
+  return { value: (distanceM / 1000).toFixed(2), unit: 'km' };
 }
 
 /**
- * Formats a distance in meters as a runner-friendly string:
- *  - < 1000 m  -> "123 m"
- *  - >= 1000 m -> "1.23 km" (2 decimals)
+ * Average pace from elapsed time and total distance, in "M:SS" per km.
+ * Returns null if there is no measurable distance or elapsed time yet.
  */
-function formatDistance(distanceM: number): string {
-  if (!distanceM || distanceM <= 0) return '0 m';
-  if (distanceM < 1000) return `${Math.round(distanceM)} m`;
-  return `${(distanceM / 1000).toFixed(2)} km`;
+function computeAvgPace(elapsedMs: number, distanceM: number): string | null {
+  if (!distanceM || distanceM < 1) return null;
+  if (!elapsedMs || elapsedMs < 1000) return null;
+  const minutesTotal = elapsedMs / 60000.0;
+  const km = distanceM / 1000.0;
+  const pace = minutesTotal / km;
+  if (!isFinite(pace) || pace <= 0) return null;
+  const wholeMin = Math.floor(pace);
+  const sec = Math.round((pace - wholeMin) * 60);
+  if (sec === 60) return `${wholeMin + 1}:00`;
+  return `${wholeMin}:${pad2(sec)}`;
 }
 
 /**
- * Formats pace (minutes per km) from elapsed time and distance.
- * Returns "—" if there's no measurable distance or elapsed time yet.
- *
- * Pace is shown as "M:SS" — e.g. 5 min 30 sec per km = "5:30".
- * For very slow paces (> 15:00/km, basically walking or standing),
- * we still show the number; that's useful feedback.
+ * Current (instantaneous) pace from GPS speed (m/s), in "M:SS" per km.
+ * Returns null if speed is missing or zero.
  */
-function formatPace(elapsedMs: number, distanceM: number): string {
-  if (!distanceM || distanceM < 1) return '—';
-  if (!elapsedMs || elapsedMs < 1000) return '—';
-  const minutesTotal = elapsedMs / 60000.0;            // elapsed minutes
-  const km = distanceM / 1000.0;                        // distance in km
-  const paceMinPerKm = minutesTotal / km;               // minutes per km
-  if (!isFinite(paceMinPerKm) || paceMinPerKm <= 0) return '—';
-  const wholeMin = Math.floor(paceMinPerKm);
-  const sec = Math.round((paceMinPerKm - wholeMin) * 60);
-  // Handle the round-up-to-60 edge case (e.g. 5:59.6 -> 6:00)
+function computeCurrentPace(speedMps: number | null | undefined): string | null {
+  if (speedMps == null || speedMps <= 0.3) return null;  // ignore < 1 km/h (standing still)
+  const paceSecPerKm = 1000 / speedMps;                  // seconds per km
+  const wholeMin = Math.floor(paceSecPerKm / 60);
+  const sec = Math.round(paceSecPerKm % 60);
   if (sec === 60) return `${wholeMin + 1}:00`;
   return `${wholeMin}:${pad2(sec)}`;
 }
@@ -104,8 +136,12 @@ function App(): React.ReactElement {
   const [elapsedMs, setElapsedMs] = useState<number>(0);
   const [pointCount, setPointCount] = useState<number>(0);
   const [distance, setDistance] = useState<number>(0);
+  const [currentSpeed, setCurrentSpeed] = useState<number | null>(null);
   const [fixType, setFixType] = useState<GpsFixType>('no fix');
-  const [lastFix, setLastFix] = useState<GpsLocationEvent | null>(null);
+  const [accuracy, setAccuracy] = useState<number | null>(null);
+  const [satellitesUsed, setSatellitesUsed] = useState<number>(0);
+  const [satellitesInView, setSatellitesInView] = useState<number>(0);
+  const [hasFix, setHasFix] = useState<boolean>(false);
   const [lastSavedPath, setLastSavedPath] = useState<string | null>(null);
   const [hasPermissions, setHasPermissions] = useState<boolean>(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
@@ -122,7 +158,8 @@ function App(): React.ReactElement {
         if (typeof state.distance === 'number') setDistance(state.distance);
         if (state.fixType) setFixType(state.fixType);
         if (state.lastFix) {
-          setLastFix(state.lastFix);
+          setAccuracy(state.lastFix.accuracy);
+          setCurrentSpeed(state.lastFix.speed);
         }
         if (startTimeRef.current == null) {
           startTimeRef.current = Date.now() - state.elapsedMs;
@@ -149,6 +186,12 @@ function App(): React.ReactElement {
         }
         if (!mounted) return;
         setHasPermissions(granted);
+
+        // Start the always-on GNSS monitor so the UI shows fix status even
+        // before recording starts.
+        if (granted) {
+          try { await GpsRecorder.startGnssMonitor(); } catch { /* ignore */ }
+        }
         await syncStateFromNative();
       } catch {
         // ignore
@@ -157,17 +200,28 @@ function App(): React.ReactElement {
 
     // Event subscriptions (real-time updates)
     const subs = [
+      subscribe('gnss', (ev: GpsGnssEvent) => {
+        // The monitor's status is the source of truth for the GNSS pill.
+        setFixType(ev.fixType);
+        setAccuracy(ev.accuracy);
+        setSatellitesUsed(ev.satellitesUsed);
+        setSatellitesInView(ev.satellitesInView);
+        setHasFix(ev.hasFix);
+        // While idle (not recording), the monitor's speed is also the best
+        // current-speed signal we have. While recording, the 'location' event
+        // overrides it.
+        if (recordingState !== 'recording') {
+          setCurrentSpeed(ev.speed);
+        }
+      }),
       subscribe('location', (ev: GpsLocationEvent) => {
-        setLastFix(ev);
-        if (ev.pointCount != null) {
-          setPointCount(ev.pointCount);
-        }
-        if (typeof ev.distance === 'number') {
-          setDistance(ev.distance);
-        }
-        if (ev.fixType) {
-          setFixType(ev.fixType);
-        }
+        // Recording-time updates from the service.
+        setPointCount(ev.pointCount);
+        if (typeof ev.distance === 'number') setDistance(ev.distance);
+        if (ev.fixType) setFixType(ev.fixType);
+        if (ev.accuracy != null) setAccuracy(ev.accuracy);
+        if (ev.speed != null) setCurrentSpeed(ev.speed);
+        setHasFix(ev.fixType !== 'no fix');
       }),
       subscribe('duration', (ev) => {
         setElapsedMs(ev.elapsedMs);
@@ -186,8 +240,9 @@ function App(): React.ReactElement {
           setPointCount(0);
           setElapsedMs(0);
           setDistance(0);
+          setCurrentSpeed(null);
           setFixType('no fix');
-          setLastFix(null);
+          setHasFix(false);
           startTimeRef.current = null;
         }
       }),
@@ -196,8 +251,9 @@ function App(): React.ReactElement {
         setPointCount(0);
         setElapsedMs(0);
         setDistance(0);
+        setCurrentSpeed(null);
         setFixType('no fix');
-        setLastFix(null);
+        setHasFix(false);
         setRecordingState('idle');
         startTimeRef.current = null;
       }),
@@ -211,13 +267,16 @@ function App(): React.ReactElement {
     const appStateSub = AppState.addEventListener('change', (state) => {
       if (state === 'active') {
         syncStateFromNative();
-        GpsRecorder.hasPermissions().then(setHasPermissions);
+        GpsRecorder.hasPermissions().then(async (g) => {
+          setHasPermissions(g);
+          if (g) {
+            try { await GpsRecorder.startGnssMonitor(); } catch { /* ignore */ }
+          }
+        });
       }
     });
 
     // Polling fallback: every 2 seconds, sync state from native.
-    // This guarantees point count / latest fix / duration / distance are always fresh
-    // even if the event emitter drops events.
     const pollInterval = setInterval(() => {
       syncStateFromNative();
     }, 2000);
@@ -227,25 +286,26 @@ function App(): React.ReactElement {
       subs.forEach((s) => s.remove());
       appStateSub.remove();
       clearInterval(pollInterval);
+      // Stop the GNSS monitor when the JS app unmounts.
+      try { GpsRecorder.stopGnssMonitor(); } catch { /* ignore */ }
     };
-  }, [syncStateFromNative]);
+  }, [syncStateFromNative, recordingState]);
 
   const handleStart = useCallback(async () => {
     setErrorMsg(null);
     try {
       let granted = await GpsRecorder.hasPermissions();
       if (!granted) {
-        // Trigger the native permission request (which now also fires from onResume,
-        // but we call it explicitly here in case that was missed).
         await GpsRecorder.requestPermissions();
-        // Wait for the user to respond to the system dialog. We poll hasPermissions
-        // for up to ~30 seconds.
         for (let i = 0; i < 30; i++) {
           await new Promise((r) => setTimeout(r, 1000));
           granted = await GpsRecorder.hasPermissions();
           if (granted) break;
         }
         setHasPermissions(granted);
+        if (granted) {
+          try { await GpsRecorder.startGnssMonitor(); } catch { /* ignore */ }
+        }
       }
 
       if (!granted) {
@@ -264,8 +324,7 @@ function App(): React.ReactElement {
       setElapsedMs(0);
       setPointCount(0);
       setDistance(0);
-      setFixType('no fix');
-      setLastFix(null);
+      setCurrentSpeed(null);
       setLastSavedPath(null);
       startTimeRef.current = Date.now();
 
@@ -293,124 +352,101 @@ function App(): React.ReactElement {
   const handleGrantPermissions = useCallback(async () => {
     await GpsRecorder.requestPermissions();
     await new Promise((r) => setTimeout(r, 800));
-    setHasPermissions(await GpsRecorder.hasPermissions());
+    const granted = await GpsRecorder.hasPermissions();
+    setHasPermissions(granted);
+    if (granted) {
+      try { await GpsRecorder.startGnssMonitor(); } catch { /* ignore */ }
+    }
   }, []);
 
   const isRecording = recordingState === 'recording';
   const isStopping = recordingState === 'stopping';
 
+  const distanceFmt = formatDistance(distance);
+  const currentPace = computeCurrentPace(currentSpeed);
+  const avgPace = computeAvgPace(elapsedMs, distance);
+
   return (
     <SafeAreaView style={styles.container}>
-      <StatusBar barStyle="dark-content" backgroundColor="#0F172A" />
+      <StatusBar barStyle="dark-content" backgroundColor={COLOR.bg} />
       <ScrollView
         contentContainerStyle={styles.scrollContent}
         keyboardShouldPersistTaps="handled"
       >
-        <View style={styles.header}>
-          <Text style={styles.headerTitle}>trck</Text>
-          <Text style={styles.headerSubtitle}>
-            Background GPX recorder · foreground service
+        {/* GNSS status pill — always visible, updates live */}
+        <GnssPill
+          fixType={fixType}
+          accuracy={accuracy}
+          satellitesUsed={satellitesUsed}
+          satellitesInView={satellitesInView}
+          hasFix={hasFix}
+        />
+
+        {/* Primary stats: TIME, DISTANCE, PACE, AVG PACE */}
+        <BigStat label="ВРЕМЯ" value={formatDuration(elapsedMs)} />
+        <Divider />
+
+        <BigStat
+          label="ДИСТАНЦИЯ"
+          value={distanceFmt.value}
+          unit={distanceFmt.unit}
+        />
+        <Divider />
+
+        <View style={styles.twoCol}>
+          <BigStat
+            label="ТЕМП"
+            value={currentPace ?? '—'}
+            unit={currentPace ? '/км' : undefined}
+            compact
+          />
+          <View style={styles.colDivider} />
+          <BigStat
+            label="СРЕД. ТЕМП"
+            value={avgPace ?? '—'}
+            unit={avgPace ? '/км' : undefined}
+            compact
+          />
+        </View>
+
+        {/* Status / recording indicator */}
+        <View style={styles.statusRow}>
+          <View style={[styles.statusDot, isRecording ? styles.dotOn : styles.dotOff]} />
+          <Text style={styles.statusText}>
+            {isRecording ? 'ЗАПИСЬ' : isStopping ? 'ОСТАНОВКА…' : pointCount > 0 ? `${pointCount} ТОЧЕК` : 'ОЖИДАНИЕ'}
           </Text>
         </View>
 
-        <View style={styles.durationCard}>
-          <Text style={styles.durationLabel}>DURATION</Text>
-          <Text style={styles.durationValue}>{formatDuration(elapsedMs)}</Text>
-          <View style={[styles.statusPill, isRecording ? styles.statusPillOn : styles.statusPillOff]}>
-            <View style={[styles.statusDot, isRecording ? styles.dotOn : styles.dotOff]} />
-            <Text style={styles.statusText}>
-              {isRecording ? 'RECORDING' : isStopping ? 'STOPPING…' : 'IDLE'}
+        {/* Big circular START / STOP button */}
+        <View style={styles.buttonWrap}>
+          <Pressable
+            style={({ pressed }) => [
+              styles.bigButton,
+              isRecording ? styles.bigButtonStop : styles.bigButtonStart,
+              (pressed || isStopping) && styles.bigButtonPressed,
+              isStopping && styles.bigButtonStopping,
+            ]}
+            onPress={isRecording ? handleStop : handleStart}
+            disabled={isStopping}
+            android_ripple={{ color: 'rgba(255,255,255,0.18)', radius: 220 }}
+          >
+            <Text style={styles.bigButtonText}>
+              {isStopping ? '…' : isRecording ? 'СТОП' : 'СТАРТ'}
             </Text>
-          </View>
+          </Pressable>
         </View>
-
-        <Pressable
-          style={({ pressed }) => [
-            styles.bigButton,
-            isRecording ? styles.bigButtonStop : styles.bigButtonStart,
-            (pressed || isStopping) && styles.bigButtonPressed,
-            isStopping && styles.bigButtonStopping,
-          ]}
-          onPress={isRecording ? handleStop : handleStart}
-          disabled={isStopping}
-          android_ripple={{ color: 'rgba(255,255,255,0.15)', radius: 200 }}
-        >
-          <Text style={styles.bigButtonText}>
-            {isStopping ? 'STOPPING…' : isRecording ? 'STOP' : 'START'}
-          </Text>
-        </Pressable>
 
         {!hasPermissions && (
           <Pressable style={styles.permissionButton} onPress={handleGrantPermissions}>
             <Text style={styles.permissionButtonText}>
-              Grant location &amp; notification permissions
+              Разрешить доступ к местоположению и уведомлениям
             </Text>
           </Pressable>
         )}
 
-        {/* Primary runner stats: distance + pace */}
-        <View style={styles.statsGrid}>
-          <StatCard
-            label="DISTANCE"
-            value={formatDistance(distance)}
-          />
-          <StatCard
-            label="PACE"
-            value={formatPace(elapsedMs, distance)}
-            sub="/km"
-          />
-        </View>
-
-        {/* Secondary stats: points + accuracy (with GNSS status) + speed */}
-        <View style={styles.statsGrid}>
-          <StatCard label="POINTS" value={String(pointCount)} />
-          <StatCard
-            label="ACCURACY"
-            value={lastFix?.accuracy != null ? `${lastFix.accuracy.toFixed(0)} m` : '—'}
-            sub={fixType}
-            subStyle={fixTypeStyle(fixType)}
-          />
-          <StatCard
-            label="SPEED"
-            value={
-              lastFix?.speed != null && lastFix.speed > 0
-                ? `${(lastFix.speed * 3.6).toFixed(1)} km/h`
-                : '—'
-            }
-          />
-        </View>
-
-        {lastFix && (
-          <View style={styles.fixCard}>
-            <Text style={styles.fixTitle}>LATEST FIX</Text>
-            <Text style={styles.fixLine}>
-              <Text style={styles.fixLabel}>Lat </Text>
-              {lastFix.lat.toFixed(6)}
-            </Text>
-            <Text style={styles.fixLine}>
-              <Text style={styles.fixLabel}>Lon </Text>
-              {lastFix.lon.toFixed(6)}
-            </Text>
-            {lastFix.alt != null && (
-              <Text style={styles.fixLine}>
-                <Text style={styles.fixLabel}>Alt </Text>
-                {lastFix.alt.toFixed(1)} m
-              </Text>
-            )}
-            <Text style={styles.fixLine}>
-              <Text style={styles.fixLabel}>GNSS </Text>
-              {fixType}
-            </Text>
-            <Text style={styles.fixLine}>
-              <Text style={styles.fixLabel}>Time </Text>
-              {new Date(lastFix.timestamp).toLocaleTimeString()}
-            </Text>
-          </View>
-        )}
-
         {lastSavedPath && (
           <View style={styles.savedCard}>
-            <Text style={styles.savedTitle}>GPX SAVED</Text>
+            <Text style={styles.savedTitle}>GPX СОХРАНЁН</Text>
             <Text style={styles.savedPath}>{lastSavedPath}</Text>
           </View>
         )}
@@ -423,9 +459,9 @@ function App(): React.ReactElement {
 
         <View style={styles.footerNote}>
           <Text style={styles.footerText}>
-            Recording runs in a foreground service and keeps going when the app is
-            backgrounded or swiped away. Stop it from the notification or this button.
-            GPX files are written to the public Downloads/GpsRecorder folder.
+            Запись идёт в foreground service и продолжается, когда приложение
+            свёрнуто или смахнуто. Остановить можно из уведомления или кнопкой
+            выше. GPX-файлы сохраняются в общую папку Downloads/trck.
           </Text>
         </View>
       </ScrollView>
@@ -433,116 +469,223 @@ function App(): React.ReactElement {
   );
 }
 
-function StatCard({
+/**
+ * Big-stat block: small uppercase label, then a huge numeral. Optional `unit`
+ * is rendered small and to the right of the value (e.g. "km", "/km").
+ */
+function BigStat({
   label,
   value,
-  sub,
-  subStyle,
+  unit,
+  compact,
 }: {
   label: string;
   value: string;
-  sub?: string;
-  subStyle?: { color: string };
+  unit?: string;
+  compact?: boolean;
 }): React.ReactElement {
   return (
-    <View style={styles.statCard}>
+    <View style={[styles.statBlock, compact ? styles.statBlockCompact : null]}>
       <Text style={styles.statLabel}>{label}</Text>
       <View style={styles.statValueRow}>
-        <Text style={styles.statValue}>{value}</Text>
-        {sub != null && <Text style={[styles.statSub, subStyle]}>{sub}</Text>}
+        <Text style={[styles.statValue, compact ? styles.statValueCompact : null]}>
+          {value}
+        </Text>
+        {unit != null && <Text style={styles.statUnit}>{unit}</Text>}
       </View>
     </View>
   );
 }
 
+function Divider(): React.ReactElement {
+  return <View style={styles.divider} />;
+}
+
 /**
- * Picks a color for the GNSS fix type chip next to the accuracy value.
- *  - 3D fix -> green (good)
- *  - 2D fix -> amber (marginal)
- *  - no fix -> red (no signal)
+ * Pill-shaped GNSS status indicator. Always visible at the top of the screen.
+ * Color-coded: green = 3D fix, amber = 2D fix, red/gray = no fix.
  */
-function fixTypeStyle(fixType: GpsFixType): { color: string } {
-  switch (fixType) {
-    case '3D fix':
-      return { color: '#22C55E' };
-    case '2D fix':
-      return { color: '#F59E0B' };
-    default:
-      return { color: '#EF4444' };
+function GnssPill({
+  fixType,
+  accuracy,
+  satellitesUsed,
+  satellitesInView,
+  hasFix,
+}: {
+  fixType: GpsFixType;
+  accuracy: number | null;
+  satellitesUsed: number;
+  satellitesInView: number;
+  hasFix: boolean;
+}): React.ReactElement {
+  const color = hasFix
+    ? (fixType === '3D fix' ? COLOR.gnssGreen : COLOR.gnssAmber)
+    : COLOR.gnssRed;
+
+  // Build the detail text: "3D · 4 m · 9 sats" or "no fix · 0/12 sats"
+  let detail: string;
+  if (hasFix) {
+    const parts: string[] = [fixType.toUpperCase()];
+    if (accuracy != null) parts.push(`${accuracy.toFixed(0)} м`);
+    parts.push(`${satellitesUsed} СПУТ`);
+    detail = parts.join(' · ');
+  } else {
+    detail = 'НЕТ СИГНАЛА' + (satellitesInView > 0 ? ` · ${satellitesUsed}/${satellitesInView}` : '');
   }
+
+  return (
+    <View style={styles.gnssPillWrap}>
+      <View style={[styles.gnssPill, { borderColor: color }]}>
+        <View style={[styles.gnssDot, { backgroundColor: color }]} />
+        <Text style={styles.gnssText}>{detail}</Text>
+      </View>
+    </View>
+  );
 }
 
 const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: '#0F172A' },
-  scrollContent: { padding: 20, paddingBottom: 60 },
-  header: { alignItems: 'center', marginTop: 8, marginBottom: 24 },
-  headerTitle: { fontSize: 28, fontWeight: '700', color: '#F8FAFC', letterSpacing: 0.5 },
-  headerSubtitle: { fontSize: 13, color: '#94A3B8', marginTop: 4 },
-  durationCard: { alignItems: 'center', marginBottom: 24 },
-  durationLabel: { fontSize: 12, color: '#64748B', letterSpacing: 2, fontWeight: '600' },
-  durationValue: {
-    fontSize: 64, color: '#F8FAFC', fontWeight: '200',
-    fontVariant: ['tabular-nums'], marginVertical: 4,
+  container: { flex: 1, backgroundColor: COLOR.bg },
+  scrollContent: {
+    paddingHorizontal: 24,
+    paddingTop: 16,
+    paddingBottom: 60,
   },
-  statusPill: {
-    flexDirection: 'row', alignItems: 'center',
-    paddingHorizontal: 12, paddingVertical: 6, borderRadius: 16, marginTop: 8,
+  // ---- GNSS pill ----
+  gnssPillWrap: { alignItems: 'center', marginBottom: 24 },
+  gnssPill: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingHorizontal: 14,
+    paddingVertical: 8,
+    borderRadius: 20,
+    borderWidth: 1.5,
+    backgroundColor: '#FFFFFF',
   },
-  statusPillOn: { backgroundColor: 'rgba(34, 197, 94, 0.18)' },
-  statusPillOff: { backgroundColor: 'rgba(148, 163, 184, 0.15)' },
-  statusDot: { width: 8, height: 8, borderRadius: 4, marginRight: 6 },
-  dotOn: { backgroundColor: '#22C55E' },
-  dotOff: { backgroundColor: '#64748B' },
-  statusText: { color: '#E2E8F0', fontSize: 11, fontWeight: '700', letterSpacing: 1.5 },
-  bigButton: {
-    height: 220, borderRadius: 110, alignItems: 'center', justifyContent: 'center',
-    marginVertical: 16, elevation: 8,
-    shadowColor: '#000', shadowOffset: { width: 0, height: 6 },
-    shadowOpacity: 0.3, shadowRadius: 12,
+  gnssDot: {
+    width: 8, height: 8, borderRadius: 4, marginRight: 8,
   },
-  bigButtonStart: { backgroundColor: '#22C55E' },
-  bigButtonStop: { backgroundColor: '#EF4444' },
-  bigButtonPressed: { transform: [{ scale: 0.98 }] },
-  bigButtonStopping: { backgroundColor: '#64748B' },
-  bigButtonText: { color: '#FFFFFF', fontSize: 36, fontWeight: '800', letterSpacing: 4 },
-  permissionButton: {
-    backgroundColor: '#1E293B', borderRadius: 12, paddingVertical: 14,
-    alignItems: 'center', marginBottom: 16, borderWidth: 1, borderColor: '#334155',
-  },
-  permissionButtonText: { color: '#F8FAFC', fontSize: 14, fontWeight: '600' },
-  statsGrid: { flexDirection: 'row', gap: 10, marginBottom: 10 },
-  statCard: {
-    flex: 1, backgroundColor: '#1E293B', borderRadius: 12, padding: 14, alignItems: 'center',
-  },
-  statLabel: { fontSize: 10, color: '#64748B', letterSpacing: 1.5, fontWeight: '600' },
-  statValueRow: { flexDirection: 'row', alignItems: 'baseline', marginTop: 4, gap: 4 },
-  statValue: {
-    fontSize: 20, color: '#F8FAFC', fontWeight: '600',
+  gnssText: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: COLOR.primary,
+    letterSpacing: 0.8,
     fontVariant: ['tabular-nums'],
   },
-  statSub: {
-    fontSize: 11, color: '#94A3B8', fontWeight: '600', letterSpacing: 0.5,
+  // ---- Big stats ----
+  statBlock: {
+    alignItems: 'center',
+    paddingVertical: 22,
   },
-  fixCard: { backgroundColor: '#1E293B', borderRadius: 12, padding: 16, marginBottom: 16 },
-  fixTitle: { fontSize: 11, color: '#64748B', letterSpacing: 1.5, fontWeight: '700', marginBottom: 8 },
-  fixLine: { fontSize: 14, color: '#E2E8F0', marginVertical: 2, fontVariant: ['tabular-nums'] },
-  fixLabel: { color: '#64748B', fontWeight: '600' },
+  statBlockCompact: {
+    paddingVertical: 16,
+    flex: 1,
+  },
+  statLabel: {
+    fontSize: 12,
+    fontWeight: '600',
+    color: COLOR.secondary,
+    letterSpacing: 2,
+    marginBottom: 8,
+  },
+  statValueRow: {
+    flexDirection: 'row',
+    alignItems: 'baseline',
+    gap: 6,
+  },
+  statValue: {
+    fontSize: 64,
+    fontWeight: '700',
+    color: COLOR.primary,
+    fontVariant: ['tabular-nums'],
+    letterSpacing: -1,
+  },
+  statValueCompact: {
+    fontSize: 36,
+  },
+  statUnit: {
+    fontSize: 16,
+    fontWeight: '500',
+    color: COLOR.secondary,
+  },
+  divider: {
+    height: StyleSheet.hairlineWidth,
+    backgroundColor: COLOR.divider,
+    marginVertical: 0,
+  },
+  twoCol: {
+    flexDirection: 'row',
+    alignItems: 'stretch',
+  },
+  colDivider: {
+    width: StyleSheet.hairlineWidth,
+    backgroundColor: COLOR.divider,
+    marginHorizontal: 0,
+  },
+  // ---- Status row ----
+  statusRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginTop: 16,
+    marginBottom: 8,
+    gap: 8,
+  },
+  statusDot: {
+    width: 8, height: 8, borderRadius: 4,
+  },
+  dotOn: { backgroundColor: COLOR.accentStop },
+  dotOff: { backgroundColor: COLOR.gnssGray },
+  statusText: {
+    fontSize: 11,
+    fontWeight: '700',
+    color: COLOR.secondary,
+    letterSpacing: 1.5,
+  },
+  // ---- Big button ----
+  buttonWrap: { alignItems: 'center', marginTop: 24, marginBottom: 16 },
+  bigButton: {
+    width: 220, height: 220, borderRadius: 110,
+    alignItems: 'center', justifyContent: 'center',
+    elevation: 6,
+    shadowColor: '#000', shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.18, shadowRadius: 12,
+  },
+  bigButtonStart: { backgroundColor: COLOR.accentStart },
+  bigButtonStop: { backgroundColor: COLOR.accentStop },
+  bigButtonPressed: { transform: [{ scale: 0.98 }] },
+  bigButtonStopping: { backgroundColor: COLOR.accentStopping },
+  bigButtonText: {
+    color: '#FFFFFF', fontSize: 32, fontWeight: '800', letterSpacing: 4,
+  },
+  // ---- Permission button ----
+  permissionButton: {
+    backgroundColor: '#F3F4F6', borderRadius: 12, paddingVertical: 14,
+    alignItems: 'center', marginBottom: 16, borderWidth: 1, borderColor: COLOR.divider,
+  },
+  permissionButtonText: { color: COLOR.primary, fontSize: 14, fontWeight: '600' },
+  // ---- Saved / error cards ----
   savedCard: {
-    backgroundColor: '#1E293B', borderRadius: 12, padding: 16, marginBottom: 16,
-    borderWidth: 1, borderColor: '#334155',
+    backgroundColor: COLOR.savedBg, borderRadius: 12, padding: 14,
+    marginBottom: 16, borderWidth: 1, borderColor: COLOR.savedBorder,
   },
-  savedTitle: { fontSize: 11, color: '#22C55E', letterSpacing: 1.5, fontWeight: '700', marginBottom: 6 },
+  savedTitle: {
+    fontSize: 11, color: COLOR.savedText, letterSpacing: 1.5,
+    fontWeight: '700', marginBottom: 6,
+  },
   savedPath: {
-    fontSize: 13, color: '#E2E8F0',
+    fontSize: 13, color: COLOR.savedText,
     fontFamily: Platform.select({ ios: 'Menlo', android: 'monospace' }),
   },
   errorCard: {
-    backgroundColor: 'rgba(239, 68, 68, 0.12)', borderRadius: 12, padding: 14,
-    marginBottom: 16, borderWidth: 1, borderColor: 'rgba(239, 68, 68, 0.4)',
+    backgroundColor: COLOR.errorBg, borderRadius: 12, padding: 14,
+    marginBottom: 16, borderWidth: 1, borderColor: COLOR.errorBorder,
   },
-  errorText: { color: '#FCA5A5', fontSize: 13 },
+  errorText: { color: COLOR.errorText, fontSize: 13 },
+  // ---- Footer ----
   footerNote: { marginTop: 8 },
-  footerText: { color: '#475569', fontSize: 12, lineHeight: 18, textAlign: 'center' },
+  footerText: {
+    color: '#9CA3AF', fontSize: 12, lineHeight: 18, textAlign: 'center',
+  },
 });
 
 export default App;

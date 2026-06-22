@@ -40,6 +40,24 @@ export type GpsErrorEvent = {
   message: string;
 };
 
+/**
+ * Live GNSS status event, independent of recording. Emitted by the always-on
+ * monitor (GpsRecorderModule.startGnssMonitor) so the UI can show fix status
+ * BEFORE the user starts recording. Also still useful while recording.
+ */
+export type GpsGnssEvent = {
+  fixType: GpsFixType;
+  accuracy: number | null;        // meters, null when no fix
+  satellitesUsed: number;
+  satellitesInView: number;
+  hasFix: boolean;
+  lat: number | null;
+  lon: number | null;
+  alt: number | null;
+  speed: number | null;           // m/s
+  timestamp: number;              // epoch ms
+};
+
 export type GpsFullState = {
   isRecording: boolean;
   pointCount: number;
@@ -55,6 +73,7 @@ export type GpsRecorderEvents = {
   state: GpsStateEvent;
   saved: GpsSavedEvent;
   error: GpsErrorEvent;
+  gnss: GpsGnssEvent;
 };
 
 type GpsRecorderNativeType = {
@@ -66,6 +85,8 @@ type GpsRecorderNativeType = {
   hasPermissions(): Promise<boolean>;
   requestIgnoreBatteryOptimizations(): Promise<boolean>;
   openAppSettings(): Promise<void>;
+  startGnssMonitor(): Promise<boolean>;
+  stopGnssMonitor(): Promise<boolean>;
   addListener(eventName: string): void;
   removeListeners(count: number): void;
 };
@@ -86,6 +107,8 @@ const NativeGpsRecorder = (NativeModules.GpsRecorder as GpsRecorderNativeType) |
   hasPermissions: async () => false,
   requestIgnoreBatteryOptimizations: async () => false,
   openAppSettings: async () => {},
+  startGnssMonitor: async () => false,
+  stopGnssMonitor: async () => false,
   addListener: () => {},
   removeListeners: () => {},
 };
@@ -99,6 +122,8 @@ export const GpsRecorder = {
   hasPermissions: () => NativeGpsRecorder.hasPermissions(),
   requestIgnoreBatteryOptimizations: () => NativeGpsRecorder.requestIgnoreBatteryOptimizations(),
   openAppSettings: () => NativeGpsRecorder.openAppSettings(),
+  startGnssMonitor: () => NativeGpsRecorder.startGnssMonitor(),
+  stopGnssMonitor: () => NativeGpsRecorder.stopGnssMonitor(),
 };
 
 /**

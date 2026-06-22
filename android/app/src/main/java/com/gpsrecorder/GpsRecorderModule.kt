@@ -4,12 +4,18 @@ import android.Manifest
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.location.GnssStatus
+import android.location.Location
+import android.location.LocationListener
+import android.location.LocationManager
 import android.net.Uri
 import android.os.Build
+import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.os.PowerManager
 import android.provider.Settings
+import android.util.Log
 import androidx.core.content.ContextCompat
 import com.facebook.react.bridge.Arguments
 import com.facebook.react.bridge.Promise
@@ -101,6 +107,37 @@ class GpsRecorderModule(private val reactContext: ReactApplicationContext) :
             val map = Arguments.createMap().apply { putString("message", message) }
             module.send("error", map)
         }
+
+        /**
+         * Emits a 'gnss' event with the current live GNSS status (independent of
+         * recording). Called by the always-on monitor in [GpsRecorderModule].
+         */
+        fun emitGnssStatus(
+            fixType: String,
+            accuracy: Float?,
+            satellitesUsed: Int,
+            satellitesInView: Int,
+            hasFix: Boolean,
+            lat: Double?,
+            lon: Double?,
+            altitude: Double?,
+            speed: Float?
+        ) {
+            val module = instance ?: return
+            val map = Arguments.createMap().apply {
+                putString("fixType", fixType)
+                if (accuracy != null) putDouble("accuracy", accuracy.toDouble()) else putNull("accuracy")
+                putInt("satellitesUsed", satellitesUsed)
+                putInt("satellitesInView", satellitesInView)
+                putBoolean("hasFix", hasFix)
+                if (lat != null) putDouble("lat", lat) else putNull("lat")
+                if (lon != null) putDouble("lon", lon) else putNull("lon")
+                if (altitude != null) putDouble("alt", altitude) else putNull("alt")
+                if (speed != null) putDouble("speed", speed.toDouble()) else putNull("speed")
+                putDouble("timestamp", System.currentTimeMillis().toDouble())
+            }
+            module.send("gnss", map)
+        }
     }
 
     init { instance = this }
@@ -108,6 +145,185 @@ class GpsRecorderModule(private val reactContext: ReactApplicationContext) :
     override fun getName(): String = "GpsRecorder"
 
     override fun getConstants(): Map<String, Any> = emptyMap()
+
+    // ---- Always-on GNSS monitor (independent of recording) ----
+    //
+    // Lightweight location + GnssStatus listener that runs whenever the JS app is
+    // alive and permissions are granted. It emits 'gnss' events so the UI can show
+    // the current fix type / accuracy / satellite count BEFORE the user starts
+    // recording. The monitor does NOT write to the GPX buffer or affect recording.
+    //
+    // When recording starts, the service's own LocationListener takes over; we
+    // keep the monitor running too because it's harmless and the user might stop
+    // recording and want to see the status again.
+
+    private var monitorLocationManager: LocationManager? = null
+    private var monitorGnssCallback: GnssStatus.Callback? = null
+    @Volatile private var monitorSatellitesUsed: Int = 0
+    @Volatile private var monitorSatellitesInView: Int = 0
+    @Volatile private var monitorLastFixTimeMs: Long = 0L
+    @Volatile private var monitorLastAccuracy: Float? = null
+    @Volatile private var monitorLastLat: Double? = null
+    @Volatile private var monitorLastLon: Double? = null
+    @Volatile private var monitorLastAlt: Double? = null
+    @Volatile private var monitorLastSpeed: Float? = null
+    @Volatile private var monitorRunning: Boolean = false
+    private val monitorHandler = Handler(Looper.getMainLooper())
+
+    private val monitorLocationListener = object : LocationListener {
+        override fun onLocationChanged(location: Location) {
+            monitorLastFixTimeMs = if (location.time > 0) location.time else System.currentTimeMillis()
+            monitorLastAccuracy = if (location.hasAccuracy()) location.accuracy else null
+            monitorLastLat = location.latitude
+            monitorLastLon = location.longitude
+            monitorLastAlt = if (location.hasAltitude()) location.altitude else null
+            monitorLastSpeed = if (location.hasSpeed()) location.speed else null
+            emitGnssFromMonitor()
+        }
+        override fun onProviderEnabled(provider: String) {}
+        override fun onProviderDisabled(provider: String) {}
+        @Deprecated("legacy")
+        override fun onStatusChanged(provider: String?, status: Int, extras: Bundle?) {}
+    }
+
+    private fun computeMonitorFixType(): String {
+        val now = System.currentTimeMillis()
+        val recentFix = monitorLastFixTimeMs > 0 && (now - monitorLastFixTimeMs) < 10_000L
+        if (!recentFix) return "no fix"
+        if (monitorSatellitesUsed == 0) return "no fix"
+        return if (monitorSatellitesUsed >= 4) "3D fix" else "2D fix"
+    }
+
+    private fun emitGnssFromMonitor() {
+        val fixType = computeMonitorFixType()
+        val hasFix = fixType != "no fix"
+        emitGnssStatus(
+            fixType = fixType,
+            accuracy = monitorLastAccuracy,
+            satellitesUsed = monitorSatellitesUsed,
+            satellitesInView = monitorSatellitesInView,
+            hasFix = hasFix,
+            lat = monitorLastLat,
+            lon = monitorLastLon,
+            altitude = monitorLastAlt,
+            speed = monitorLastSpeed
+        )
+    }
+
+    /**
+     * Heartbeat runnable: even if no new location arrives, we re-emit the GNSS
+     * status every few seconds so the UI can age out a stale fix to "no fix"
+     * when the user is indoors and the GPS hasn't produced a fix in 10+ seconds.
+     */
+    private val monitorHeartbeat = object : Runnable {
+        override fun run() {
+            if (monitorRunning) {
+                emitGnssFromMonitor()
+                monitorHandler.postDelayed(this, 3000L)
+            }
+        }
+    }
+
+    @ReactMethod
+    fun startGnssMonitor(promise: Promise) {
+        try {
+            if (monitorRunning) {
+                promise.resolve(true); return
+            }
+            if (!hasFineLocation()) {
+                promise.reject("E_PERMISSION", "Location permission not granted")
+                return
+            }
+            val lm = monitorLocationManager ?: run {
+                val l = reactContext.getSystemService(Context.LOCATION_SERVICE) as LocationManager
+                monitorLocationManager = l
+                l
+            }
+            // Register GnssStatus callback for satellite counts
+            val cb = object : GnssStatus.Callback() {
+                override fun onSatelliteStatusChanged(status: GnssStatus) {
+                    var used = 0
+                    val total = status.satelliteCount
+                    for (i in 0 until total) {
+                        if (status.usedInFix(i)) used++
+                    }
+                    monitorSatellitesUsed = used
+                    monitorSatellitesInView = total
+                    emitGnssFromMonitor()
+                }
+                override fun onStarted() { Log.i(TAG, "Monitor: GNSS engine started") }
+                override fun onStopped() {
+                    Log.i(TAG, "Monitor: GNSS engine stopped")
+                    monitorSatellitesUsed = 0
+                    monitorSatellitesInView = 0
+                    emitGnssFromMonitor()
+                }
+            }
+            try {
+                lm.registerGnssStatusCallback(cb, monitorHandler)
+                monitorGnssCallback = cb
+            } catch (e: Exception) {
+                Log.w(TAG, "Monitor: registerGnssStatusCallback failed", e)
+            }
+            // Register location listener on GPS provider (2s, 0m so we get frequent updates)
+            try {
+                if (lm.isProviderEnabled(LocationManager.GPS_PROVIDER)) {
+                    lm.requestLocationUpdates(
+                        LocationManager.GPS_PROVIDER,
+                        2000L, 0.0f,
+                        monitorLocationListener,
+                        Looper.getMainLooper()
+                    )
+                }
+            } catch (e: SecurityException) {
+                Log.w(TAG, "Monitor: SecurityException on requestLocationUpdates", e)
+            } catch (e: IllegalArgumentException) {
+                Log.w(TAG, "Monitor: IllegalArgument on requestLocationUpdates", e)
+            }
+            // Try to seed with last known location so UI shows something immediately
+            try {
+                val last = lm.getLastKnownLocation(LocationManager.GPS_PROVIDER)
+                if (last != null) monitorLocationListener.onLocationChanged(last)
+            } catch (e: SecurityException) {
+                // ignore
+            }
+            monitorRunning = true
+            monitorHandler.post(monitorHeartbeat)
+            Log.i(TAG, "GNSS monitor started")
+            promise.resolve(true)
+        } catch (e: Exception) {
+            promise.reject("E_MONITOR", e.message ?: "monitor start error", e)
+        }
+    }
+
+    @ReactMethod
+    fun stopGnssMonitor(promise: Promise) {
+        try {
+            if (!monitorRunning) {
+                promise.resolve(true); return
+            }
+            monitorRunning = false
+            monitorHandler.removeCallbacks(monitorHeartbeat)
+            try {
+                monitorLocationManager?.removeUpdates(monitorLocationListener)
+            } catch (e: Exception) {
+                Log.w(TAG, "Monitor: removeUpdates failed", e)
+            }
+            val cb = monitorGnssCallback
+            if (cb != null) {
+                try {
+                    monitorLocationManager?.unregisterGnssStatusCallback(cb)
+                } catch (e: Exception) {
+                    Log.w(TAG, "Monitor: unregisterGnssStatusCallback failed", e)
+                }
+                monitorGnssCallback = null
+            }
+            Log.i(TAG, "GNSS monitor stopped")
+            promise.resolve(true)
+        } catch (e: Exception) {
+            promise.reject("E_MONITOR", e.message ?: "monitor stop error", e)
+        }
+    }
 
     // ---- JS-callable methods ----
 
@@ -279,6 +495,25 @@ class GpsRecorderModule(private val reactContext: ReactApplicationContext) :
 
     @ReactMethod
     fun removeListeners(count: Int) { /* required by NativeEventEmitter, no-op */ }
+
+    @Suppress("DEPRECATION")
+    override fun onCatalystInstanceDestroy() {
+        // Stop the monitor when the RN instance is torn down
+        try {
+            if (monitorRunning) {
+                monitorRunning = false
+                monitorHandler.removeCallbacks(monitorHeartbeat)
+                monitorLocationManager?.removeUpdates(monitorLocationListener)
+                monitorGnssCallback?.let { cb ->
+                    monitorLocationManager?.unregisterGnssStatusCallback(cb)
+                }
+                monitorGnssCallback = null
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "onCatalystInstanceDestroy cleanup failed", e)
+        }
+        super.onCatalystInstanceDestroy()
+    }
 
     // ---- Internal helpers ----
 
