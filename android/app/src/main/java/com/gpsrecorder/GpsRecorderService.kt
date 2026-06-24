@@ -540,26 +540,63 @@ class GpsRecorderService : Service(), LocationListener {
             accuracy = if (location.hasAccuracy()) location.accuracy else null,
             timeMs = if (location.time > 0) location.time else System.currentTimeMillis()
         )
-        // Defensive: drop fixes whose timestamp is more than MAX_FIX_AGE_MS in the
-        // past. The OS occasionally delivers a slightly stale fix immediately after
-        // requestLocationUpdates() is called, and such a fix would poison prevLat/
-        // prevLon and inflate totalDistanceM on the next fresh fix. This is the
-        // second half of the "starts with 9 m / 69 m" fix (the first half is
-        // removing the explicit getLastKnownLocation() seed above).
+        // A. Always reject stale cached fixes first. The OS occasionally hands us a
+        // slightly stale fix right after requestLocationUpdates() is called, and
+        // such a fix would poison prevLat/prevLon and inflate totalDistanceM on
+        // the next fresh fix. This is the second half of the "starts with 9 m /
+        // 69 m" fix (the first half is removing the getLastKnownLocation() seed).
         val fixAgeMs = System.currentTimeMillis() - pt.timeMs
         if (fixAgeMs > MAX_FIX_AGE_MS) {
             Log.w(TAG, "Dropping stale fix: age=${fixAgeMs}ms lat=${pt.lat} lon=${pt.lon}")
             return
         }
-        synchronized(pointBufferLock) {
-            pointBuffer.add(pt)
-            pointCount = pointBuffer.size
+        // The "post_process_enabled" setting is now interpreted as ON-THE-FLY track
+        // filtering: when it is on, noisy / wild points are dropped at write time
+        // so the GPX buffer only ever contains clean, validated fixes and there is
+        // nothing left to post-process at finalization. When it is off, every fix
+        // is recorded raw (the fallback / diagnostic mode).
+        if (isPostProcessEnabled()) {
+            // B. Accuracy gate: skip fixes whose reported accuracy is worse than the
+            // threshold. These are almost always multipath or cold-start noise.
+            val acc = pt.accuracy
+            if (acc != null && acc > ACCURACY_THRESHOLD_M) {
+                Log.d(TAG, "On-the-fly filter: dropping low-accuracy fix (acc=${acc}m)")
+                return
+            }
+            // C. Jump plausibility gate: if the step from the previous accepted fix
+            // is implausible (negative, or beyond 1 km between ~1 Hz fixes =>
+            // >3600 km/h), treat it as a GPS glitch and skip it entirely. A zero
+            // step is allowed (the device barely moved between fixes).
+            val pLat = prevLat
+            val pLon = prevLon
+            if (pLat != null && pLon != null) {
+                val d = haversineMeters(pLat, pLon, pt.lat, pt.lon)
+                if (d !in 0.0..1000.0) {
+                    Log.d(TAG, "On-the-fly filter: dropping implausible jump (d=${d}m)")
+                    return
+                }
+                totalDistanceM += d
+            }
+            // D. Point passed both gates — commit it to the buffer and advance the
+            // previous-fix cursor.
+            synchronized(pointBufferLock) {
+                pointBuffer.add(pt)
+                pointCount = pointBuffer.size
+            }
+            prevLat = pt.lat
+            prevLon = pt.lon
+            lastFixTimeMs = pt.timeMs
+        } else {
+            // E. Fallback: record every fix raw so the GPX file keeps the noisy
+            // data, but still keep the displayed distance sane by routing the
+            // accuracy/jump gates through the distance accumulator only.
+            synchronized(pointBufferLock) {
+                pointBuffer.add(pt)
+                pointCount = pointBuffer.size
+            }
+            accumulateDistance(pt)
+            lastFixTimeMs = pt.timeMs
         }
-        // Update distance accumulator (Haversine between consecutive fixes).
-        // Skip fixes with poor accuracy so GPS noise doesn't inflate the total.
-        accumulateDistance(pt)
-        // Record fix time for GNSS status timeout detection.
-        lastFixTimeMs = pt.timeMs
         // Save current state to SharedPreferences so JS can poll via getState()
         // even if the event emitter is not delivering events reliably.
         saveLiveState(pt)
@@ -762,14 +799,15 @@ class GpsRecorderService : Service(), LocationListener {
     }
 
     /**
-     * Finalizes the GPX file: writes a complete GPX file (header + all points + footer)
-     * and saves it to the public Downloads folder.
+     * Finalizes the GPX file: writes a complete GPX file (header + all buffered
+     * points + footer) and saves it to the public Downloads folder.
      *
-     * If the post-process setting is enabled, the raw file is then read back, the
-     * post-processing algorithm (parse / sort / dedupe / accuracy filter / jump
-     * sweep / 1 Hz interpolation) is applied, and the file is OVERWRITTEN with the
-     * processed content. If the setting is disabled, only the raw data is written
-     * (the original behavior).
+     * Track filtering now happens ON-THE-FLY inside [onLocationChanged]: when the
+     * setting is enabled the buffer only ever holds clean, validated points, so
+     * there is nothing left to post-process here and the heavy offline parser is
+     * bypassed (we always pass postProcess = false to the save routines). When the
+     * setting is disabled the buffer holds the raw fixes, which is exactly what we
+     * want to persist as the fallback.
      *
      * On API >= 29 we use MediaStore.Downloads so the file is visible to other apps.
      * On older APIs we write directly to Environment.DIRECTORY_DOWNLOADS.
@@ -799,14 +837,17 @@ class GpsRecorderService : Service(), LocationListener {
         }
 
         val rawBytes = rawGpxContent.toByteArray(Charsets.UTF_8)
-        val postProcess = isPostProcessEnabled()
-        Log.i(TAG, "finalizeGpxFile: points=${snapshot.size} postProcess=$postProcess")
+        // Filtering is applied at write time in onLocationChanged, so the buffer is
+        // already clean when the setting is on. There is no need (and no point) in
+        // re-running the CPU-heavy offline post-processor here, so we always write
+        // the buffer verbatim. With the setting off the buffer is raw by design.
+        Log.i(TAG, "finalizeGpxFile: points=${snapshot.size} onTheFlyFilter=${isPostProcessEnabled()}")
 
         return try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                saveViaMediaStore(fileName, rawBytes, postProcess)
+                saveViaMediaStore(fileName, rawBytes, false)
             } else {
-                saveViaLegacyFile(fileName, rawBytes, postProcess)
+                saveViaLegacyFile(fileName, rawBytes, false)
             }
         } catch (e: Exception) {
             Log.e(TAG, "finalizeGpxFile failed; falling back to cache", e)

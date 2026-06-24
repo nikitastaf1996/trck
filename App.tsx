@@ -456,7 +456,7 @@ function App(): React.ReactElement {
           </Pressable>
         </View>
 
-        {/* Post-processing toggle */}
+        {/* On-the-fly track filtering toggle */}
         <Pressable
           style={[
             styles.toggleRow,
@@ -465,11 +465,11 @@ function App(): React.ReactElement {
           onPress={handleTogglePostProcess}
         >
           <View style={styles.toggleLabelWrap}>
-            <Text style={styles.toggleTitle}>Постобработка GPX</Text>
+            <Text style={styles.toggleTitle}>Фильтрация трека на лету</Text>
             <Text style={styles.toggleSubtitle}>
               {postProcessEnabled
-                ? 'Фильтр точности, дедупликация, интерполяция 1 Гц'
-                : 'Только сырые данные (без обработки)'}
+                ? 'Включена: запись только точных точек GPS (отсекание шумов и выбросов)'
+                : 'Выключена: запись сырых GPS-данных без изменений'}
             </Text>
           </View>
           <View
