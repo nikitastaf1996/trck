@@ -94,16 +94,49 @@ class GpsRecorderService : Service(), LocationListener {
         // If no GPS fix for this long, treat GNSS status as "no fix"
         private const val NO_FIX_TIMEOUT_MS = 10_000L
 
-        // Minimum number of points that must exist before distance starts accumulating,
-        // so a single noisy first fix doesn't shift the total by a large jump.
-        private const val ACCURACY_THRESHOLD_M = 50.0f  // ignore fixes worse than this
+        // Accuracy gate (on-the-fly + raw-recording distance accumulator):
+        // any fix whose reported horizontal accuracy is worse than this is dropped
+        // before it can touch the buffer or the distance accumulator. Tightened
+        // from 50 m to 25 m per the user's request — 25 m is still permissive
+        // enough for cold-start fixes but filters out the worst multipath noise.
+        private const val ACCURACY_THRESHOLD_M = 25.0f
 
         // Maximum acceptable age of a GPS fix (ms). Fixes older than this are dropped
         // in onLocationChanged to prevent stale cached fixes from inflating the
         // distance of a fresh recording. See "starts with 9 m / 69 m" bug fix.
         private const val MAX_FIX_AGE_MS = 3000L
 
-        // ---- Post-processing algorithm thresholds ----
+        // ---- Velocity-based filter (replaces the old 1 km static jump gate) ----
+        //
+        // Instead of a single "drop the step if it exceeds 1 km" threshold, we now
+        // compute the instantaneous velocity between the previous accepted fix and
+        // the candidate fix:
+        //
+        //     velocity = distance(prev, curr) / (t_curr - t_prev)
+        //
+        // and discard the candidate if that velocity exceeds a mode-of-transport
+        // ceiling. For walking / running the ceiling is 20 km/h = 5.5556 m/s — a
+        // generous upper bound that covers sprinting uphill with phone bounce but
+        // still rejects the classic GPS glitches (teleport 200 m in 1 s = 720 km/h)
+        // that a 1 km static gate would only catch when the glitch was already
+        // ridiculously large.
+        //
+        // Duplicate-timestamp fixes (dt == 0) are dropped because they would imply
+        // infinite velocity.
+        private const val MAX_VELOCITY_MPS = 5.5556f   // 20 km/h walking/running ceiling
+
+        // ---- Gaussian smoothing (post-processing) ----
+        // Half-window size: each output point is a weighted average of the input
+        // points within ±GAUSSIAN_HALF_WINDOW of it. ±5 points at 1 Hz covers a
+        // ~11 s window, which is large enough to suppress single-fix glitches but
+        // small enough not to round off real corners.
+        private const val GAUSSIAN_HALF_WINDOW = 5
+        // Gaussian sigma (in points, not seconds) — controls how flat the kernel
+        // is. With sigma=1.5 and a ±5 window, the weights drop to ~1% of the peak
+        // at the edges, so the window edges contribute negligibly.
+        private const val GAUSSIAN_SIGMA = 1.5
+
+        // ---- Legacy post-processing algorithm thresholds ----
         // (kept as constants so they're easy to tune; documented in postProcessGpx)
         private const val POST_PROCESS_ACCURACY_THRESHOLD_M = 15.0f
         private const val POST_PROCESS_JUMP_THRESHOLD_M = 15.0
@@ -128,9 +161,11 @@ class GpsRecorderService : Service(), LocationListener {
     @Volatile private var lastFixTimeMs: Long = 0L
     private var gnssStatusCallback: GnssStatus.Callback? = null
 
-    // Previous point used for distance accumulation (Haversine between consecutive fixes).
+    // Previous point used for distance accumulation + velocity-based filtering
+    // (Haversine distance and dt between consecutive accepted fixes).
     @Volatile private var prevLat: Double? = null
     @Volatile private var prevLon: Double? = null
+    @Volatile private var prevTimeMs: Long? = null
 
     // In-memory buffer of GPX points; also persisted to temp file periodically
     private val pointBuffer = ArrayList<GpsPoint>(1024)
@@ -248,6 +283,7 @@ class GpsRecorderService : Service(), LocationListener {
             totalDistanceM = 0.0
             prevLat = null
             prevLon = null
+            prevTimeMs = null
             satellitesUsed = 0
             lastFixTimeMs = 0L
             synchronized(pointBufferLock) { pointBuffer.clear() }
@@ -563,16 +599,29 @@ class GpsRecorderService : Service(), LocationListener {
                 Log.d(TAG, "On-the-fly filter: dropping low-accuracy fix (acc=${acc}m)")
                 return
             }
-            // C. Jump plausibility gate: if the step from the previous accepted fix
-            // is implausible (negative, or beyond 1 km between ~1 Hz fixes =>
-            // >3600 km/h), treat it as a GPS glitch and skip it entirely. A zero
-            // step is allowed (the device barely moved between fixes).
+            // C. Velocity-based plausibility gate: compute the instantaneous
+            // velocity from the previous accepted fix to this candidate, and drop
+            // the candidate if it implies the user moved faster than the walking /
+            // running ceiling (20 km/h). This replaces the old static 1 km jump
+            // gate, which only caught glitches that were already absurdly large.
+            //
+            //   velocity = haversine(prev, curr) / (t_curr - t_prev)
+            //
+            // A zero-dt fix (duplicate timestamp) is dropped because it would
+            // imply infinite velocity.
             val pLat = prevLat
             val pLon = prevLon
-            if (pLat != null && pLon != null) {
+            val pTime = prevTimeMs
+            if (pLat != null && pLon != null && pTime != null) {
+                val dtSec = (pt.timeMs - pTime) / 1000.0
+                if (dtSec <= 0.0) {
+                    Log.d(TAG, "On-the-fly filter: dropping zero-dt fix (dt=${dtSec}s)")
+                    return
+                }
                 val d = haversineMeters(pLat, pLon, pt.lat, pt.lon)
-                if (d !in 0.0..1000.0) {
-                    Log.d(TAG, "On-the-fly filter: dropping implausible jump (d=${d}m)")
+                val velocityMps = d / dtSec
+                if (velocityMps > MAX_VELOCITY_MPS) {
+                    Log.d(TAG, "On-the-fly filter: dropping velocity outlier (v=${velocityMps}m/s d=${d}m dt=${dtSec}s)")
                     return
                 }
                 totalDistanceM += d
@@ -585,11 +634,12 @@ class GpsRecorderService : Service(), LocationListener {
             }
             prevLat = pt.lat
             prevLon = pt.lon
+            prevTimeMs = pt.timeMs
             lastFixTimeMs = pt.timeMs
         } else {
             // E. Fallback: record every fix raw so the GPX file keeps the noisy
             // data, but still keep the displayed distance sane by routing the
-            // accuracy/jump gates through the distance accumulator only.
+            // accuracy/velocity gates through the distance accumulator only.
             synchronized(pointBufferLock) {
                 pointBuffer.add(pt)
                 pointCount = pointBuffer.size
@@ -610,8 +660,11 @@ class GpsRecorderService : Service(), LocationListener {
 
     /**
      * Adds the Haversine distance between [pt] and the previous accepted fix to
-     * [totalDistanceM]. Filters out fixes with poor accuracy to avoid GPS noise
-     * inflating the distance.
+     * [totalDistanceM]. Filters out fixes with poor accuracy or implausible
+     * velocity (walk/run ceiling 20 km/h) to avoid GPS noise inflating the
+     * distance. This is the path used when on-the-fly filtering is OFF (raw
+     * recording) — the point itself is still added to the buffer (raw mode),
+     * but the distance accumulator stays sane.
      */
     private fun accumulateDistance(pt: GpsPoint) {
         val acc = pt.accuracy
@@ -621,16 +674,25 @@ class GpsRecorderService : Service(), LocationListener {
         }
         val pLat = prevLat
         val pLon = prevLon
-        if (pLat != null && pLon != null) {
-            val d = haversineMeters(pLat, pLon, pt.lat, pt.lon)
-            // Ignore implausible jumps (>1 km between 1-second fixes = >3600 km/h).
-            // These are usually GPS glitches after a cold start or tunnel exit.
-            if (d in 0.0..1000.0) {
-                totalDistanceM += d
+        val pTime = prevTimeMs
+        if (pLat != null && pLon != null && pTime != null) {
+            val dtSec = (pt.timeMs - pTime) / 1000.0
+            if (dtSec > 0.0) {
+                val d = haversineMeters(pLat, pLon, pt.lat, pt.lon)
+                val velocityMps = d / dtSec
+                // Drop the contribution if the implied velocity exceeds the walk/
+                // run ceiling. These are usually GPS glitches after a cold start
+                // or tunnel exit; they would otherwise inflate totalDistanceM.
+                if (velocityMps <= MAX_VELOCITY_MPS) {
+                    totalDistanceM += d
+                } else {
+                    Log.d(TAG, "accumulateDistance: dropping velocity outlier (v=${velocityMps}m/s d=${d}m dt=${dtSec}s)")
+                }
             }
         }
         prevLat = pt.lat
         prevLon = pt.lon
+        prevTimeMs = pt.timeMs
     }
 
     /**
@@ -758,6 +820,20 @@ class GpsRecorderService : Service(), LocationListener {
     }
 
     /**
+     * Reads the Gaussian-smoothing setting from the SEPARATE settings prefs file.
+     * When enabled, finalizeGpxFile() will (after writing the raw / on-the-fly-
+     * filtered GPX file) read it back, apply a Gaussian kernel smoother to the
+     * lat/lon coordinates, and overwrite the file with the smoothed track.
+     *
+     * Stored in the same prefs file as `post_process_enabled` so it survives the
+     * per-recording state clear.
+     */
+    private fun isGaussianSmoothingEnabled(): Boolean {
+        return getSharedPreferences("gps_recorder_settings", Context.MODE_PRIVATE)
+            .getBoolean("gaussian_smoothing_enabled", false)
+    }
+
+    /**
      * Writes the GPX header to the temp file, replacing any previous content.
      * The temp file lives in the app's cache dir so it survives the JS app being killed
      * but is private to the app.
@@ -837,21 +913,26 @@ class GpsRecorderService : Service(), LocationListener {
         }
 
         val rawBytes = rawGpxContent.toByteArray(Charsets.UTF_8)
-        // Filtering is applied at write time in onLocationChanged, so the buffer is
-        // already clean when the setting is on. There is no need (and no point) in
-        // re-running the CPU-heavy offline post-processor here, so we always write
-        // the buffer verbatim. With the setting off the buffer is raw by design.
-        Log.i(TAG, "finalizeGpxFile: points=${snapshot.size} onTheFlyFilter=${isPostProcessEnabled()}")
+        // On-the-fly filtering (if enabled) was already applied in onLocationChanged,
+        // so the buffer is clean by this point. The legacy offline post-processor
+        // (postProcessGpx) is intentionally NOT invoked here — it has been superseded
+        // by the on-the-fly filter. The only optional finalize-time step left is the
+        // Gaussian kernel smoothing, controlled by its own setting.
+        val doGaussian = isGaussianSmoothingEnabled()
+        Log.i(
+            TAG,
+            "finalizeGpxFile: points=${snapshot.size} onTheFlyFilter=${isPostProcessEnabled()} gaussianSmoothing=$doGaussian"
+        )
 
         return try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                saveViaMediaStore(fileName, rawBytes, false)
+                saveViaMediaStore(fileName, rawBytes, gaussianSmooth = doGaussian)
             } else {
-                saveViaLegacyFile(fileName, rawBytes, false)
+                saveViaLegacyFile(fileName, rawBytes, gaussianSmooth = doGaussian)
             }
         } catch (e: Exception) {
             Log.e(TAG, "finalizeGpxFile failed; falling back to cache", e)
-            // Last resort: write to cache and return its path (raw only, no post-process)
+            // Last resort: write to cache and return its path (raw only, no smoothing)
             try {
                 val f = File(externalCacheDir ?: cacheDir, fileName)
                 FileOutputStream(f).use { it.write(rawBytes) }
@@ -866,7 +947,11 @@ class GpsRecorderService : Service(), LocationListener {
         }
     }
 
-    private fun saveViaMediaStore(fileName: String, rawBytes: ByteArray, postProcess: Boolean): String {
+    private fun saveViaMediaStore(
+        fileName: String,
+        rawBytes: ByteArray,
+        gaussianSmooth: Boolean = false
+    ): String {
         val resolver = contentResolver
         val values = android.content.ContentValues().apply {
             put(MediaStore.MediaColumns.DISPLAY_NAME, fileName)
@@ -891,28 +976,29 @@ class GpsRecorderService : Service(), LocationListener {
                 out.flush()
             } ?: throw java.io.IOException("Cannot open output stream for $uri")
 
-            // Step 2: if post-processing is enabled, read the raw file back, apply
-            // the algorithm, and OVERWRITE the file with the processed content.
-            if (postProcess) {
+            // Step 2: if Gaussian smoothing is enabled, read the raw file back,
+            // apply the kernel smoother, and OVERWRITE the file with the smoothed
+            // track.
+            if (gaussianSmooth) {
                 val rawText = resolver.openInputStream(uri)?.use { it.readBytes() }
                     ?.toString(Charsets.UTF_8) ?: ""
-                val processedText = try {
-                    postProcessGpx(rawText)
+                val smoothedText = try {
+                    gaussianSmoothGpx(rawText)
                 } catch (e: Exception) {
-                    Log.e(TAG, "postProcessGpx failed; keeping raw file", e)
+                    Log.e(TAG, "gaussianSmoothGpx failed; keeping raw file", e)
                     rawText
                 }
-                val processedBytes = processedText.toByteArray(Charsets.UTF_8)
+                val smoothedBytes = smoothedText.toByteArray(Charsets.UTF_8)
                 // "wt" = write-truncate: replaces the file's contents.
                 resolver.openOutputStream(uri, "wt")?.use { out: OutputStream ->
-                    out.write(processedBytes)
+                    out.write(smoothedBytes)
                     out.flush()
-                } ?: throw java.io.IOException("Cannot reopen output stream for $uri (post-process)")
-                Log.i(TAG, "Post-processed GPX written (${processedBytes.size} bytes)")
+                } ?: throw java.io.IOException("Cannot reopen output stream for $uri (gaussian)")
+                Log.i(TAG, "Gaussian-smoothed GPX written (${smoothedBytes.size} bytes)")
             }
         } finally {
             // Mark as not pending so it becomes visible, regardless of whether
-            // post-processing succeeded (we always want the file accessible).
+            // smoothing succeeded (we always want the file accessible).
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 val done = android.content.ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) }
                 resolver.update(uri, done, null, null)
@@ -921,24 +1007,28 @@ class GpsRecorderService : Service(), LocationListener {
         return "Downloads/trck/$fileName"
     }
 
-    private fun saveViaLegacyFile(fileName: String, rawBytes: ByteArray, postProcess: Boolean): String {
+    private fun saveViaLegacyFile(
+        fileName: String,
+        rawBytes: ByteArray,
+        gaussianSmooth: Boolean = false
+    ): String {
         @Suppress("DEPRECATION")
         val downloadsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
         val targetDir = File(downloadsDir, "trck").apply { if (!exists()) mkdirs() }
         val f = File(targetDir, fileName)
         // Step 1: write raw bytes.
         FileOutputStream(f).use { it.write(rawBytes) }
-        // Step 2: if post-processing is enabled, read back, process, overwrite.
-        if (postProcess) {
+        // Step 2: if Gaussian smoothing is enabled, read back, smooth, overwrite.
+        if (gaussianSmooth) {
             val rawText = f.readText(Charsets.UTF_8)
-            val processedText = try {
-                postProcessGpx(rawText)
+            val smoothedText = try {
+                gaussianSmoothGpx(rawText)
             } catch (e: Exception) {
-                Log.e(TAG, "postProcessGpx failed; keeping raw file", e)
+                Log.e(TAG, "gaussianSmoothGpx failed; keeping raw file", e)
                 rawText
             }
-            FileOutputStream(f).use { it.write(processedText.toByteArray(Charsets.UTF_8)) }
-            Log.i(TAG, "Post-processed GPX written to ${f.absolutePath}")
+            FileOutputStream(f).use { it.write(smoothedText.toByteArray(Charsets.UTF_8)) }
+            Log.i(TAG, "Gaussian-smoothed GPX written to ${f.absolutePath}")
         }
         return f.absolutePath
     }
@@ -1064,6 +1154,113 @@ class GpsRecorderService : Service(), LocationListener {
             append("    <name>").append(origName).append("</name>\n")
             append("    <trkseg>\n")
             for (p in final) {
+                append(formatGpxPointWithInterpolated(p))
+            }
+            append("    </trkseg>\n")
+            append("  </trk>\n")
+            append("</gpx>\n")
+        }
+    }
+
+    /**
+     * Gaussian / kernel smoothing of the GPX track.
+     *
+     * Replaces each point's lat/lon (and altitude, if present) with a weighted
+     * average of itself and its neighbours within ±GAUSSIAN_HALF_WINDOW points.
+     * The weights follow a Gaussian kernel:
+     *
+     *     w(i, j) = exp( -0.5 * ((i - j) / GAUSSIAN_SIGMA)^2 )
+     *
+     * Timestamps, speed, and accuracy are preserved verbatim — only the spatial
+     * coordinates are smoothed. The output has the SAME number of points as the
+     * input (no interpolation, no dropping); only the lat/lon/ele values change.
+     *
+     * Effect: single-fix GPS glitches (which typically look like a spike 20–80 m
+     * away from the true track) get pulled back towards their neighbours, since
+     * the Gaussian-weighted average is dominated by the surrounding clean fixes.
+     * Real corners are preserved reasonably well because the kernel is narrow
+     * (±5 points at 1 Hz = ±5 s window).
+     *
+     * If parsing fails or no trkpt is found, the input is returned unchanged so
+     * the user still gets a usable (raw) file rather than nothing.
+     */
+    private fun gaussianSmoothGpx(rawGpx: String): String {
+        // 1. Parse all trkpt entries.
+        val parsed = mutableListOf<GpxTrkPt>()
+        val regex = Regex("<trkpt lat=\"([^\"]+)\" lon=\"([^\"]+)\">(.*?)</trkpt>", RegexOption.DOT_MATCHES_ALL)
+        for (m in regex.findAll(rawGpx)) {
+            val lat = m.groupValues[1].toDoubleOrNull() ?: continue
+            val lon = m.groupValues[2].toDoubleOrNull() ?: continue
+            val inner = m.groupValues[3]
+            val ele = Regex("<ele>([^<]+)</ele>").find(inner)?.groupValues?.get(1)?.toDoubleOrNull()
+            val speed = Regex("<speed>([^<]+)</speed>").find(inner)?.groupValues?.get(1)?.toFloatOrNull()
+            val acc = Regex("<accuracy>([^<]+)</accuracy>").find(inner)?.groupValues?.get(1)?.toFloatOrNull()
+            val timeIso = Regex("<time>([^<]+)</time>").find(inner)?.groupValues?.get(1)
+            val timeMs = parseIsoTime(timeIso) ?: continue
+            parsed.add(GpxTrkPt(lat, lon, ele, speed, acc, timeMs, interpolated = false))
+        }
+        if (parsed.isEmpty()) {
+            Log.w(TAG, "gaussianSmoothGpx: no trkpt found, returning raw input")
+            return rawGpx
+        }
+        Log.i(TAG, "gaussianSmoothGpx: parsed ${parsed.size} points, half-window=$GAUSSIAN_HALF_WINDOW sigma=$GAUSSIAN_SIGMA")
+
+        // 2. Pre-compute the Gaussian kernel weights for offsets -W..+W.
+        //    w[k] = exp(-0.5 * (k / sigma)^2), k in [-W, W].
+        val w = DoubleArray(2 * GAUSSIAN_HALF_WINDOW + 1) { kOff ->
+            val k = (kOff - GAUSSIAN_HALF_WINDOW).toDouble()
+            Math.exp(-0.5 * (k / GAUSSIAN_SIGMA) * (k / GAUSSIAN_SIGMA))
+        }
+
+        // 3. Smooth each point.
+        val smoothed = ArrayList<GpxTrkPt>(parsed.size)
+        for (i in parsed.indices) {
+            var sumW = 0.0
+            var sumLat = 0.0
+            var sumLon = 0.0
+            var sumEle: Double? = null
+            var nEle = 0
+            var sumEleVal = 0.0
+            for (kOff in 0 until w.size) {
+                val j = i + (kOff - GAUSSIAN_HALF_WINDOW)
+                if (j < 0 || j >= parsed.size) continue
+                val weight = w[kOff]
+                sumW += weight
+                sumLat += parsed[j].lat * weight
+                sumLon += parsed[j].lon * weight
+                val e = parsed[j].ele
+                if (e != null) {
+                    sumEleVal += e * weight
+                    nEle++
+                    sumEle = sumEleVal
+                }
+            }
+            val newLat = if (sumW > 0.0) sumLat / sumW else parsed[i].lat
+            val newLon = if (sumW > 0.0) sumLon / sumW else parsed[i].lon
+            val newEle = if (nEle > 0 && sumEle != null) sumEle / nEle else null
+            smoothed.add(
+                GpxTrkPt(
+                    lat = newLat,
+                    lon = newLon,
+                    ele = newEle,
+                    speed = parsed[i].speed,
+                    accuracy = parsed[i].accuracy,
+                    timeMs = parsed[i].timeMs,
+                    interpolated = false
+                )
+            )
+        }
+        Log.i(TAG, "gaussianSmoothGpx: smoothed ${smoothed.size} points")
+
+        // 4. Rebuild GPX, preserving the original <name> if present.
+        val origName = Regex("<name>([^<]*)</name>").find(rawGpx)?.groupValues?.get(1)
+            ?: "GPS Recording"
+        return buildString {
+            append(gpxHeader())
+            append("  <trk>\n")
+            append("    <name>").append(origName).append("</name>\n")
+            append("    <trkseg>\n")
+            for (p in smoothed) {
                 append(formatGpxPointWithInterpolated(p))
             }
             append("    </trkseg>\n")

@@ -216,27 +216,78 @@ don't regress any of these properties.
 
 ## Post-processing setting
 
-There is a user-facing toggle in the app: **"Постобработка GPX"** (GPX
-post-processing). When enabled, after the raw GPX file is written to
-`Downloads/trck/`, the service reads it back, applies the post-processing
-algorithm, and overwrites the file. When disabled, only raw data is written
-(the original behavior).
+There are **two independent** user-facing toggles in the app, both located in
+the **НАСТРОЙКИ** section. Both are **locked while a recording is in
+progress** (the row is greyed out and a "🔒 Заблокировано на время записи"
+badge appears next to the section header) so that changing either setting
+mid-recording cannot change the filter / smoothing behaviour halfway through
+the file.
+
+### 1. "Фильтрация трека на лету" (on-the-fly track filtering)
+
+When enabled, noisy / wild points are dropped at write time inside
+`onLocationChanged` so the GPX buffer only ever contains clean, validated
+fixes. When disabled, every fix is recorded raw (the fallback / diagnostic
+mode) and the distance accumulator alone applies the same gates.
+
+The on-the-fly filter applies two gates to each candidate fix:
+
+1. **Accuracy gate.** Drop any fix whose reported horizontal accuracy is
+   worse than `ACCURACY_THRESHOLD_M = 25.0 m` (tightened from 50 m — 25 m
+   is still permissive enough for cold-start fixes but rejects the worst
+   multipath noise).
+2. **Velocity gate.** Compute the instantaneous velocity from the previous
+   accepted fix to the candidate:
+   ```
+   velocity = haversine(prev, curr) / (t_curr - t_prev)
+   ```
+   and drop the candidate if it implies the user moved faster than
+   `MAX_VELOCITY_MPS = 5.5556 m/s` (= 20 km/h, a generous walking/running
+   ceiling). This **replaces** the old static 1 km jump gate, which only
+   caught glitches that were already absurdly large. A zero-dt fix
+   (duplicate timestamp) is dropped because it would imply infinite
+   velocity.
 
 The setting is persisted in a **separate** SharedPreferences file
-(`gps_recorder_settings`) so it survives the per-recording state clear in
-`stopRecording()`. JS reads/writes it via `GpsRecorder.getPostProcessEnabled()`
-and `GpsRecorder.setPostProcessEnabled(bool)`.
+(`gps_recorder_settings`) under the key `post_process_enabled`, so it
+survives the per-recording state clear in `stopRecording()`. JS reads /
+writes it via `GpsRecorder.getPostProcessEnabled()` /
+`GpsRecorder.setPostProcessEnabled(bool)`.
 
-The algorithm (in `GpsRecorderService.postProcessGpx()`):
+### 2. "Сглаживание Гауссом (постобработка)" (Gaussian / kernel smoothing)
+
+When enabled, after the (raw or on-the-fly-filtered) GPX file is written to
+`Downloads/trck/`, the service reads it back, applies a Gaussian kernel
+smoother, and overwrites the file. When disabled, only the raw /
+on-the-fly-filtered track is written.
+
+The algorithm (in `GpsRecorderService.gaussianSmoothGpx()`):
 
 1. Parse all `<trkpt>` (lat/lon/ele/time/speed/accuracy).
-2. Sort by timestamp ascending (stable).
-3. Drop points with accuracy missing or `>= 15.0` m.
-4. Drop duplicate-timestamp points (`dt == 0`).
-5. Defensive jump sweep: drop points still producing `>= 15.0` m jump vs
-   previous kept.
-6. Interpolate remaining outages (gaps `>= 5.0` s) at 1.0 Hz. Synthetic points
-   are tagged `<interpolated>true</interpolated>` inside `<extensions>`.
+2. Pre-compute the Gaussian kernel weights for offsets
+   `-GAUSSIAN_HALF_WINDOW .. +GAUSSIAN_HALF_WINDOW`
+   (`GAUSSIAN_HALF_WINDOW = 5`, `GAUSSIAN_SIGMA = 1.5`):
+   ```
+   w(k) = exp( -0.5 * (k / sigma)^2 )
+   ```
+3. For each point, replace its lat/lon (and altitude, if present) with the
+   weighted average of itself and its neighbours within the ±5-point
+   window. Timestamps, speed, and accuracy are preserved verbatim. The
+   output has the SAME number of points as the input — only the
+   spatial coordinates change.
+4. Re-emit the GPX with the smoothed coordinates.
+
+Effect: single-fix GPS glitches (typically a 20–80 m spike away from the
+true track) get pulled back toward their neighbours because the
+Gaussian-weighted average is dominated by the surrounding clean fixes.
+Real corners are preserved reasonably well because the kernel is narrow
+(±5 points at 1 Hz = ±5 s window).
+
+The setting is persisted in the same `gps_recorder_settings` prefs file
+under the key `gaussian_smoothing_enabled`, so it survives the
+per-recording state clear. JS reads / writes it via
+`GpsRecorder.getGaussianSmoothingEnabled()` /
+`GpsRecorder.setGaussianSmoothingEnabled(bool)`.
 
 A standalone Python reference implementation with tests lives at
 `/home/z/my-project/scripts/test_post_process.py` in the build agent's

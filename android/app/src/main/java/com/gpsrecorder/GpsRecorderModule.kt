@@ -401,6 +401,34 @@ class GpsRecorderModule(private val reactContext: ReactApplicationContext) :
         }
     }
 
+    // ---- Gaussian-smoothing setting ----
+    //
+    // Persisted in the same SEPARATE SharedPreferences file ("gps_recorder_settings")
+    // as post_process_enabled, so it survives the per-recording state clear. When
+    // enabled, GpsRecorderService.finalizeGpxFile() will — after writing the raw /
+    // on-the-fly-filtered GPX file — read it back, apply a Gaussian kernel smoother
+    // to the lat/lon coordinates, and overwrite the file with the smoothed track.
+
+    @ReactMethod
+    fun setGaussianSmoothingEnabled(enabled: Boolean, promise: Promise) {
+        try {
+            settingsPrefs().edit().putBoolean("gaussian_smoothing_enabled", enabled).apply()
+            Log.i(TAG, "Gaussian smoothing enabled = $enabled")
+            promise.resolve(enabled)
+        } catch (e: Exception) {
+            promise.reject("E_SETTINGS", e.message ?: "setGaussianSmoothingEnabled error", e)
+        }
+    }
+
+    @ReactMethod
+    fun getGaussianSmoothingEnabled(promise: Promise) {
+        try {
+            promise.resolve(settingsPrefs().getBoolean("gaussian_smoothing_enabled", false))
+        } catch (e: Exception) {
+            promise.reject("E_SETTINGS", e.message ?: "getGaussianSmoothingEnabled error", e)
+        }
+    }
+
     /**
      * Returns the current recording state, point count, elapsed time, last GPS fix,
      * total distance traveled, and current GNSS fix type. JS calls this on mount and

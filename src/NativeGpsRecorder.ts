@@ -89,6 +89,8 @@ type GpsRecorderNativeType = {
   stopGnssMonitor(): Promise<boolean>;
   setPostProcessEnabled(enabled: boolean): Promise<boolean>;
   getPostProcessEnabled(): Promise<boolean>;
+  setGaussianSmoothingEnabled(enabled: boolean): Promise<boolean>;
+  getGaussianSmoothingEnabled(): Promise<boolean>;
   addListener(eventName: string): void;
   removeListeners(count: number): void;
 };
@@ -113,6 +115,8 @@ const NativeGpsRecorder = (NativeModules.GpsRecorder as GpsRecorderNativeType) |
   stopGnssMonitor: async () => false,
   setPostProcessEnabled: async (_enabled: boolean) => false,
   getPostProcessEnabled: async () => false,
+  setGaussianSmoothingEnabled: async (_enabled: boolean) => false,
+  getGaussianSmoothingEnabled: async () => false,
   addListener: () => {},
   removeListeners: () => {},
 };
@@ -130,6 +134,8 @@ export const GpsRecorder = {
   stopGnssMonitor: () => NativeGpsRecorder.stopGnssMonitor(),
   setPostProcessEnabled: (enabled: boolean) => NativeGpsRecorder.setPostProcessEnabled(enabled),
   getPostProcessEnabled: () => NativeGpsRecorder.getPostProcessEnabled(),
+  setGaussianSmoothingEnabled: (enabled: boolean) => NativeGpsRecorder.setGaussianSmoothingEnabled(enabled),
+  getGaussianSmoothingEnabled: () => NativeGpsRecorder.getGaussianSmoothingEnabled(),
 };
 
 /**

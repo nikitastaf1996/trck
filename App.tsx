@@ -146,6 +146,7 @@ function App(): React.ReactElement {
   const [hasPermissions, setHasPermissions] = useState<boolean>(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [postProcessEnabled, setPostProcessEnabled] = useState<boolean>(false);
+  const [gaussianSmoothingEnabled, setGaussianSmoothingEnabled] = useState<boolean>(false);
   const startTimeRef = useRef<number | null>(null);
 
   // Sync state from native via getState(). Called on mount, on foreground, and every 2s.
@@ -192,6 +193,12 @@ function App(): React.ReactElement {
         try {
           const pp = await GpsRecorder.getPostProcessEnabled();
           if (mounted) setPostProcessEnabled(pp);
+        } catch { /* ignore */ }
+
+        // Load the Gaussian-smoothing setting from native prefs.
+        try {
+          const gs = await GpsRecorder.getGaussianSmoothingEnabled();
+          if (mounted) setGaussianSmoothingEnabled(gs);
         } catch { /* ignore */ }
 
         // Start the always-on GNSS monitor so the UI shows fix status even
@@ -366,7 +373,15 @@ function App(): React.ReactElement {
     }
   }, []);
 
+  const isRecording = recordingState === 'recording';
+  const isStopping = recordingState === 'stopping';
+  // Settings are locked (read-only) while a recording is in progress so that
+  // toggling them mid-recording cannot change the filter / smoothing behaviour
+  // halfway through the file.
+  const settingsLocked = isRecording || isStopping;
+
   const handleTogglePostProcess = useCallback(async () => {
+    if (settingsLocked) return; // locked during recording
     const next = !postProcessEnabled;
     setPostProcessEnabled(next); // optimistic UI update
     try {
@@ -377,10 +392,21 @@ function App(): React.ReactElement {
       setPostProcessEnabled(!next);
       setErrorMsg(e?.message ?? String(e));
     }
-  }, [postProcessEnabled]);
+  }, [postProcessEnabled, settingsLocked]);
 
-  const isRecording = recordingState === 'recording';
-  const isStopping = recordingState === 'stopping';
+  const handleToggleGaussianSmoothing = useCallback(async () => {
+    if (settingsLocked) return; // locked during recording
+    const next = !gaussianSmoothingEnabled;
+    setGaussianSmoothingEnabled(next); // optimistic UI update
+    try {
+      const confirmed = await GpsRecorder.setGaussianSmoothingEnabled(next);
+      setGaussianSmoothingEnabled(confirmed);
+    } catch (e: any) {
+      // revert on failure
+      setGaussianSmoothingEnabled(!next);
+      setErrorMsg(e?.message ?? String(e));
+    }
+  }, [gaussianSmoothingEnabled, settingsLocked]);
 
   const distanceFmt = formatDistance(distance);
   const currentPace = computeCurrentPace(currentSpeed);
@@ -456,19 +482,31 @@ function App(): React.ReactElement {
           </Pressable>
         </View>
 
-        {/* On-the-fly track filtering toggle */}
+        {/* Settings section header + "locked during recording" notice */}
+        <View style={styles.settingsHeader}>
+          <Text style={styles.settingsHeaderText}>НАСТРОЙКИ</Text>
+          {settingsLocked && (
+            <Text style={styles.settingsLockedBadge}>
+              🔒 Заблокировано на время записи
+            </Text>
+          )}
+        </View>
+
+        {/* On-the-fly track filtering toggle (locked while recording) */}
         <Pressable
           style={[
             styles.toggleRow,
             postProcessEnabled ? styles.toggleRowOn : styles.toggleRowOff,
+            settingsLocked && styles.toggleRowLocked,
           ]}
           onPress={handleTogglePostProcess}
+          disabled={settingsLocked}
         >
           <View style={styles.toggleLabelWrap}>
             <Text style={styles.toggleTitle}>Фильтрация трека на лету</Text>
             <Text style={styles.toggleSubtitle}>
               {postProcessEnabled
-                ? 'Включена: запись только точных точек GPS (отсекание шумов и выбросов)'
+                ? 'Включена: точность ≤ 25 м, скорость ≤ 20 км/ч — выбросы отсекаются при записи'
                 : 'Выключена: запись сырых GPS-данных без изменений'}
             </Text>
           </View>
@@ -476,12 +514,47 @@ function App(): React.ReactElement {
             style={[
               styles.toggleSwitch,
               postProcessEnabled ? styles.toggleSwitchOn : styles.toggleSwitchOff,
+              settingsLocked && styles.toggleSwitchLocked,
             ]}
           >
             <View
               style={[
                 styles.toggleKnob,
                 postProcessEnabled ? styles.toggleKnobOn : styles.toggleKnobOff,
+              ]}
+            />
+          </View>
+        </Pressable>
+
+        {/* Gaussian / kernel smoothing toggle (locked while recording) */}
+        <Pressable
+          style={[
+            styles.toggleRow,
+            gaussianSmoothingEnabled ? styles.toggleRowOn : styles.toggleRowOff,
+            settingsLocked && styles.toggleRowLocked,
+          ]}
+          onPress={handleToggleGaussianSmoothing}
+          disabled={settingsLocked}
+        >
+          <View style={styles.toggleLabelWrap}>
+            <Text style={styles.toggleTitle}>Сглаживание Гауссом (постобработка)</Text>
+            <Text style={styles.toggleSubtitle}>
+              {gaussianSmoothingEnabled
+                ? 'Включено: после записи к треку применяется гауссово сглаживание (окно ±5 точек, σ=1.5)'
+                : 'Выключено: GPX сохраняется как есть, без финального сглаживания'}
+            </Text>
+          </View>
+          <View
+            style={[
+              styles.toggleSwitch,
+              gaussianSmoothingEnabled ? styles.toggleSwitchOn : styles.toggleSwitchOff,
+              settingsLocked && styles.toggleSwitchLocked,
+            ]}
+          >
+            <View
+              style={[
+                styles.toggleKnob,
+                gaussianSmoothingEnabled ? styles.toggleKnobOn : styles.toggleKnobOff,
               ]}
             />
           </View>
@@ -727,6 +800,13 @@ const styles = StyleSheet.create({
     backgroundColor: '#F9FAFB',
     borderColor: COLOR.divider,
   },
+  // Visual "locked" state — used when recording is in progress so the toggles
+  // are visibly disabled and the user knows they cannot be changed mid-recording.
+  toggleRowLocked: {
+    opacity: 0.55,
+    backgroundColor: '#F3F4F6',
+    borderColor: COLOR.divider,
+  },
   toggleLabelWrap: {
     flex: 1,
     paddingRight: 12,
@@ -751,6 +831,9 @@ const styles = StyleSheet.create({
   },
   toggleSwitchOn: { backgroundColor: COLOR.accentStart },
   toggleSwitchOff: { backgroundColor: '#D1D5DB' },
+  // When locked, the switch is forced to its "off" grey regardless of state
+  // so it visually matches the disabled-looking row.
+  toggleSwitchLocked: { backgroundColor: '#9CA3AF' },
   toggleKnob: {
     width: 20,
     height: 20,
@@ -759,6 +842,32 @@ const styles = StyleSheet.create({
   },
   toggleKnobOn: { alignSelf: 'flex-end' },
   toggleKnobOff: { alignSelf: 'flex-start' },
+  // ---- Settings section header + locked badge ----
+  settingsHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: 8,
+    marginTop: 4,
+    flexWrap: 'wrap',
+    gap: 8,
+  },
+  settingsHeaderText: {
+    fontSize: 11,
+    fontWeight: '700',
+    color: COLOR.secondary,
+    letterSpacing: 2,
+  },
+  settingsLockedBadge: {
+    fontSize: 10,
+    fontWeight: '600',
+    color: COLOR.accentStop,
+    backgroundColor: '#FEF2F2',
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+    borderRadius: 8,
+    overflow: 'hidden',
+  },
   // ---- Permission button ----
   permissionButton: {
     backgroundColor: '#F3F4F6', borderRadius: 12, paddingVertical: 14,
