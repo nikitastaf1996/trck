@@ -6,5 +6,9 @@
     <string name="notification_channel_desc">Ongoing notification while GPS is being recorded in the background.</string>
     <string name="notification_title">Recording GPS…</string>
     <string name="notification_text">%1$d points · %2$s</string>
+    <!-- Phase 3: shown while auto-pause is active (user is stationary). -->
+    <string name="notification_text_paused">Запись приостановлена (остановка) · %1$d points · %2$s</string>
+    <!-- Phase 4: shown when the gap watchdog has declared signal lost. -->
+    <string name="notification_text_signal_lost">Нет сигнала GPS · %1$d points · %2$s</string>
     <string name="notification_action_stop">Stop</string>
 </resources>

@@ -64,6 +64,13 @@ const COLOR = {
   accentStart: '#0A2463',    // navy — START button
   accentStop: '#DC2626',     // red — STOP button
   accentStopping: '#9CA3AF', // gray — STOPPING state
+  // Phase 6: auto-pause / signal-lost palette.
+  pauseAccent: '#D97706',    // amber — auto-paused indicator
+  pauseBg: '#FFFBEB',        // light amber background for pause banner
+  pauseBorder: '#FDE68A',    // amber border for pause banner
+  signalLostAccent: '#DC2626', // red — signal-lost banner
+  signalLostBg: '#FEF2F2',     // light red background for signal-lost banner
+  signalLostBorder: '#FECACA', // red border for signal-lost banner
   gnssGreen: '#16A34A',
   gnssAmber: '#D97706',
   gnssRed: '#DC2626',
@@ -104,6 +111,10 @@ function formatDistance(distanceM: number): { value: string; unit: string } {
 /**
  * Average pace from elapsed time and total distance, in "M:SS" per km.
  * Returns null if there is no measurable distance or elapsed time yet.
+ *
+ * Phase 6: when auto-pause is enabled, callers should pass the active moving
+ * time (movingMs) instead of wall-clock elapsed time so paused intervals
+ * don't inflate the displayed average pace.
  */
 function computeAvgPace(elapsedMs: number, distanceM: number): string | null {
   if (!distanceM || distanceM < 1) return null;
@@ -147,6 +158,11 @@ function App(): React.ReactElement {
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [postProcessEnabled, setPostProcessEnabled] = useState<boolean>(false);
   const [gaussianSmoothingEnabled, setGaussianSmoothingEnabled] = useState<boolean>(false);
+  // Phase 1/3/4: auto-pause setting + live pause / signal state + moving time.
+  const [autoPauseEnabled, setAutoPauseEnabled] = useState<boolean>(false);
+  const [isAutoPaused, setIsAutoPaused] = useState<boolean>(false);
+  const [signalLost, setSignalLost] = useState<boolean>(false);
+  const [movingMs, setMovingMs] = useState<number>(0);
   const startTimeRef = useRef<number | null>(null);
 
   // Sync state from native via getState(). Called on mount, on foreground, and every 2s.
@@ -159,6 +175,10 @@ function App(): React.ReactElement {
         setElapsedMs(state.elapsedMs);
         if (typeof state.distance === 'number') setDistance(state.distance);
         if (state.fixType) setFixType(state.fixType);
+        // Phase 1/3/4: sync auto-pause / signal-lost / moving-time from native.
+        if (typeof state.isAutoPaused === 'boolean') setIsAutoPaused(state.isAutoPaused);
+        if (typeof state.signalLost === 'boolean') setSignalLost(state.signalLost);
+        if (typeof state.movingMs === 'number') setMovingMs(state.movingMs);
         if (state.lastFix) {
           setAccuracy(state.lastFix.accuracy);
           setCurrentSpeed(state.lastFix.speed);
@@ -201,6 +221,12 @@ function App(): React.ReactElement {
           if (mounted) setGaussianSmoothingEnabled(gs);
         } catch { /* ignore */ }
 
+        // Phase 1: load the auto-pause setting from native prefs.
+        try {
+          const ap = await GpsRecorder.getAutoPauseEnabled();
+          if (mounted) setAutoPauseEnabled(ap);
+        } catch { /* ignore */ }
+
         // Start the always-on GNSS monitor so the UI shows fix status even
         // before recording starts.
         if (granted) {
@@ -236,6 +262,10 @@ function App(): React.ReactElement {
         if (ev.accuracy != null) setAccuracy(ev.accuracy);
         if (ev.speed != null) setCurrentSpeed(ev.speed);
         setHasFix(ev.fixType !== 'no fix');
+        // Phase 1/3/4: live auto-pause / signal-lost / moving-time.
+        if (typeof ev.isAutoPaused === 'boolean') setIsAutoPaused(ev.isAutoPaused);
+        if (typeof ev.signalLost === 'boolean') setSignalLost(ev.signalLost);
+        if (typeof ev.movingMs === 'number') setMovingMs(ev.movingMs);
       }),
       subscribe('duration', (ev) => {
         setElapsedMs(ev.elapsedMs);
@@ -249,6 +279,11 @@ function App(): React.ReactElement {
           setPointCount(ev.pointCount);
           setElapsedMs(ev.elapsedMs);
           startTimeRef.current = Date.now() - ev.elapsedMs;
+          // Phase 1/3/4: sync live pause / signal / moving-time on state
+          // transitions (e.g. when the watchdog fires or auto-pause toggles).
+          if (typeof ev.isAutoPaused === 'boolean') setIsAutoPaused(ev.isAutoPaused);
+          if (typeof ev.signalLost === 'boolean') setSignalLost(ev.signalLost);
+          if (typeof ev.movingMs === 'number') setMovingMs(ev.movingMs);
         } else {
           setRecordingState('idle');
           setPointCount(0);
@@ -257,6 +292,10 @@ function App(): React.ReactElement {
           setCurrentSpeed(null);
           setFixType('no fix');
           setHasFix(false);
+          // Phase 1/3/4: reset live state when recording stops.
+          setIsAutoPaused(false);
+          setSignalLost(false);
+          setMovingMs(0);
           startTimeRef.current = null;
         }
       }),
@@ -269,6 +308,10 @@ function App(): React.ReactElement {
         setFixType('no fix');
         setHasFix(false);
         setRecordingState('idle');
+        // Phase 1/3/4: clear live pause / signal / moving-time after save.
+        setIsAutoPaused(false);
+        setSignalLost(false);
+        setMovingMs(0);
         startTimeRef.current = null;
       }),
       subscribe('error', (ev) => {
@@ -408,9 +451,32 @@ function App(): React.ReactElement {
     }
   }, [gaussianSmoothingEnabled, settingsLocked]);
 
+  // Phase 1: toggle the auto-pause setting. Persisted in the separate
+  // settings prefs file so it survives the per-recording state clear. Like
+  // the other two settings, it is locked during an active recording so
+  // toggling it mid-recording can't change the stop-detection behaviour
+  // halfway through the file.
+  const handleToggleAutoPause = useCallback(async () => {
+    if (settingsLocked) return;
+    const next = !autoPauseEnabled;
+    setAutoPauseEnabled(next);
+    try {
+      const confirmed = await GpsRecorder.setAutoPauseEnabled(next);
+      setAutoPauseEnabled(confirmed);
+    } catch (e: any) {
+      setAutoPauseEnabled(!next);
+      setErrorMsg(e?.message ?? String(e));
+    }
+  }, [autoPauseEnabled, settingsLocked]);
+
   const distanceFmt = formatDistance(distance);
   const currentPace = computeCurrentPace(currentSpeed);
-  const avgPace = computeAvgPace(elapsedMs, distance);
+  // Phase 6: when auto-pause is enabled, compute average pace using the
+  // active moving time (which excludes paused intervals) instead of wall-
+  // clock elapsed time. This keeps the displayed avg pace honest when the
+  // user stands still for long stretches (e.g. at traffic lights).
+  const paceTimeMs = autoPauseEnabled ? movingMs : elapsedMs;
+  const avgPace = computeAvgPace(paceTimeMs, distance);
 
   return (
     <SafeAreaView style={styles.container}>
@@ -428,8 +494,36 @@ function App(): React.ReactElement {
           hasFix={hasFix}
         />
 
+        {/* Phase 4: signal-loss banner. Shown when the gap watchdog in the
+            service has declared signal lost (no fix in 15+ seconds) while a
+            recording is in progress. */}
+        {isRecording && signalLost && (
+          <View style={styles.signalLostBanner}>
+            <Text style={styles.signalLostTitle}>ПОТЕРЯ СИГНАЛА GPS</Text>
+            <Text style={styles.signalLostText}>
+              Нет фиксации более 15 с. Запись продолжится; новый сегмент
+              трека начнётся автоматически при восстановлении сигнала.
+            </Text>
+          </View>
+        )}
+
         {/* Primary stats: TIME, DISTANCE, PACE, AVG PACE */}
-        <BigStat label="ВРЕМЯ" value={formatDuration(elapsedMs)} />
+        <BigStat
+          label="ВРЕМЯ"
+          value={formatDuration(elapsedMs)}
+          // Phase 3: when auto-pause is active, render the TIME value in
+          // amber and show a small "ПАУЗА" indicator above it so the user
+          // knows the timer is wall-clock but recording is paused.
+          valueColor={isAutoPaused ? COLOR.pauseAccent : undefined}
+        />
+        {isAutoPaused && (
+          <View style={styles.pauseBadge}>
+            <View style={styles.pauseDot} />
+            <Text style={styles.pauseBadgeText}>
+              АВТОПАУЗА · запись приостановлена
+            </Text>
+          </View>
+        )}
         <Divider />
 
         <BigStat
@@ -457,9 +551,28 @@ function App(): React.ReactElement {
 
         {/* Status / recording indicator */}
         <View style={styles.statusRow}>
-          <View style={[styles.statusDot, isRecording ? styles.dotOn : styles.dotOff]} />
+          <View
+            style={[
+              styles.statusDot,
+              isAutoPaused
+            ? styles.dotPaused
+            : isRecording
+            ? styles.dotOn
+            : styles.dotOff,
+            ]}
+          />
           <Text style={styles.statusText}>
-            {isRecording ? 'ЗАПИСЬ' : isStopping ? 'ОСТАНОВКА…' : pointCount > 0 ? `${pointCount} ТОЧЕК` : 'ОЖИДАНИЕ'}
+            {isAutoPaused
+              ? 'АВТОПАУЗА'
+              : signalLost
+              ? 'НЕТ СИГНАЛА'
+              : isRecording
+              ? 'ЗАПИСЬ'
+              : isStopping
+              ? 'ОСТАНОВКА…'
+              : pointCount > 0
+              ? `${pointCount} ТОЧЕК`
+              : 'ОЖИДАНИЕ'}
           </Text>
         </View>
 
@@ -560,6 +673,45 @@ function App(): React.ReactElement {
           </View>
         </Pressable>
 
+        {/* Phase 1/3: Auto-pause toggle (locked while recording). When
+            enabled, recording auto-pauses while the user is stationary
+            (speed < 0.35 m/s + max displacement in 10 s window < 3.5 m) and
+            auto-resumes when they start moving again. The track is split
+            into separate <trkseg> blocks at each pause / resume so the GPX
+            file has clean segment breaks. */}
+        <Pressable
+          style={[
+            styles.toggleRow,
+            autoPauseEnabled ? styles.toggleRowOn : styles.toggleRowOff,
+            settingsLocked && styles.toggleRowLocked,
+          ]}
+          onPress={handleToggleAutoPause}
+          disabled={settingsLocked}
+        >
+          <View style={styles.toggleLabelWrap}>
+            <Text style={styles.toggleTitle}>Автопауза при остановке</Text>
+            <Text style={styles.toggleSubtitle}>
+              {autoPauseEnabled
+                ? 'Включена: пауза при скорости < 0.35 м/с и смещении < 3.5 м за 10 с. Средний темп считается по чистому времени движения'
+                : 'Выключена: запись идёт непрерывно, даже когда вы стоите на месте'}
+            </Text>
+          </View>
+          <View
+            style={[
+              styles.toggleSwitch,
+              autoPauseEnabled ? styles.toggleSwitchOn : styles.toggleSwitchOff,
+              settingsLocked && styles.toggleSwitchLocked,
+            ]}
+          >
+            <View
+              style={[
+                styles.toggleKnob,
+                autoPauseEnabled ? styles.toggleKnobOn : styles.toggleKnobOff,
+              ]}
+            />
+          </View>
+        </Pressable>
+
         {!hasPermissions && (
           <Pressable style={styles.permissionButton} onPress={handleGrantPermissions}>
             <Text style={styles.permissionButtonText}>
@@ -596,23 +748,34 @@ function App(): React.ReactElement {
 /**
  * Big-stat block: small uppercase label, then a huge numeral. Optional `unit`
  * is rendered small and to the right of the value (e.g. "km", "/km").
+ * Phase 3: optional `valueColor` overrides the default navy when the value
+ * needs to be visually de-emphasized (e.g. the TIME value turns amber while
+ * auto-pause is active).
  */
 function BigStat({
   label,
   value,
   unit,
   compact,
+  valueColor,
 }: {
   label: string;
   value: string;
   unit?: string;
   compact?: boolean;
+  valueColor?: string;
 }): React.ReactElement {
   return (
     <View style={[styles.statBlock, compact ? styles.statBlockCompact : null]}>
       <Text style={styles.statLabel}>{label}</Text>
       <View style={styles.statValueRow}>
-        <Text style={[styles.statValue, compact ? styles.statValueCompact : null]}>
+        <Text
+          style={[
+            styles.statValue,
+            compact ? styles.statValueCompact : null,
+            valueColor != null ? { color: valueColor } : null,
+          ]}
+        >
           {value}
         </Text>
         {unit != null && <Text style={styles.statUnit}>{unit}</Text>}
@@ -759,11 +922,53 @@ const styles = StyleSheet.create({
   },
   dotOn: { backgroundColor: COLOR.accentStop },
   dotOff: { backgroundColor: COLOR.gnssGray },
+  // Phase 3: amber dot shown while auto-pause is active.
+  dotPaused: { backgroundColor: COLOR.pauseAccent },
   statusText: {
     fontSize: 11,
     fontWeight: '700',
     color: COLOR.secondary,
     letterSpacing: 1.5,
+  },
+  // ---- Phase 3: auto-pause badge (shown below the TIME stat) ----
+  pauseBadge: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 8,
+    marginTop: -8,
+    marginBottom: 4,
+  },
+  pauseDot: {
+    width: 8, height: 8, borderRadius: 4,
+    backgroundColor: COLOR.pauseAccent,
+  },
+  pauseBadgeText: {
+    fontSize: 11,
+    fontWeight: '700',
+    color: COLOR.pauseAccent,
+    letterSpacing: 1.5,
+  },
+  // ---- Phase 4: signal-lost banner ----
+  signalLostBanner: {
+    backgroundColor: COLOR.signalLostBg,
+    borderRadius: 12,
+    padding: 14,
+    marginBottom: 16,
+    borderWidth: 1,
+    borderColor: COLOR.signalLostBorder,
+  },
+  signalLostTitle: {
+    fontSize: 12,
+    fontWeight: '800',
+    color: COLOR.signalLostAccent,
+    letterSpacing: 1.5,
+    marginBottom: 6,
+  },
+  signalLostText: {
+    fontSize: 12,
+    color: COLOR.signalLostAccent,
+    lineHeight: 17,
   },
   // ---- Big button ----
   buttonWrap: { alignItems: 'center', marginTop: 24, marginBottom: 16 },

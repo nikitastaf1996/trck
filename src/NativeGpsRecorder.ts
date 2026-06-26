@@ -19,6 +19,12 @@ export type GpsLocationEvent = {
   distance: number;      // total distance traveled so far, meters
   timestamp: number; // epoch ms
   pointCount: number;
+  // Phase 1/3/4: auto-pause / signal-lost / moving-time so the UI can
+  // reflect pause / gap status in real time. These are emitted on every
+  // 'location' event alongside the rest of the fix data.
+  isAutoPaused: boolean;  // true while auto-pause is active (user stationary)
+  signalLost: boolean;    // true while the gap watchdog has declared signal lost
+  movingMs: number;       // active moving time (excludes auto-paused intervals)
 };
 
 export type GpsDurationEvent = {
@@ -29,6 +35,12 @@ export type GpsStateEvent = {
   isRecording: boolean;
   pointCount: number;
   elapsedMs: number;
+  // Phase 1/3/4: same live state fields as GpsLocationEvent, so the UI
+  // can sync pause / signal / moving-time from getState() polling even
+  // when event delivery is unreliable.
+  isAutoPaused: boolean;
+  signalLost: boolean;
+  movingMs: number;
 };
 
 export type GpsSavedEvent = {
@@ -65,6 +77,12 @@ export type GpsFullState = {
   distance: number;          // total distance traveled, meters
   fixType: GpsFixType;       // GNSS fix status
   lastFix: GpsLocationEvent | null;
+  // Phase 1/3/4: live state for auto-pause / signal-loss / moving-time.
+  // These come from the per-recording prefs so they survive service
+  // restarts and are always available via getState() polling.
+  isAutoPaused: boolean;
+  signalLost: boolean;
+  movingMs: number;
 };
 
 export type GpsRecorderEvents = {
@@ -91,6 +109,10 @@ type GpsRecorderNativeType = {
   getPostProcessEnabled(): Promise<boolean>;
   setGaussianSmoothingEnabled(enabled: boolean): Promise<boolean>;
   getGaussianSmoothingEnabled(): Promise<boolean>;
+  // Phase 1: auto-pause (stop detection) toggle. Persisted in the separate
+  // settings prefs file so it survives the per-recording state clear.
+  setAutoPauseEnabled(enabled: boolean): Promise<boolean>;
+  getAutoPauseEnabled(): Promise<boolean>;
   addListener(eventName: string): void;
   removeListeners(count: number): void;
 };
@@ -106,6 +128,9 @@ const NativeGpsRecorder = (NativeModules.GpsRecorder as GpsRecorderNativeType) |
     distance: 0,
     fixType: 'no fix' as GpsFixType,
     lastFix: null,
+    isAutoPaused: false,
+    signalLost: false,
+    movingMs: 0,
   }),
   requestPermissions: async () => false,
   hasPermissions: async () => false,
@@ -117,6 +142,8 @@ const NativeGpsRecorder = (NativeModules.GpsRecorder as GpsRecorderNativeType) |
   getPostProcessEnabled: async () => false,
   setGaussianSmoothingEnabled: async (_enabled: boolean) => false,
   getGaussianSmoothingEnabled: async () => false,
+  setAutoPauseEnabled: async (_enabled: boolean) => false,
+  getAutoPauseEnabled: async () => false,
   addListener: () => {},
   removeListeners: () => {},
 };
@@ -136,6 +163,8 @@ export const GpsRecorder = {
   getPostProcessEnabled: () => NativeGpsRecorder.getPostProcessEnabled(),
   setGaussianSmoothingEnabled: (enabled: boolean) => NativeGpsRecorder.setGaussianSmoothingEnabled(enabled),
   getGaussianSmoothingEnabled: () => NativeGpsRecorder.getGaussianSmoothingEnabled(),
+  setAutoPauseEnabled: (enabled: boolean) => NativeGpsRecorder.setAutoPauseEnabled(enabled),
+  getAutoPauseEnabled: () => NativeGpsRecorder.getAutoPauseEnabled(),
 };
 
 /**

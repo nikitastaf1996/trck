@@ -34,6 +34,7 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.TimeZone
+import java.util.LinkedList
 
 /**
  * GpsRecorderService
@@ -76,6 +77,17 @@ class GpsRecorderService : Service(), LocationListener {
         private const val KEY_TOTAL_DISTANCE = "total_distance_m"
         private const val KEY_FIX_TYPE = "fix_type"
         private const val KEY_SATELLITES_USED = "satellites_used"
+
+        // ---- Auto-pause / gap-detection prefs (Phase 1) ----
+        // KEY_AUTO_PAUSE_ENABLED lives in the SEPARATE settings prefs file
+        // ("gps_recorder_settings") so it survives the per-recording state
+        // clear in stopRecording(). KEY_IS_AUTO_PAUSED / KEY_SIGNAL_LOST /
+        // KEY_MOVING_MS live in PREFS_NAME because they are per-recording
+        // live state, just like KEY_IS_RECORDING.
+        private const val KEY_AUTO_PAUSE_ENABLED = "auto_pause_enabled"
+        private const val KEY_IS_AUTO_PAUSED = "is_auto_paused"
+        private const val KEY_SIGNAL_LOST = "signal_lost"
+        private const val KEY_MOVING_MS = "moving_ms"
         // Last fix (updated on every GPS callback so JS can poll via getState())
         private const val KEY_LAST_LAT = "last_lat"
         private const val KEY_LAST_LON = "last_lon"
@@ -141,6 +153,27 @@ class GpsRecorderService : Service(), LocationListener {
         private const val POST_PROCESS_ACCURACY_THRESHOLD_M = 15.0f
         private const val POST_PROCESS_JUMP_THRESHOLD_M = 15.0
         private const val POST_PROCESS_GAP_THRESHOLD_S = 5.0
+
+        // ---- Auto-pause (stop detection) (Phase 3) ----
+        // Sliding window of recent raw fixes used to detect stops. We keep
+        // the last AUTO_PAUSE_RAW_WINDOW_MS of fixes (regardless of whether
+        // they passed the on-the-fly filter) and look at the maximum
+        // pairwise displacement inside that window.
+        private const val AUTO_PAUSE_RAW_WINDOW_MS = 10_000L
+        // Instantaneous speed below which the user is considered stationary.
+        // 0.35 m/s ~ 1.26 km/h — a slow shuffle; anything below this is
+        // effectively standing still.
+        private const val AUTO_PAUSE_SPEED_THRESHOLD_MPS = 0.35f
+        // Maximum pairwise displacement within the sliding window below
+        // which the user is considered stationary (i.e. not just bouncing
+        // in place due to GPS noise). 3.5 m ~ the diameter of a typical
+        // urban GPS noise bubble when standing still.
+        private const val AUTO_PAUSE_DISPLACEMENT_THRESHOLD_M = 3.5
+
+        // ---- Gap detection (signal loss) (Phase 4) ----
+        // If no GPS fix arrives for this many ms, declare a signal gap and
+        // split the track into a new <trkseg> when the next fix does arrive.
+        private const val GAP_THRESHOLD_MS = 15_000L
     }
 
     private var locationManager: LocationManager? = null
@@ -150,7 +183,7 @@ class GpsRecorderService : Service(), LocationListener {
     // Recording state (persisted to SharedPreferences for recovery)
     @Volatile private var isRecording = false
     private var startTimeMs: Long = 0L
-    private var pointCount: Int = 0
+    @Volatile private var pointCount: Int = 0
     private var tempFileName: String? = null
 
     // Distance accumulator (meters). Persisted so it survives service restarts.
@@ -163,13 +196,44 @@ class GpsRecorderService : Service(), LocationListener {
 
     // Previous point used for distance accumulation + velocity-based filtering
     // (Haversine distance and dt between consecutive accepted fixes).
+    // Nullified by resetValidationCursor() on auto-pause transitions and
+    // gap-recovery events so the next accepted fix isn't validated against
+    // a stale previous point.
     @Volatile private var prevLat: Double? = null
     @Volatile private var prevLon: Double? = null
     @Volatile private var prevTimeMs: Long? = null
 
-    // In-memory buffer of GPX points; also persisted to temp file periodically
-    private val pointBuffer = ArrayList<GpsPoint>(1024)
+    // ---- Segmented track buffer (Phase 2) ----
+    // Replaces the flat pointBuffer. Each segment corresponds to one
+    // <trkseg> in the output GPX. New segments are created on auto-pause
+    // transitions and gap-detection events so the final track has clean
+    // breaks at those points (no straight-line "stitches" across pauses /
+    // gaps). The currently-active segment is `currentSegment`; finalized
+    // segments live in `trackSegments`.
+    private val trackSegments = ArrayList<ArrayList<GpsPoint>>()
+    @Volatile private var currentSegment = ArrayList<GpsPoint>()
     private val pointBufferLock = Any()
+
+    // ---- Auto-pause state (Phase 3) ----
+    @Volatile private var isAutoPaused: Boolean = false
+    // Sliding window of the last AUTO_PAUSE_RAW_WINDOW_MS of raw fixes,
+    // used to compute displacement for stop detection. Raw = fixes that
+    // arrive from onLocationChanged, regardless of whether they passed
+    // the on-the-fly filter.
+    private val rawWindow: LinkedList<GpsPoint> = LinkedList()
+
+    // ---- Gap detection state (Phase 4) ----
+    // True when the watchdog has declared a signal gap (no fix in
+    // GAP_THRESHOLD_MS). Cleared on gap recovery inside onLocationChanged.
+    @Volatile private var signalLost: Boolean = false
+
+    // ---- Moving time accumulator (Phase 6 helper) ----
+    // When auto-pause is enabled, this accumulates ONLY the time spent
+    // actually moving (i.e. not in isAutoPaused). Used by JS to compute
+    // pace based on active moving time instead of wall-clock elapsed time.
+    // When auto-pause is disabled, this stays equal to elapsedMs.
+    @Volatile private var movingMs: Long = 0L
+    @Volatile private var lastResumeMs: Long? = null
 
     // Duration tick runnable
     private val durationTick = object : Runnable {
@@ -182,11 +246,27 @@ class GpsRecorderService : Service(), LocationListener {
         }
     }
 
-    // Periodic flush to temp file
+    // Periodic flush to temp file + gap-detection watchdog.
     private val flushTick = object : Runnable {
         override fun run() {
             if (isRecording) {
                 flushToTempFile()
+                // Gap watchdog (Phase 4): if no fix in GAP_THRESHOLD_MS,
+                // declare signal lost so the UI can show a warning and
+                // so the next arriving fix triggers a segment split.
+                if (!signalLost && lastFixTimeMs > 0L) {
+                    val sinceLast = System.currentTimeMillis() - lastFixTimeMs
+                    if (sinceLast > GAP_THRESHOLD_MS) {
+                        signalLost = true
+                        Log.w(TAG, "Signal lost: no fix for ${sinceLast}ms")
+                        persistAutoPauseState()
+                        updateNotification()
+                        GpsRecorderModule.emitState(
+                            isRecording, pointCount, getElapsedMs(),
+                            isAutoPaused, signalLost, movingMs
+                        )
+                    }
+                }
                 handler.postDelayed(this, FLUSH_INTERVAL_MS)
             }
         }
@@ -269,6 +349,12 @@ class GpsRecorderService : Service(), LocationListener {
             }
             Log.i(TAG, "Resuming recording after system restart")
             // Do NOT reset state — continue from where we left off.
+            // If we were not auto-paused when the service was killed, treat
+            // the resume instant as the start of a new moving segment so
+            // movingMs accumulates correctly going forward.
+            if (!isAutoPaused) {
+                lastResumeMs = System.currentTimeMillis()
+            }
         } else {
             // The user explicitly pressed START. Always start a fresh recording,
             // even if isRecording happens to be true (e.g. leftover state from a
@@ -286,7 +372,18 @@ class GpsRecorderService : Service(), LocationListener {
             prevTimeMs = null
             satellitesUsed = 0
             lastFixTimeMs = 0L
-            synchronized(pointBufferLock) { pointBuffer.clear() }
+            // Phase 2: reset segmented buffer.
+            synchronized(pointBufferLock) {
+                trackSegments.clear()
+                currentSegment = ArrayList()
+            }
+            // Phase 3/4: reset auto-pause + gap-detection state.
+            isAutoPaused = false
+            signalLost = false
+            rawWindow.clear()
+            // Phase 6: reset moving-time accumulator.
+            movingMs = 0L
+            lastResumeMs = startTimeMs
             tempFileName = "gps_temp_${startTimeMs}.gpx"
         }
         isRecording = true
@@ -314,7 +411,10 @@ class GpsRecorderService : Service(), LocationListener {
             writeGpxHeaderToTempFile()
         }
 
-        GpsRecorderModule.emitState(true, pointCount, System.currentTimeMillis() - startTimeMs)
+        GpsRecorderModule.emitState(
+            true, pointCount, System.currentTimeMillis() - startTimeMs,
+            isAutoPaused, signalLost, movingMs
+        )
         Log.i(TAG, "Recording started at $startTimeMs (resume=$resume)")
     }
 
@@ -333,6 +433,14 @@ class GpsRecorderService : Service(), LocationListener {
         stopLocationUpdates()
         stopGnssStatusTracking()
 
+        // Finalize the moving-time accumulator (add the segment from the
+        // last resume up to "now" to movingMs).
+        lastResumeMs?.let { r ->
+            val now = System.currentTimeMillis()
+            if (now > r) movingMs += (now - r)
+        }
+        lastResumeMs = null
+
         // Final flush + finalize the GPX file
         val savedFilePath = finalizeGpxFile()
 
@@ -344,7 +452,7 @@ class GpsRecorderService : Service(), LocationListener {
 
         // Tell JS (if alive) that we saved a file
         GpsRecorderModule.emitSaved(savedFilePath, pointCount)
-        GpsRecorderModule.emitState(false, 0, 0L)
+        GpsRecorderModule.emitState(false, 0, 0L, false, false, 0L)
 
         // Stop foreground + service
         stopForeground(STOP_FOREGROUND_REMOVE)
@@ -395,6 +503,21 @@ class GpsRecorderService : Service(), LocationListener {
     }
 
     private fun buildNotification(points: Int, elapsedMs: Long): Notification {
+        return buildNotificationWithText(points, elapsedMs, isAutoPaused, signalLost)
+    }
+
+    /**
+     * Builds the foreground-service notification with optional auto-pause /
+     * signal-lost text variants. Called by [buildNotification] for the normal
+     * case and directly when we change pause / signal state and want to
+     * refresh the notification immediately.
+     */
+    private fun buildNotificationWithText(
+        points: Int,
+        elapsedMs: Long,
+        paused: Boolean,
+        signalLost: Boolean
+    ): Notification {
         val mainIntent = Intent(this, MainActivity::class.java).apply {
             flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
         }
@@ -411,7 +534,11 @@ class GpsRecorderService : Service(), LocationListener {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
-        val text = getString(R.string.notification_text, points, formatDuration(elapsedMs))
+        val text = when {
+            signalLost -> getString(R.string.notification_text_signal_lost, points, formatDuration(elapsedMs))
+            paused -> getString(R.string.notification_text_paused, points, formatDuration(elapsedMs))
+            else -> getString(R.string.notification_text, points, formatDuration(elapsedMs))
+        }
 
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle(getString(R.string.notification_title))
@@ -432,10 +559,6 @@ class GpsRecorderService : Service(), LocationListener {
         val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
         nm.notify(NOTIFICATION_ID, buildNotification(pointCount, getElapsedMs()))
     }
-
-    // ------------------------------------------------------------------
-    // GPS
-    // ------------------------------------------------------------------
 
     private fun startLocationUpdates() {
         if (locationManager == null) {
@@ -566,6 +689,199 @@ class GpsRecorderService : Service(), LocationListener {
         satellitesUsed = 0
     }
 
+    // ------------------------------------------------------------------
+    // Phase 2/3/4: segmented buffer, auto-pause, gap-detection helpers
+    // ------------------------------------------------------------------
+
+    /**
+     * Finalizes the current segment (if non-empty) and starts a new, empty
+     * one. Called on auto-pause transitions and gap-recovery events so the
+     * track has clean <trkseg> breaks at those points (no straight-line
+     * "stitches" across pauses / gaps).
+     *
+     * Safe to call when currentSegment is already empty — it is a no-op in
+     * that case.
+     */
+    private fun createNewSegment() {
+        synchronized(pointBufferLock) {
+            if (currentSegment.isNotEmpty()) {
+                trackSegments.add(currentSegment)
+                currentSegment = ArrayList()
+            }
+        }
+    }
+
+    /**
+     * Nullifies the prev-fix cursor used by the velocity / distance gates.
+     * Called on auto-pause transitions and gap-recovery events so the next
+     * accepted fix isn't validated against a stale previous point (which
+     * would either be dropped by the velocity gate or inflate the distance
+     * with a straight-line jump across the pause / gap).
+     */
+    private fun resetValidationCursor() {
+        prevLat = null
+        prevLon = null
+        prevTimeMs = null
+    }
+
+    /**
+     * Returns a flat snapshot of all points across all finalized segments
+     * plus the currently-active segment. Used by callers that need a single
+     * ordered list (e.g. for total count or temp-file flushing).
+     */
+    private fun allPointsSnapshot(): List<GpsPoint> = synchronized(pointBufferLock) {
+        val out = ArrayList<GpsPoint>(
+            (trackSegments.size.coerceAtLeast(1)) * 64 + currentSegment.size
+        )
+        for (seg in trackSegments) out.addAll(seg)
+        out.addAll(currentSegment)
+        out
+    }
+
+    /**
+     * Returns the total number of points across all finalized segments plus
+     * the currently-active segment. This is the value reported to JS as
+     * `pointCount`.
+     */
+    private fun totalPointCount(): Int = synchronized(pointBufferLock) {
+        var n = currentSegment.size
+        for (seg in trackSegments) n += seg.size
+        n
+    }
+
+    /**
+     * Returns a snapshot of all segments (finalized + current) for serialization.
+     * Each inner list is one <trkseg>.
+     */
+    private fun segmentsSnapshot(): List<List<GpsPoint>> = synchronized(pointBufferLock) {
+        val out = ArrayList<List<GpsPoint>>(trackSegments.size + 1)
+        for (seg in trackSegments) out.add(ArrayList(seg))
+        out.add(ArrayList(currentSegment))
+        out
+    }
+
+    /**
+     * Adds a point to the currently-active segment and refreshes [pointCount].
+     * Caller must have already validated the point (accuracy / velocity gates,
+     * auto-pause / gap detection, etc.).
+     */
+    private fun appendPointToCurrentSegment(pt: GpsPoint) {
+        synchronized(pointBufferLock) {
+            currentSegment.add(pt)
+            pointCount = currentSegment.size + trackSegments.sumOf { it.size }
+        }
+    }
+
+    /**
+     * Returns the maximum pairwise Haversine distance (in meters) between
+     * any two points in the sliding raw window. Used by auto-pause to confirm
+     * that the user is actually standing still (and not just momentarily
+     * slow at the start of a sprint).
+     *
+     * O(n^2) in the window size — at 1 Hz over 10 s that's ~45 comparisons,
+     * which is negligible.
+     */
+    private fun maxDisplacementInWindow(): Double {
+        // Take a snapshot under no lock (rawWindow is only touched on the
+        // main thread by onLocationChanged, so this is safe).
+        val pts = ArrayList(rawWindow)
+        if (pts.size < 2) return 0.0
+        var maxD = 0.0
+        for (i in pts.indices) {
+            val a = pts[i]
+            for (j in (i + 1) until pts.size) {
+                val b = pts[j]
+                val d = haversineMeters(a.lat, a.lon, b.lat, b.lon)
+                if (d > maxD) maxD = d
+            }
+        }
+        return maxD
+    }
+
+    /**
+     * Reads the auto-pause setting from the SEPARATE settings prefs file.
+     * The setting is written by GpsRecorderModule.setAutoPauseEnabled() from JS.
+     * Stored apart from `gps_recorder_state` so it survives the per-recording
+     * state clear in stopRecording().
+     */
+    private fun isAutoPauseEnabled(): Boolean {
+        return getSharedPreferences("gps_recorder_settings", Context.MODE_PRIVATE)
+            .getBoolean(KEY_AUTO_PAUSE_ENABLED, false)
+    }
+
+    /**
+     * Persists the auto-pause / signal-lost / moving-time live state to
+     * SharedPreferences so it survives service restarts and can be polled
+     * via getState(). Called whenever these flags change (whether or not a
+     * new fix arrived).
+     */
+    private fun persistAutoPauseState() {
+        try {
+            getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit()
+                .putBoolean(KEY_IS_AUTO_PAUSED, isAutoPaused)
+                .putBoolean(KEY_SIGNAL_LOST, signalLost)
+                .putLong(KEY_MOVING_MS, movingMs)
+                .apply()
+        } catch (e: Exception) {
+            Log.w(TAG, "persistAutoPauseState failed", e)
+        }
+    }
+
+    /**
+     * Enters auto-pause: stops recording points, finalizes the current
+     * segment so the post-pause segment is distinct, freezes the moving-time
+     * accumulator, and updates the foreground notification.
+     */
+    private fun enterAutoPause(now: Long) {
+        isAutoPaused = true
+        resetValidationCursor()
+        createNewSegment()
+        // Freeze the moving-time accumulator.
+        lastResumeMs?.let { r ->
+            if (now > r) movingMs += (now - r)
+        }
+        lastResumeMs = null
+        persistAutoPauseState()
+        updateNotification()
+        Log.i(TAG, "Auto-pause entered at $now (movingMs=$movingMs)")
+    }
+
+    /**
+     * Exits auto-pause: starts a new segment for the post-pause data,
+     * resets the validation cursor so the first post-pause fix isn't dropped
+     * by the velocity gate, and resumes the moving-time accumulator.
+     */
+    private fun exitAutoPause(now: Long) {
+        isAutoPaused = false
+        resetValidationCursor()
+        createNewSegment()  // no-op if currentSegment is empty (typical case)
+        lastResumeMs = now
+        persistAutoPauseState()
+        updateNotification()
+        Log.i(TAG, "Auto-pause exited at $now (movingMs=$movingMs)")
+    }
+
+    /**
+     * Handles gap recovery: called inside onLocationChanged when a new fix
+     * arrives after a signal gap (> GAP_THRESHOLD_MS since the last fix, or
+     * when the watchdog has already declared signalLost). Splits the track
+     * into a new segment and resets the validation cursor so the velocity
+     * gate doesn't compare across the gap. Distance across the gap is NOT
+     * added to totalDistanceM (prevLat is null after reset).
+     */
+    private fun handleGapRecovery(now: Long) {
+        resetValidationCursor()
+        createNewSegment()
+        signalLost = false
+        persistAutoPauseState()
+        updateNotification()
+        Log.i(TAG, "Gap recovered at $now — new segment started")
+    }
+
+    // ------------------------------------------------------------------
+    // GPS callback
+    // ------------------------------------------------------------------
+
     override fun onLocationChanged(location: Location) {
         if (!isRecording) return
         val pt = GpsPoint(
@@ -586,6 +902,81 @@ class GpsRecorderService : Service(), LocationListener {
             Log.w(TAG, "Dropping stale fix: age=${fixAgeMs}ms lat=${pt.lat} lon=${pt.lon}")
             return
         }
+
+        // ---- Phase 4: Gap detection (signal loss) ----
+        // If this fix arrived more than GAP_THRESHOLD_MS after the previous one,
+        // OR if the watchdog has already declared signalLost, treat this as gap
+        // recovery: split the track into a new segment and reset the validation
+        // cursor so the velocity gate doesn't compare across the gap. Distance
+        // across the gap is NOT added to totalDistanceM (prevLat is null after
+        // reset, so both the velocity gate and accumulateDistance skip it).
+        val gapDetected = lastFixTimeMs > 0L && (pt.timeMs - lastFixTimeMs) > GAP_THRESHOLD_MS
+        if (gapDetected || signalLost) {
+            Log.i(
+                TAG,
+                "Gap recovery: gapSinceLast=${if (lastFixTimeMs > 0L) pt.timeMs - lastFixTimeMs else -1}ms" +
+                    " signalLostWas=$signalLost"
+            )
+            handleGapRecovery(pt.timeMs)
+        }
+
+        // ---- Phase 3: Auto-pause (stop detection) ----
+        // When enabled, we maintain a sliding window of the last
+        // AUTO_PAUSE_RAW_WINDOW_MS of raw fixes and check two conditions:
+        //   1. Instantaneous speed < AUTO_PAUSE_SPEED_THRESHOLD_MPS
+        //   2. Maximum pairwise displacement in the window < AUTO_PAUSE_DISPLACEMENT_THRESHOLD_M
+        // If both are true, the user is considered stationary; we enter (or
+        // stay in) auto-pause and skip recording the point. When the user
+        // starts moving again, we exit auto-pause and start a new segment.
+        if (isAutoPauseEnabled()) {
+            // Push to sliding raw window and prune entries older than the window.
+            rawWindow.add(pt)
+            val windowCutoff = pt.timeMs - AUTO_PAUSE_RAW_WINDOW_MS
+            while (rawWindow.isNotEmpty() && rawWindow.peek().timeMs < windowCutoff) {
+                rawWindow.poll()
+            }
+
+            val speedOk = (pt.speed ?: 0f) < AUTO_PAUSE_SPEED_THRESHOLD_MPS
+            val disp = maxDisplacementInWindow()
+            val dispOk = disp < AUTO_PAUSE_DISPLACEMENT_THRESHOLD_M
+            val stopped = speedOk && dispOk
+
+            if (stopped) {
+                // User is stationary.
+                if (!isAutoPaused) {
+                    Log.i(
+                        TAG,
+                        "Auto-pause entering: speed=${pt.speed} disp=${disp}m window=${rawWindow.size}"
+                    )
+                    enterAutoPause(pt.timeMs)
+                }
+                // While paused: do NOT add the point to the buffer and do NOT
+                // accumulate distance. But DO update lastFixTimeMs and live
+                // state so the UI knows we still have a fix (and isn't fooled
+                // into thinking we lost signal).
+                lastFixTimeMs = pt.timeMs
+                saveLiveState(pt)
+                GpsRecorderModule.emitLocation(
+                    pt.lat, pt.lon, pt.alt, pt.speed, pt.accuracy,
+                    computeFixType(), totalDistanceM, pt.timeMs, pointCount,
+                    isAutoPaused, signalLost, movingMs
+                )
+                return
+            } else {
+                // User is moving.
+                if (isAutoPaused) {
+                    Log.i(
+                        TAG,
+                        "Auto-pause resuming: speed=${pt.speed} disp=${disp}m window=${rawWindow.size}"
+                    )
+                    exitAutoPause(pt.timeMs)
+                    // After exitAutoPause, prevLat is null, so the velocity
+                    // gate below will naturally let this first post-pause fix
+                    // through without being dropped (no dt to compute).
+                }
+            }
+        }
+
         // The "post_process_enabled" setting is now interpreted as ON-THE-FLY track
         // filtering: when it is on, noisy / wild points are dropped at write time
         // so the GPX buffer only ever contains clean, validated fixes and there is
@@ -609,6 +1000,11 @@ class GpsRecorderService : Service(), LocationListener {
             //
             // A zero-dt fix (duplicate timestamp) is dropped because it would
             // imply infinite velocity.
+            //
+            // NOTE: prevLat is null after a resetValidationCursor() call (auto-
+            // pause resume / gap recovery), so this gate is naturally bypassed
+            // for the first fix after such a transition — exactly what we want,
+            // since that fix has no meaningful "previous" to compare against.
             val pLat = prevLat
             val pLon = prevLon
             val pTime = prevTimeMs
@@ -626,12 +1022,9 @@ class GpsRecorderService : Service(), LocationListener {
                 }
                 totalDistanceM += d
             }
-            // D. Point passed both gates — commit it to the buffer and advance the
-            // previous-fix cursor.
-            synchronized(pointBufferLock) {
-                pointBuffer.add(pt)
-                pointCount = pointBuffer.size
-            }
+            // D. Point passed both gates — commit it to the current segment and
+            // advance the previous-fix cursor.
+            appendPointToCurrentSegment(pt)
             prevLat = pt.lat
             prevLon = pt.lon
             prevTimeMs = pt.timeMs
@@ -640,20 +1033,19 @@ class GpsRecorderService : Service(), LocationListener {
             // E. Fallback: record every fix raw so the GPX file keeps the noisy
             // data, but still keep the displayed distance sane by routing the
             // accuracy/velocity gates through the distance accumulator only.
-            synchronized(pointBufferLock) {
-                pointBuffer.add(pt)
-                pointCount = pointBuffer.size
-            }
+            appendPointToCurrentSegment(pt)
             accumulateDistance(pt)
             lastFixTimeMs = pt.timeMs
         }
         // Save current state to SharedPreferences so JS can poll via getState()
         // even if the event emitter is not delivering events reliably.
         saveLiveState(pt)
-        // Emit the event with pointCount included so the JS UI updates in real time.
+        // Emit the event with pointCount + auto-pause / signal state so the JS
+        // UI can reflect pause / gap status in real time.
         GpsRecorderModule.emitLocation(
             pt.lat, pt.lon, pt.alt, pt.speed, pt.accuracy,
-            computeFixType(), totalDistanceM, pt.timeMs, pointCount
+            computeFixType(), totalDistanceM, pt.timeMs, pointCount,
+            isAutoPaused, signalLost, movingMs
         )
         updateNotification()
     }
@@ -739,7 +1131,12 @@ class GpsRecorderService : Service(), LocationListener {
             prefs.putString(KEY_TOTAL_DISTANCE, totalDistanceM.toString())
             prefs.putString(KEY_FIX_TYPE, computeFixType())
             prefs.putInt(KEY_SATELLITES_USED, satellitesUsed)
-            val fix = lastFix ?: synchronized(pointBufferLock) { pointBuffer.lastOrNull() }
+            // Phase 1/3/4: persist auto-pause / signal-lost / moving-time so
+            // JS can poll via getState() and survive service restarts.
+            prefs.putBoolean(KEY_IS_AUTO_PAUSED, isAutoPaused)
+            prefs.putBoolean(KEY_SIGNAL_LOST, signalLost)
+            prefs.putLong(KEY_MOVING_MS, movingMs)
+            val fix = lastFix ?: synchronized(pointBufferLock) { currentSegment.lastOrNull() }
             if (fix != null) {
                 prefs.putString(KEY_LAST_LAT, fix.lat.toString())
                 prefs.putString(KEY_LAST_LON, fix.lon.toString())
@@ -834,16 +1231,22 @@ class GpsRecorderService : Service(), LocationListener {
     }
 
     /**
-     * Writes the GPX header to the temp file, replacing any previous content.
-     * The temp file lives in the app's cache dir so it survives the JS app being killed
-     * but is private to the app.
+     * Writes the GPX header (and the opening <trk> / <name> tags only) to
+     * the temp file, replacing any previous content. The temp file lives
+     * in the app's cache dir so it survives the JS app being killed but is
+     * private to the app.
+     *
+     * NOTE: We deliberately do NOT write an opening <trkseg> here. The
+     * multi-segment-aware flushToTempFile() / finalizeGpxFile() writers
+     * emit their own <trkseg> blocks (one per segment), so there is no
+     * globally-open segment that they would need to close.
      */
     private fun writeGpxHeaderToTempFile() {
         try {
             val f = getTempFile()
             FileOutputStream(f).use { out ->
                 out.write(gpxHeader().toByteArray(Charsets.UTF_8))
-                out.write("  <trk>\n    <name>GPS Recording</name>\n    <trkseg>\n".toByteArray(Charsets.UTF_8))
+                out.write("  <trk>\n    <name>GPS Recording</name>\n".toByteArray(Charsets.UTF_8))
             }
         } catch (e: Exception) {
             Log.e(TAG, "writeGpxHeaderToTempFile failed", e)
@@ -851,23 +1254,44 @@ class GpsRecorderService : Service(), LocationListener {
     }
 
     /**
+     * Serializes all current segments (finalized + current) as a complete GPX
+     * document. Each segment becomes its own <trkseg> block so that pauses /
+     * gaps appear as clean segment breaks in the output file (no straight-
+     * line "stitches" across them). Empty segments are omitted.
+     */
+    private fun serializeSegmentsToGpx(name: String): String {
+        val segments = segmentsSnapshot()
+        val sb = StringBuilder()
+        sb.append(gpxHeader())
+        sb.append("  <trk>\n")
+        sb.append("    <name>").append(name).append("</name>\n")
+        for (seg in segments) {
+            if (seg.isEmpty()) continue
+            sb.append("    <trkseg>\n")
+            for (p in seg) {
+                sb.append(formatGpxPoint(p))
+            }
+            sb.append("    </trkseg>\n")
+        }
+        sb.append("  </trk>\n")
+        sb.append("</gpx>\n")
+        return sb.toString()
+    }
+
+    /**
      * Flushes the current in-memory points to the temp file. We rewrite the whole temp
      * file on each flush for simplicity (point counts are typically in the thousands,
      * well under a megabyte).
+     *
+     * Phase 5: now multi-segment-aware — each finalized segment and the active
+     * currentSegment are emitted as their own <trkseg> block.
      */
     private fun flushToTempFile() {
         try {
-            val snapshot: List<GpsPoint> = synchronized(pointBufferLock) {
-                ArrayList(pointBuffer)
-            }
+            val content = serializeSegmentsToGpx("GPS Recording")
             val f = getTempFile()
             FileOutputStream(f).use { out ->
-                out.write(gpxHeader().toByteArray(Charsets.UTF_8))
-                out.write("  <trk>\n    <name>GPS Recording</name>\n    <trkseg>\n".toByteArray(Charsets.UTF_8))
-                for (p in snapshot) {
-                    out.write(formatGpxPoint(p).toByteArray(Charsets.UTF_8))
-                }
-                out.write("    </trkseg>\n  </trk>\n</gpx>\n".toByteArray(Charsets.UTF_8))
+                out.write(content.toByteArray(Charsets.UTF_8))
             }
         } catch (e: Exception) {
             Log.e(TAG, "flushToTempFile failed", e)
@@ -891,26 +1315,16 @@ class GpsRecorderService : Service(), LocationListener {
      * Returns the human-readable path/URI of the saved file.
      */
     private fun finalizeGpxFile(): String {
-        val snapshot: List<GpsPoint> = synchronized(pointBufferLock) {
-            ArrayList(pointBuffer)
-        }
+        val segments = segmentsSnapshot()
+        val totalPoints = segments.sumOf { it.size }
 
         val timestamp = SimpleDateFormat("yyyy-MM-dd_HH-mm-ss", Locale.US)
             .format(Date(startTimeMs))
         val fileName = "trck_$timestamp.gpx"
 
-        val rawGpxContent = buildString {
-            append(gpxHeader())
-            append("  <trk>\n")
-            append("    <name>GPS Recording $timestamp</name>\n")
-            append("    <trkseg>\n")
-            for (p in snapshot) {
-                append(formatGpxPoint(p))
-            }
-            append("    </trkseg>\n")
-            append("  </trk>\n")
-            append("</gpx>\n")
-        }
+        // Phase 5: serialize with one <trkseg> per segment so pauses / gaps
+        // appear as clean segment breaks in the final file.
+        val rawGpxContent = serializeSegmentsToGpx("GPS Recording $timestamp")
 
         val rawBytes = rawGpxContent.toByteArray(Charsets.UTF_8)
         // On-the-fly filtering (if enabled) was already applied in onLocationChanged,
@@ -921,7 +1335,9 @@ class GpsRecorderService : Service(), LocationListener {
         val doGaussian = isGaussianSmoothingEnabled()
         Log.i(
             TAG,
-            "finalizeGpxFile: points=${snapshot.size} onTheFlyFilter=${isPostProcessEnabled()} gaussianSmoothing=$doGaussian"
+            "finalizeGpxFile: segments=${segments.size} points=$totalPoints" +
+                " onTheFlyFilter=${isPostProcessEnabled()} gaussianSmoothing=$doGaussian" +
+                " autoPause=${isAutoPauseEnabled()}"
         )
 
         return try {
@@ -1185,88 +1601,115 @@ class GpsRecorderService : Service(), LocationListener {
      * the user still gets a usable (raw) file rather than nothing.
      */
     private fun gaussianSmoothGpx(rawGpx: String): String {
-        // 1. Parse all trkpt entries.
-        val parsed = mutableListOf<GpxTrkPt>()
-        val regex = Regex("<trkpt lat=\"([^\"]+)\" lon=\"([^\"]+)\">(.*?)</trkpt>", RegexOption.DOT_MATCHES_ALL)
-        for (m in regex.findAll(rawGpx)) {
-            val lat = m.groupValues[1].toDoubleOrNull() ?: continue
-            val lon = m.groupValues[2].toDoubleOrNull() ?: continue
-            val inner = m.groupValues[3]
-            val ele = Regex("<ele>([^<]+)</ele>").find(inner)?.groupValues?.get(1)?.toDoubleOrNull()
-            val speed = Regex("<speed>([^<]+)</speed>").find(inner)?.groupValues?.get(1)?.toFloatOrNull()
-            val acc = Regex("<accuracy>([^<]+)</accuracy>").find(inner)?.groupValues?.get(1)?.toFloatOrNull()
-            val timeIso = Regex("<time>([^<]+)</time>").find(inner)?.groupValues?.get(1)
-            val timeMs = parseIsoTime(timeIso) ?: continue
-            parsed.add(GpxTrkPt(lat, lon, ele, speed, acc, timeMs, interpolated = false))
-        }
-        if (parsed.isEmpty()) {
-            Log.w(TAG, "gaussianSmoothGpx: no trkpt found, returning raw input")
+        // Phase 5: segment-isolated smoothing. We parse each <trkseg> block
+        // separately, smooth the points within it independently, and re-emit
+        // them inside their own <trkseg>. This prevents the Gaussian kernel
+        // from "bleeding" coordinates across pauses / gaps — e.g. the first
+        // point after a gap should NOT be averaged together with the last
+        // point before the gap, because they belong to different parts of
+        // the user's actual movement.
+        val segRegex = Regex("<trkseg>(.*?)</trkseg>", RegexOption.DOT_MATCHES_ALL)
+        val ptRegex = Regex("<trkpt lat=\"([^\"]+)\" lon=\"([^\"]+)\">(.*?)</trkpt>", RegexOption.DOT_MATCHES_ALL)
+
+        val segmentMatches = segRegex.findAll(rawGpx).toList()
+        if (segmentMatches.isEmpty()) {
+            Log.w(TAG, "gaussianSmoothGpx: no <trkseg> found, returning raw input")
             return rawGpx
         }
-        Log.i(TAG, "gaussianSmoothGpx: parsed ${parsed.size} points, half-window=$GAUSSIAN_HALF_WINDOW sigma=$GAUSSIAN_SIGMA")
 
-        // 2. Pre-compute the Gaussian kernel weights for offsets -W..+W.
+        // 1. Pre-compute the Gaussian kernel weights for offsets -W..+W.
         //    w[k] = exp(-0.5 * (k / sigma)^2), k in [-W, W].
         val w = DoubleArray(2 * GAUSSIAN_HALF_WINDOW + 1) { kOff ->
             val k = (kOff - GAUSSIAN_HALF_WINDOW).toDouble()
             Math.exp(-0.5 * (k / GAUSSIAN_SIGMA) * (k / GAUSSIAN_SIGMA))
         }
 
-        // 3. Smooth each point.
-        val smoothed = ArrayList<GpxTrkPt>(parsed.size)
-        for (i in parsed.indices) {
-            var sumW = 0.0
-            var sumLat = 0.0
-            var sumLon = 0.0
-            var sumEle: Double? = null
-            var nEle = 0
-            var sumEleVal = 0.0
-            for (kOff in 0 until w.size) {
-                val j = i + (kOff - GAUSSIAN_HALF_WINDOW)
-                if (j < 0 || j >= parsed.size) continue
-                val weight = w[kOff]
-                sumW += weight
-                sumLat += parsed[j].lat * weight
-                sumLon += parsed[j].lon * weight
-                val e = parsed[j].ele
-                if (e != null) {
-                    sumEleVal += e * weight
-                    nEle++
-                    sumEle = sumEleVal
-                }
-            }
-            val newLat = if (sumW > 0.0) sumLat / sumW else parsed[i].lat
-            val newLon = if (sumW > 0.0) sumLon / sumW else parsed[i].lon
-            val newEle = if (nEle > 0 && sumEle != null) sumEle / nEle else null
-            smoothed.add(
-                GpxTrkPt(
-                    lat = newLat,
-                    lon = newLon,
-                    ele = newEle,
-                    speed = parsed[i].speed,
-                    accuracy = parsed[i].accuracy,
-                    timeMs = parsed[i].timeMs,
-                    interpolated = false
-                )
-            )
-        }
-        Log.i(TAG, "gaussianSmoothGpx: smoothed ${smoothed.size} points")
-
-        // 4. Rebuild GPX, preserving the original <name> if present.
         val origName = Regex("<name>([^<]*)</name>").find(rawGpx)?.groupValues?.get(1)
             ?: "GPS Recording"
-        return buildString {
-            append(gpxHeader())
-            append("  <trk>\n")
-            append("    <name>").append(origName).append("</name>\n")
-            append("    <trkseg>\n")
-            for (p in smoothed) {
-                append(formatGpxPointWithInterpolated(p))
+
+        val sb = StringBuilder()
+        sb.append(gpxHeader())
+        sb.append("  <trk>\n")
+        sb.append("    <name>").append(origName).append("</name>\n")
+
+        var totalIn = 0
+        var totalOut = 0
+        for (segMatch in segmentMatches) {
+            val segContent = segMatch.groupValues[1]
+            val parsed = mutableListOf<GpxTrkPt>()
+            for (m in ptRegex.findAll(segContent)) {
+                val lat = m.groupValues[1].toDoubleOrNull() ?: continue
+                val lon = m.groupValues[2].toDoubleOrNull() ?: continue
+                val inner = m.groupValues[3]
+                val ele = Regex("<ele>([^<]+)</ele>").find(inner)?.groupValues?.get(1)?.toDoubleOrNull()
+                val speed = Regex("<speed>([^<]+)</speed>").find(inner)?.groupValues?.get(1)?.toFloatOrNull()
+                val acc = Regex("<accuracy>([^<]+)</accuracy>").find(inner)?.groupValues?.get(1)?.toFloatOrNull()
+                val timeIso = Regex("<time>([^<]+)</time>").find(inner)?.groupValues?.get(1)
+                val timeMs = parseIsoTime(timeIso) ?: continue
+                parsed.add(GpxTrkPt(lat, lon, ele, speed, acc, timeMs, interpolated = false))
             }
-            append("    </trkseg>\n")
-            append("  </trk>\n")
-            append("</gpx>\n")
+            totalIn += parsed.size
+            if (parsed.isEmpty()) {
+                // Preserve empty <trkseg> blocks as-is so the segment
+                // structure is preserved in the output.
+                sb.append("    <trkseg>\n")
+                sb.append("    </trkseg>\n")
+                continue
+            }
+
+            // 2. Smooth each point within this segment independently.
+            val smoothed = ArrayList<GpxTrkPt>(parsed.size)
+            for (i in parsed.indices) {
+                var sumW = 0.0
+                var sumLat = 0.0
+                var sumLon = 0.0
+                var sumEleVal = 0.0
+                var nEle = 0
+                for (kOff in 0 until w.size) {
+                    val j = i + (kOff - GAUSSIAN_HALF_WINDOW)
+                    if (j < 0 || j >= parsed.size) continue
+                    val weight = w[kOff]
+                    sumW += weight
+                    sumLat += parsed[j].lat * weight
+                    sumLon += parsed[j].lon * weight
+                    val e = parsed[j].ele
+                    if (e != null) {
+                        sumEleVal += e * weight
+                        nEle++
+                    }
+                }
+                val newLat = if (sumW > 0.0) sumLat / sumW else parsed[i].lat
+                val newLon = if (sumW > 0.0) sumLon / sumW else parsed[i].lon
+                val newEle = if (nEle > 0) sumEleVal / nEle else null
+                smoothed.add(
+                    GpxTrkPt(
+                        lat = newLat,
+                        lon = newLon,
+                        ele = newEle,
+                        speed = parsed[i].speed,
+                        accuracy = parsed[i].accuracy,
+                        timeMs = parsed[i].timeMs,
+                        interpolated = false
+                    )
+                )
+            }
+            totalOut += smoothed.size
+
+            // 3. Re-emit the smoothed points inside their own <trkseg>.
+            sb.append("    <trkseg>\n")
+            for (p in smoothed) {
+                sb.append(formatGpxPointWithInterpolated(p))
+            }
+            sb.append("    </trkseg>\n")
         }
+        sb.append("  </trk>\n")
+        sb.append("</gpx>\n")
+        Log.i(
+            TAG,
+            "gaussianSmoothGpx: segments=${segmentMatches.size} points in=$totalIn out=$totalOut" +
+                " half-window=$GAUSSIAN_HALF_WINDOW sigma=$GAUSSIAN_SIGMA"
+        )
+        return sb.toString()
     }
 
     /**
@@ -1369,6 +1812,12 @@ class GpsRecorderService : Service(), LocationListener {
         prefs.putInt(KEY_POINT_COUNT, pointCount)
         prefs.putString(KEY_TEMP_FILE_NAME, tempFileName)
         prefs.putString(KEY_TOTAL_DISTANCE, totalDistanceM.toString())
+        // Phase 1/3/4: persist auto-pause / signal-lost / moving-time so
+        // they survive service restarts. (saveLiveState also writes these on
+        // every fix, but persistState is called at start / stop boundaries.)
+        prefs.putBoolean(KEY_IS_AUTO_PAUSED, isAutoPaused)
+        prefs.putBoolean(KEY_SIGNAL_LOST, signalLost)
+        prefs.putLong(KEY_MOVING_MS, movingMs)
         prefs.apply()
     }
 
@@ -1386,44 +1835,109 @@ class GpsRecorderService : Service(), LocationListener {
             pointCount = prefs.getInt(KEY_POINT_COUNT, 0)
             tempFileName = prefs.getString(KEY_TEMP_FILE_NAME, null)
             totalDistanceM = prefs.getString(KEY_TOTAL_DISTANCE, "0")?.toDoubleOrNull() ?: 0.0
-            Log.i(TAG, "Recovered recording state: start=$startTimeMs count=$pointCount temp=$tempFileName dist=$totalDistanceM")
-            // Try to reload buffered points from the temp file
+            // Phase 1/3/4: recover auto-pause / signal-lost / moving-time.
+            isAutoPaused = prefs.getBoolean(KEY_IS_AUTO_PAUSED, false)
+            signalLost = prefs.getBoolean(KEY_SIGNAL_LOST, false)
+            movingMs = prefs.getLong(KEY_MOVING_MS, 0L)
+            // If we were not auto-paused when the service was killed, treat
+            // the resume instant as the start of a new moving segment so
+            // movingMs accumulates correctly going forward. (If we were
+            // auto-paused, lastResumeMs stays null — it will be set when
+            // the user resumes.)
+            lastResumeMs = if (!isAutoPaused) System.currentTimeMillis() else null
+            Log.i(
+                TAG,
+                "Recovered recording state: start=$startTimeMs count=$pointCount" +
+                    " temp=$tempFileName dist=$totalDistanceM" +
+                    " autoPaused=$isAutoPaused signalLost=$signalLost movingMs=$movingMs"
+            )
+            // Try to reload buffered points from the temp file (multi-segment aware).
             reloadPointsFromTempFile()
-            // Restore prevLat/prevLon from the last buffered point so distance
-            // accumulation continues smoothly after a service restart.
-            synchronized(pointBufferLock) {
-                pointBuffer.lastOrNull()?.let { last ->
-                    prevLat = last.lat
-                    prevLon = last.lon
-                    lastFixTimeMs = last.timeMs
+            // Restore prevLat/prevLon/lastFixTimeMs from the last point in the
+            // last segment so distance accumulation continues smoothly after
+            // a service restart. If the last segment is empty (e.g. we were
+            // auto-paused when killed), use the last point of any non-empty
+            // earlier segment — but in that case the user was paused, so
+            // prevLat should stay null and the velocity gate will naturally
+            // bypass the first post-restart fix.
+            if (!isAutoPaused) {
+                synchronized(pointBufferLock) {
+                    val last = currentSegment.lastOrNull()
+                        ?: trackSegments.lastOrNull()?.lastOrNull()
+                    if (last != null) {
+                        prevLat = last.lat
+                        prevLon = last.lon
+                        prevTimeMs = last.timeMs
+                        lastFixTimeMs = last.timeMs
+                    }
+                }
+            } else {
+                // Paused: don't restore prev cursor — the next fix that
+                // resumes movement will go through resetValidationCursor()
+                // via exitAutoPause() anyway, so starting with null is safer.
+                synchronized(pointBufferLock) {
+                    val last = currentSegment.lastOrNull()
+                        ?: trackSegments.lastOrNull()?.lastOrNull()
+                    if (last != null) lastFixTimeMs = last.timeMs
                 }
             }
         }
     }
 
+    /**
+     * Phase 5: reloads points from the temp file into the segmented buffer.
+     * Each <trkseg> block becomes one segment. The last <trkseg> becomes
+     * `currentSegment` (so newly-recorded points are appended to it); all
+     * earlier <trkseg> blocks become finalized segments in `trackSegments`.
+     *
+     * Legacy temp files with a single <trkseg> are handled correctly (they
+     * become a single currentSegment). Temp files with no <trkseg> at all
+     * (shouldn't happen, but be safe) leave the segments empty.
+     */
     private fun reloadPointsFromTempFile() {
         try {
             val f = getTempFile()
             if (!f.exists()) return
             val content = f.readText(Charsets.UTF_8)
-            // Parse trkpt entries with a very simple regex - we wrote them, so format is known.
-            val regex = Regex("<trkpt lat=\"([^\"]+)\" lon=\"([^\"]+)\">(.*?)</trkpt>", RegexOption.DOT_MATCHES_ALL)
+            val segRegex = Regex("<trkseg>(.*?)</trkseg>", RegexOption.DOT_MATCHES_ALL)
+            val ptRegex = Regex("<trkpt lat=\"([^\"]+)\" lon=\"([^\"]+)\">(.*?)</trkpt>", RegexOption.DOT_MATCHES_ALL)
+            val segmentMatches = segRegex.findAll(content).toList()
             synchronized(pointBufferLock) {
-                pointBuffer.clear()
-                for (m in regex.findAll(content)) {
-                    val lat = m.groupValues[1].toDoubleOrNull() ?: continue
-                    val lon = m.groupValues[2].toDoubleOrNull() ?: continue
-                    val inner = m.groupValues[3]
-                    val alt = Regex("<ele>([^<]+)</ele>").find(inner)?.groupValues?.get(1)?.toDoubleOrNull()
-                    val speed = Regex("<speed>([^<]+)</speed>").find(inner)?.groupValues?.get(1)?.toFloatOrNull()
-                    val acc = Regex("<accuracy>([^<]+)</accuracy>").find(inner)?.groupValues?.get(1)?.toFloatOrNull()
-                    val timeIso = Regex("<time>([^<]+)</time>").find(inner)?.groupValues?.get(1)
-                    val timeMs = parseIsoTime(timeIso) ?: System.currentTimeMillis()
-                    pointBuffer.add(GpsPoint(lat, lon, alt, speed, acc, timeMs))
+                trackSegments.clear()
+                currentSegment = ArrayList()
+                if (segmentMatches.isEmpty()) {
+                    Log.w(TAG, "reloadPointsFromTempFile: no <trkseg> blocks in temp file")
+                    pointCount = 0
+                    return
                 }
-                pointCount = pointBuffer.size
+                for ((idx, segMatch) in segmentMatches.withIndex()) {
+                    val segContent = segMatch.groupValues[1]
+                    val parsed = ArrayList<GpsPoint>()
+                    for (m in ptRegex.findAll(segContent)) {
+                        val lat = m.groupValues[1].toDoubleOrNull() ?: continue
+                        val lon = m.groupValues[2].toDoubleOrNull() ?: continue
+                        val inner = m.groupValues[3]
+                        val alt = Regex("<ele>([^<]+)</ele>").find(inner)?.groupValues?.get(1)?.toDoubleOrNull()
+                        val speed = Regex("<speed>([^<]+)</speed>").find(inner)?.groupValues?.get(1)?.toFloatOrNull()
+                        val acc = Regex("<accuracy>([^<]+)</accuracy>").find(inner)?.groupValues?.get(1)?.toFloatOrNull()
+                        val timeIso = Regex("<time>([^<]+)</time>").find(inner)?.groupValues?.get(1)
+                        val timeMs = parseIsoTime(timeIso) ?: System.currentTimeMillis()
+                        parsed.add(GpsPoint(lat, lon, alt, speed, acc, timeMs))
+                    }
+                    if (idx == segmentMatches.size - 1) {
+                        // Last segment becomes currentSegment so new points are
+                        // appended to it on subsequent fixes.
+                        currentSegment = parsed
+                    } else {
+                        trackSegments.add(parsed)
+                    }
+                }
+                pointCount = totalPointCount()
             }
-            Log.i(TAG, "Reloaded ${pointCount} points from temp file")
+            Log.i(
+                TAG,
+                "Reloaded $pointCount points in ${segmentMatches.size} segments from temp file"
+            )
         } catch (e: Exception) {
             Log.e(TAG, "reloadPointsFromTempFile failed", e)
         }

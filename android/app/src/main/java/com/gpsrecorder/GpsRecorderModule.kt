@@ -36,15 +36,26 @@ import com.facebook.react.modules.core.DeviceEventManagerModule
  *   - hasPermissions()             -> Promise<Boolean> (no request, just check)
  *   - requestIgnoreBatteryOptimizations() -> Promise<Boolean>
  *   - openAppSettings()            -> void (fallback when user denies permissions)
+ *   - setPostProcessEnabled(b)     -> Promise<Boolean> (on-the-fly track filter)
+ *   - getPostProcessEnabled()      -> Promise<Boolean>
+ *   - setGaussianSmoothingEnabled(b) -> Promise<Boolean> (post-process Gaussian smoother)
+ *   - getGaussianSmoothingEnabled() -> Promise<Boolean>
+ *   - setAutoPauseEnabled(b)       -> Promise<Boolean> (auto-pause on stop detection)
+ *   - getAutoPauseEnabled()        -> Promise<Boolean>
+ *   - startGnssMonitor()           -> Promise<Boolean> (always-on GNSS status)
+ *   - stopGnssMonitor()            -> Promise<Boolean>
  *   - addListener(String)          -> required by NativeEventEmitter
  *   - removeListeners(Integer)     -> required by NativeEventEmitter
  *
  * Events emitted to JS:
- *   - "location"  { lat, lon, alt, speed, accuracy, fixType, distance, timestamp, pointCount }
+ *   - "location"  { lat, lon, alt, speed, accuracy, fixType, distance, timestamp,
+ *                   pointCount, isAutoPaused, signalLost, movingMs }
  *   - "duration"  { elapsedMs }
- *   - "state"     { isRecording, pointCount, elapsedMs }
+ *   - "state"     { isRecording, pointCount, elapsedMs, isAutoPaused, signalLost, movingMs }
  *   - "saved"     { filePath, pointCount }
  *   - "error"     { message }
+ *   - "gnss"      { fixType, accuracy, satellitesUsed, satellitesInView, hasFix,
+ *                   lat, lon, alt, speed, timestamp }
  */
 class GpsRecorderModule(private val reactContext: ReactApplicationContext) :
     ReactContextBaseJavaModule(reactContext) {
@@ -58,7 +69,10 @@ class GpsRecorderModule(private val reactContext: ReactApplicationContext) :
         fun emitLocation(
             lat: Double, lon: Double, alt: Double?, speed: Float?, accuracy: Float?,
             fixType: String, distanceMeters: Double,
-            timestamp: Long, pointCount: Int
+            timestamp: Long, pointCount: Int,
+            isAutoPaused: Boolean = false,
+            signalLost: Boolean = false,
+            movingMs: Long = 0L
         ) {
             val module = instance ?: return
             val map = Arguments.createMap().apply {
@@ -71,6 +85,11 @@ class GpsRecorderModule(private val reactContext: ReactApplicationContext) :
                 putDouble("distance", distanceMeters)
                 putDouble("timestamp", timestamp.toDouble())
                 putInt("pointCount", pointCount)
+                // Phase 1/3/4: auto-pause / signal-lost / moving-time so the
+                // JS UI can reflect pause / gap status in real time.
+                putBoolean("isAutoPaused", isAutoPaused)
+                putBoolean("signalLost", signalLost)
+                putDouble("movingMs", movingMs.toDouble())
             }
             module.send("location", map)
         }
@@ -83,12 +102,25 @@ class GpsRecorderModule(private val reactContext: ReactApplicationContext) :
             module.send("duration", map)
         }
 
-        fun emitState(isRecording: Boolean, pointCount: Int, elapsedMs: Long) {
+        fun emitState(
+            isRecording: Boolean,
+            pointCount: Int,
+            elapsedMs: Long,
+            isAutoPaused: Boolean = false,
+            signalLost: Boolean = false,
+            movingMs: Long = 0L
+        ) {
             val module = instance ?: return
             val map = Arguments.createMap().apply {
                 putBoolean("isRecording", isRecording)
                 putInt("pointCount", pointCount)
                 putDouble("elapsedMs", elapsedMs.toDouble())
+                // Phase 1/3/4: include auto-pause / signal-lost / moving-time
+                // so JS can poll via getState() and stay in sync after a
+                // service restart.
+                putBoolean("isAutoPaused", isAutoPaused)
+                putBoolean("signalLost", signalLost)
+                putDouble("movingMs", movingMs.toDouble())
             }
             module.send("state", map)
         }
@@ -429,6 +461,35 @@ class GpsRecorderModule(private val reactContext: ReactApplicationContext) :
         }
     }
 
+    // ---- Auto-pause setting (Phase 1) ----
+    //
+    // Persisted in the same SEPARATE SharedPreferences file ("gps_recorder_settings")
+    // as post_process_enabled / gaussian_smoothing_enabled, so it survives the
+    // per-recording state clear. When enabled, GpsRecorderService runs a stop-
+    // detection algorithm (sliding 10 s window + speed < 0.35 m/s + max
+    // displacement < 3.5 m) that auto-pauses recording while the user is
+    // standing still, and auto-resumes when they start moving again.
+
+    @ReactMethod
+    fun setAutoPauseEnabled(enabled: Boolean, promise: Promise) {
+        try {
+            settingsPrefs().edit().putBoolean("auto_pause_enabled", enabled).apply()
+            Log.i(TAG, "Auto-pause enabled = $enabled")
+            promise.resolve(enabled)
+        } catch (e: Exception) {
+            promise.reject("E_SETTINGS", e.message ?: "setAutoPauseEnabled error", e)
+        }
+    }
+
+    @ReactMethod
+    fun getAutoPauseEnabled(promise: Promise) {
+        try {
+            promise.resolve(settingsPrefs().getBoolean("auto_pause_enabled", false))
+        } catch (e: Exception) {
+            promise.reject("E_SETTINGS", e.message ?: "getAutoPauseEnabled error", e)
+        }
+    }
+
     /**
      * Returns the current recording state, point count, elapsed time, last GPS fix,
      * total distance traveled, and current GNSS fix type. JS calls this on mount and
@@ -445,6 +506,11 @@ class GpsRecorderModule(private val reactContext: ReactApplicationContext) :
             val elapsed = if (isRec && startTime > 0) System.currentTimeMillis() - startTime else 0L
             val distance = prefs.getString("total_distance_m", "0")?.toDoubleOrNull() ?: 0.0
             val fixType = prefs.getString("fix_type", "no fix") ?: "no fix"
+            // Phase 1/3/4: read auto-pause / signal-lost / moving-time so JS
+            // can poll via getState() and stay in sync after a service restart.
+            val autoPaused = prefs.getBoolean("is_auto_paused", false)
+            val sigLost = prefs.getBoolean("signal_lost", false)
+            val movMs = prefs.getLong("moving_ms", 0L)
 
             val map = Arguments.createMap().apply {
                 putBoolean("isRecording", isRec)
@@ -452,6 +518,9 @@ class GpsRecorderModule(private val reactContext: ReactApplicationContext) :
                 putDouble("elapsedMs", elapsed.toDouble())
                 putDouble("distance", distance)
                 putString("fixType", fixType)
+                putBoolean("isAutoPaused", autoPaused)
+                putBoolean("signalLost", sigLost)
+                putDouble("movingMs", movMs.toDouble())
 
                 val lastLat = prefs.getString("last_lat", null)
                 val lastLon = prefs.getString("last_lon", null)
