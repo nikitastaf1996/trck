@@ -131,10 +131,15 @@ function computeAvgPace(elapsedMs: number, distanceM: number): string | null {
 
 /**
  * Current (instantaneous) pace from GPS speed (m/s), in "M:SS" per km.
- * Returns null if speed is missing or zero.
+ * Returns null if speed is missing or below the standing-still threshold.
+ *
+ * The threshold is 0.5 m/s (~1.8 km/h) — a slow shuffle. Anything below
+ * this is either genuinely standing still or GPS noise around a stationary
+ * user, and showing a "33:00 /km" pace in those moments is more confusing
+ * than just showing "—".
  */
 function computeCurrentPace(speedMps: number | null | undefined): string | null {
-  if (speedMps == null || speedMps <= 0.3) return null;  // ignore < 1 km/h (standing still)
+  if (speedMps == null || speedMps <= 0.5) return null;  // ignore < 1.8 km/h (standing still / GPS noise)
   const paceSecPerKm = 1000 / speedMps;                  // seconds per km
   const wholeMin = Math.floor(paceSecPerKm / 60);
   const sec = Math.round(paceSecPerKm % 60);
@@ -154,6 +159,16 @@ function App(): React.ReactElement {
   const [satellitesInView, setSatellitesInView] = useState<number>(0);
   const [hasFix, setHasFix] = useState<boolean>(false);
   const [lastSavedPath, setLastSavedPath] = useState<string | null>(null);
+  // Final distance (meters) computed from the SAVED GPX file, post-smoothing.
+  // Set when the 'saved' event arrives; shown on the "GPX СОХРАНЁН" card so
+  // the user sees the true track length (matching what Strava / other
+  // importers will compute) rather than the live-accumulated raw distance.
+  const [lastSavedDistance, setLastSavedDistance] = useState<number | null>(null);
+  // Final moving time + elapsed time captured at save time so we can show
+  // the post-save average pace on the saved card. (The live state values
+  // get reset to 0 by the 'saved' handler, so we snapshot them here first.)
+  const [lastSavedMovingMs, setLastSavedMovingMs] = useState<number>(0);
+  const [lastSavedElapsedMs, setLastSavedElapsedMs] = useState<number>(0);
   const [hasPermissions, setHasPermissions] = useState<boolean>(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [postProcessEnabled, setPostProcessEnabled] = useState<boolean>(false);
@@ -167,6 +182,35 @@ function App(): React.ReactElement {
   const [signalLost, setSignalLost] = useState<boolean>(false);
   const [movingMs, setMovingMs] = useState<number>(0);
   const startTimeRef = useRef<number | null>(null);
+  // Mirror of `recordingState` for use inside event-subscription closures.
+  // We keep the main useEffect's deps stable (so the subscriptions are NOT
+  // torn down + recreated on every idle -> recording -> stopping -> idle
+  // transition, which was causing missed 'state' / 'saved' events). The
+  // closures read this ref instead of capturing the state directly.
+  const recordingStateRef = useRef<RecordingState>('idle');
+  useEffect(() => {
+    recordingStateRef.current = recordingState;
+  }, [recordingState]);
+
+  // Sliding window of the most recent GPS speeds (m/s) seen during the
+  // current recording. Used to compute a smoothed "current pace" instead of
+  // relying on the raw instantaneous GPS speed, which jumps around a lot at
+  // 1 Hz and makes the TEMPO readout flicker between e.g. 4:30 and 6:10 from
+  // one fix to the next. The window is cleared on stop / save so a fresh
+  // recording starts with no history.
+  const recentSpeedsRef = useRef<number[]>([]);
+  const SPEED_WINDOW = 5; // ~5 seconds at 1 Hz — short enough to be responsive
+  // Refs that mirror movingMs / elapsedMs / autoPauseEnabled so the
+  // 'saved' event handler (which is set up ONCE in the mount effect and
+  // must NOT re-run on every state change, otherwise we lose events) can
+  // read their latest values at save time. Without these the closure would
+  // capture the initial 0 values and never see the updated ones.
+  const movingMsRef = useRef<number>(0);
+  const elapsedMsRef = useRef<number>(0);
+  const autoPauseEnabledRef = useRef<boolean>(false);
+  useEffect(() => { movingMsRef.current = movingMs; }, [movingMs]);
+  useEffect(() => { elapsedMsRef.current = elapsedMs; }, [elapsedMs]);
+  useEffect(() => { autoPauseEnabledRef.current = autoPauseEnabled; }, [autoPauseEnabled]);
 
   // Sync state from native via getState(). Called on mount, on foreground, and every 2s.
   const syncStateFromNative = useCallback(async () => {
@@ -261,7 +305,7 @@ function App(): React.ReactElement {
         // While idle (not recording), the monitor's speed is also the best
         // current-speed signal we have. While recording, the 'location' event
         // overrides it.
-        if (recordingState !== 'recording') {
+        if (recordingStateRef.current !== 'recording') {
           setCurrentSpeed(ev.speed);
         }
       }),
@@ -271,7 +315,16 @@ function App(): React.ReactElement {
         if (typeof ev.distance === 'number') setDistance(ev.distance);
         if (ev.fixType) setFixType(ev.fixType);
         if (ev.accuracy != null) setAccuracy(ev.accuracy);
-        if (ev.speed != null) setCurrentSpeed(ev.speed);
+        if (ev.speed != null) {
+          setCurrentSpeed(ev.speed);
+          // Push into the smoothing window. We accept every fix here (even
+          // slow / zero ones) so the window correctly reflects "user is
+          // standing still" — the smoothed pace helper returns null when
+          // the window average is below the standing-still threshold.
+          const w = recentSpeedsRef.current;
+          w.push(ev.speed);
+          if (w.length > SPEED_WINDOW) w.shift();
+        }
         setHasFix(ev.fixType !== 'no fix');
         // Phase 1/3/4: live auto-pause / signal-lost / moving-time.
         if (typeof ev.isAutoPaused === 'boolean') setIsAutoPaused(ev.isAutoPaused);
@@ -308,10 +361,24 @@ function App(): React.ReactElement {
           setSignalLost(false);
           setMovingMs(0);
           startTimeRef.current = null;
+          // Clear the pace-smoothing window so a fresh recording starts
+          // with no stale speeds from the previous run.
+          recentSpeedsRef.current = [];
         }
       }),
       subscribe('saved', (ev: GpsSavedEvent) => {
+        // Snapshot the live timing values BEFORE we reset them, so the
+        // saved card can show the post-save average pace over the final
+        // distance / moving time. We read from refs because this closure
+        // is set up once at mount and would otherwise capture stale values.
+        setLastSavedMovingMs(movingMsRef.current);
+        setLastSavedElapsedMs(elapsedMsRef.current);
         setLastSavedPath(ev.filePath);
+        // The native side sends the post-save distance (recomputed from the
+        // saved GPX file, post-smoothing) so the UI shows the true track
+        // length. Negative means "not available" — keep the live distance.
+        const fd = (ev as any).finalDistanceM;
+        setLastSavedDistance(typeof fd === 'number' && fd >= 0 ? fd : null);
         setPointCount(0);
         setElapsedMs(0);
         setDistance(0);
@@ -324,6 +391,8 @@ function App(): React.ReactElement {
         setSignalLost(false);
         setMovingMs(0);
         startTimeRef.current = null;
+        // Clear the pace-smoothing window for the next recording.
+        recentSpeedsRef.current = [];
       }),
       subscribe('error', (ev) => {
         setErrorMsg(ev.message);
@@ -357,7 +426,7 @@ function App(): React.ReactElement {
       // Stop the GNSS monitor when the JS app unmounts.
       try { GpsRecorder.stopGnssMonitor(); } catch { /* ignore */ }
     };
-  }, [syncStateFromNative, recordingState]);
+  }, [syncStateFromNative]); // NOTE: recordingState intentionally omitted — see recordingStateRef.
 
   const handleStart = useCallback(async () => {
     setErrorMsg(null);
@@ -395,6 +464,8 @@ function App(): React.ReactElement {
       setCurrentSpeed(null);
       setLastSavedPath(null);
       startTimeRef.current = Date.now();
+      // Clear the pace-smoothing window for the fresh recording.
+      recentSpeedsRef.current = [];
 
       await GpsRecorder.start();
       setRecordingState('recording');
@@ -498,7 +569,25 @@ function App(): React.ReactElement {
   }, [gapDetectionEnabled, settingsLocked]);
 
   const distanceFmt = formatDistance(distance);
-  const currentPace = computeCurrentPace(currentSpeed);
+  // Smoothed current pace: average of the last few GPS speeds. This is much
+  // less jittery than the raw 1 Hz instantaneous speed, which can swing
+  // between e.g. 2.8 m/s and 4.1 m/s on consecutive fixes just from GPS
+  // noise. The window is short (5 fixes ≈ 5 s) so the pace still tracks
+  // real changes in effort within a few seconds.
+  //
+  // While idle (no recording), we fall back to the GNSS monitor's speed.
+  // While auto-paused, we suppress the pace (show "—") because the user is
+  // stationary and any window average is meaningless.
+  const smoothedSpeed = (() => {
+    if (isAutoPaused) return null;
+    const w = recentSpeedsRef.current;
+    if (isRecording && w.length > 0) {
+      const sum = w.reduce((a, b) => a + b, 0);
+      return sum / w.length;
+    }
+    return currentSpeed;
+  })();
+  const currentPace = computeCurrentPace(smoothedSpeed);
   // Phase 6: when auto-pause is enabled, compute average pace using the
   // active moving time (which excludes paused intervals) instead of wall-
   // clock elapsed time. This keeps the displayed avg pace honest when the
@@ -655,7 +744,6 @@ function App(): React.ReactElement {
             style={[
               styles.toggleSwitch,
               postProcessEnabled ? styles.toggleSwitchOn : styles.toggleSwitchOff,
-              settingsLocked && styles.toggleSwitchLocked,
             ]}
           >
             <View
@@ -689,7 +777,6 @@ function App(): React.ReactElement {
             style={[
               styles.toggleSwitch,
               gaussianSmoothingEnabled ? styles.toggleSwitchOn : styles.toggleSwitchOff,
-              settingsLocked && styles.toggleSwitchLocked,
             ]}
           >
             <View
@@ -728,7 +815,6 @@ function App(): React.ReactElement {
             style={[
               styles.toggleSwitch,
               autoPauseEnabled ? styles.toggleSwitchOn : styles.toggleSwitchOff,
-              settingsLocked && styles.toggleSwitchLocked,
             ]}
           >
             <View
@@ -768,7 +854,6 @@ function App(): React.ReactElement {
             style={[
               styles.toggleSwitch,
               gapDetectionEnabled ? styles.toggleSwitchOn : styles.toggleSwitchOff,
-              settingsLocked && styles.toggleSwitchLocked,
             ]}
           >
             <View
@@ -792,6 +877,19 @@ function App(): React.ReactElement {
           <View style={styles.savedCard}>
             <Text style={styles.savedTitle}>GPX СОХРАНЁН</Text>
             <Text style={styles.savedPath}>{lastSavedPath}</Text>
+            {lastSavedDistance != null && (() => {
+              const fmt = formatDistance(lastSavedDistance);
+              const tMs = autoPauseEnabledRef.current
+                ? lastSavedMovingMs
+                : lastSavedElapsedMs;
+              const pace = computeAvgPace(tMs, lastSavedDistance);
+              return (
+                <Text style={styles.savedDistance}>
+                  Финальная дистанция: {fmt.value} {fmt.unit}
+                  {pace ? `  ·  ${pace} /км` : ''}
+                </Text>
+              );
+            })()}
           </View>
         )}
 
@@ -988,7 +1086,11 @@ const styles = StyleSheet.create({
   statusDot: {
     width: 8, height: 8, borderRadius: 4,
   },
-  dotOn: { backgroundColor: COLOR.accentStop },
+  // Green when recording (active = good, matches the GNSS pill colour scheme).
+  // Grey when idle. Amber when auto-paused. Red is reserved for the STOP
+  // button + signal-lost banner so the user doesn't read a red dot as
+  // "something is wrong" while a recording is happily in progress.
+  dotOn: { backgroundColor: COLOR.gnssGreen },
   dotOff: { backgroundColor: COLOR.gnssGray },
   // Phase 3: amber dot shown while auto-pause is active.
   dotPaused: { backgroundColor: COLOR.pauseAccent },
@@ -1074,11 +1176,12 @@ const styles = StyleSheet.create({
     borderColor: COLOR.divider,
   },
   // Visual "locked" state — used when recording is in progress so the toggles
-  // are visibly disabled and the user knows they cannot be changed mid-recording.
+  // are visibly disabled. We deliberately keep the row's on/off color so the
+  // user can still tell which settings are active; we only dim the whole row
+  // (opacity) and override the background to a neutral grey so the row looks
+  // "frozen" rather than "off".
   toggleRowLocked: {
     opacity: 0.55,
-    backgroundColor: '#F3F4F6',
-    borderColor: COLOR.divider,
   },
   toggleLabelWrap: {
     flex: 1,
@@ -1104,9 +1207,10 @@ const styles = StyleSheet.create({
   },
   toggleSwitchOn: { backgroundColor: COLOR.accentStart },
   toggleSwitchOff: { backgroundColor: '#D1D5DB' },
-  // When locked, the switch is forced to its "off" grey regardless of state
-  // so it visually matches the disabled-looking row.
-  toggleSwitchLocked: { backgroundColor: '#9CA3AF' },
+  // NOTE: we intentionally do NOT override the switch color when locked.
+  // The row-level `opacity: 0.55` already conveys "disabled"; forcing the
+  // switch to grey made enabled-but-locked toggles look "off" mid-recording,
+  // which was one of the wonky-UI complaints.
   toggleKnob: {
     width: 20,
     height: 20,
@@ -1159,6 +1263,15 @@ const styles = StyleSheet.create({
   savedPath: {
     fontSize: 13, color: COLOR.savedText,
     fontFamily: Platform.select({ ios: 'Menlo', android: 'monospace' }),
+  },
+  // Final distance + pace line shown on the saved card. Slightly larger and
+  // bolder than the path so the user notices it.
+  savedDistance: {
+    fontSize: 14,
+    fontWeight: '700',
+    color: COLOR.savedText,
+    marginTop: 8,
+    fontVariant: ['tabular-nums'],
   },
   errorCard: {
     backgroundColor: COLOR.errorBg, borderRadius: 12, padding: 14,

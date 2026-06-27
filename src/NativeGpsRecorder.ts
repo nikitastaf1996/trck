@@ -46,6 +46,10 @@ export type GpsStateEvent = {
 export type GpsSavedEvent = {
   filePath: string;
   pointCount: number;
+  // Final distance (meters) computed from the SAVED GPX file, post-smoothing
+  // / post-filtering. Negative when not available; the UI should keep the
+  // live-accumulated distance in that case.
+  finalDistanceM?: number;
 };
 
 export type GpsErrorEvent = {

@@ -127,11 +127,19 @@ class GpsRecorderModule(private val reactContext: ReactApplicationContext) :
             module.send("state", map)
         }
 
-        fun emitSaved(filePath: String, pointCount: Int) {
+        fun emitSaved(filePath: String, pointCount: Int, finalDistanceM: Double = -1.0) {
             val module = instance ?: return
             val map = Arguments.createMap().apply {
                 putString("filePath", filePath)
                 putInt("pointCount", pointCount)
+                // Final distance (meters) computed from the SAVED GPX file,
+                // post-smoothing. Negative / -1 means "not available; keep
+                // the live-accumulated distance". When Gaussian smoothing is
+                // applied the smoothed track's length can differ from the
+                // raw live-accumulated distance by a few percent, so we send
+                // the post-save distance to keep the UI in sync with what
+                // the user will see when they import the GPX elsewhere.
+                putDouble("finalDistanceM", finalDistanceM)
             }
             module.send("saved", map)
         }

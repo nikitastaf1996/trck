@@ -452,14 +452,32 @@ class GpsRecorderService : Service(), LocationListener {
         // Final flush + finalize the GPX file
         val savedFilePath = finalizeGpxFile()
 
+        // Recompute the final distance from the SAVED GPX file so the value
+        // the user sees in the UI matches the track length they will see when
+        // they import the GPX into Strava / another app. This matters most
+        // when Gaussian smoothing is on: smoothing pulls each point toward
+        // its neighbours, which shortens the track by a few percent vs. the
+        // raw live-accumulated haversine distance. Without this recompute,
+        // the UI would show e.g. 5.12 km while the GPX file's true length is
+        // 4.98 km — exactly the kind of "distance is weird" complaint that
+        // prompted this fix.
+        //
+        // We parse the saved GPX directly (rather than re-reading the in-
+        // memory segments) so we capture whatever smoothing / filtering was
+        // applied at finalize time. On failure we fall back to -1.0, which
+        // the JS side interprets as "keep the live-accumulated distance".
+        val finalDistanceM = recomputeDistanceFromSavedGpx(savedFilePath)
+
         // Clear persisted state
         clearPersistedState()
 
         // Release wakelock
         releaseWakeLock()
 
-        // Tell JS (if alive) that we saved a file
-        GpsRecorderModule.emitSaved(savedFilePath, pointCount)
+        // Tell JS (if alive) that we saved a file. Include the final distance
+        // so the UI can show the post-save, post-smoothing track length
+        // instead of the live-accumulated value.
+        GpsRecorderModule.emitSaved(savedFilePath, pointCount, finalDistanceM)
         GpsRecorderModule.emitState(false, 0, 0L, false, false, 0L)
 
         // Stop foreground + service
@@ -1106,11 +1124,28 @@ class GpsRecorderService : Service(), LocationListener {
      * distance. This is the path used when on-the-fly filtering is OFF (raw
      * recording) — the point itself is still added to the buffer (raw mode),
      * but the distance accumulator stays sane.
+     *
+     * BUGFIX (raw-mode distance leakage): previously this function updated
+     * `prevLat` / `prevLon` / `prevTimeMs` UNCONDITIONALLY at the end, even
+     * when the candidate was rejected by the accuracy or velocity gate. That
+     * meant the next fix's distance was computed from the rejected outlier
+     * instead of the last good point — so a single GPS glitch (e.g. a 200 m
+     * teleport) added the *return* hop back to the true track on the next
+     * fix, even though the outbound hop was correctly dropped. The displayed
+     * distance silently grew by the size of every glitch.
+     *
+     * Now we only advance the cursor when the candidate is ACCEPTED. If the
+     * candidate is rejected, the cursor stays at the last good fix and the
+     * next fix is compared against that — which is what the on-the-fly filter
+     * path already did. The two paths now behave identically w.r.t. the
+     * prev cursor; they differ only in whether the raw point is appended to
+     * the buffer.
      */
     private fun accumulateDistance(pt: GpsPoint) {
         val acc = pt.accuracy
         if (acc != null && acc > ACCURACY_THRESHOLD_M) {
-            // Fix too inaccurate to trust for distance — skip but don't reset prev.
+            // Fix too inaccurate to trust for distance — skip but don't advance
+            // prev. The next fix is compared against the last good point.
             return
         }
         val pLat = prevLat
@@ -1118,22 +1153,115 @@ class GpsRecorderService : Service(), LocationListener {
         val pTime = prevTimeMs
         if (pLat != null && pLon != null && pTime != null) {
             val dtSec = (pt.timeMs - pTime) / 1000.0
-            if (dtSec > 0.0) {
-                val d = haversineMeters(pLat, pLon, pt.lat, pt.lon)
-                val velocityMps = d / dtSec
-                // Drop the contribution if the implied velocity exceeds the walk/
-                // run ceiling. These are usually GPS glitches after a cold start
-                // or tunnel exit; they would otherwise inflate totalDistanceM.
-                if (velocityMps <= MAX_VELOCITY_MPS) {
-                    totalDistanceM += d
-                } else {
-                    Log.d(TAG, "accumulateDistance: dropping velocity outlier (v=${velocityMps}m/s d=${d}m dt=${dtSec}s)")
-                }
+            if (dtSec <= 0.0) {
+                // Zero/negative dt (duplicate timestamp or clock skew). Drop
+                // without advancing prev — the next fix's dt will be measured
+                // from the last good fix.
+                Log.d(TAG, "accumulateDistance: dropping zero-dt fix (dt=${dtSec}s)")
+                return
             }
+            val d = haversineMeters(pLat, pLon, pt.lat, pt.lon)
+            val velocityMps = d / dtSec
+            // Drop the contribution if the implied velocity exceeds the walk/
+            // run ceiling. These are usually GPS glitches after a cold start
+            // or tunnel exit; they would otherwise inflate totalDistanceM.
+            if (velocityMps > MAX_VELOCITY_MPS) {
+                Log.d(TAG, "accumulateDistance: dropping velocity outlier (v=${velocityMps}m/s d=${d}m dt=${dtSec}s)")
+                // Do NOT advance prev — keep the last good fix as the
+                // reference so the next fix's distance is computed from it,
+                // not from this outlier.
+                return
+            }
+            totalDistanceM += d
         }
+        // Candidate accepted (or no prev to compare against) — advance cursor.
         prevLat = pt.lat
         prevLon = pt.lon
         prevTimeMs = pt.timeMs
+    }
+
+    /**
+     * Recomputes the total track length (meters) by parsing the SAVED GPX
+     * file and summing haversine distances between consecutive <trkpt> within
+     * each <trkseg>. Points are NOT filtered here — whatever made it into the
+     * file is what we sum, so the result matches what an external importer
+     * (Strava, etc.) would compute.
+     *
+     * Used by [stopRecording] to give the JS UI a post-save distance that
+     * reflects Gaussian smoothing (which shortens the track slightly) and /
+     * or on-the-fly filtering. Falls back to -1.0 on any error so the caller
+     * can signal "use the live-accumulated distance instead".
+     *
+     * The `savedPath` argument is the string returned by [finalizeGpxFile]:
+     * either a MediaStore-relative path like "Downloads/trck/foo.gpx", a
+     * legacy absolute path, or a "Cache fallback: ..." / "Save failed: ..."
+     * message. We only attempt to open it as a real file when it looks like
+     * a path; otherwise we return -1.0.
+     */
+    private fun recomputeDistanceFromSavedGpx(savedPath: String): Double {
+        try {
+            val file: File? = when {
+                savedPath.startsWith("Downloads/trck/") -> {
+                    // MediaStore path on API >= 29. The file lives under the
+                    // user's Downloads directory; resolve via Environment.
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                        // We can't easily resolve MediaStore URIs back to a
+                        // File without a query; fall back to the public
+                        // Downloads directory + the relative tail.
+                        val downloads = Environment.getExternalStoragePublicDirectory(
+                            Environment.DIRECTORY_DOWNLOADS
+                        )
+                        File(downloads, "trck/${savedPath.removePrefix("Downloads/trck/")}")
+                    } else {
+                        val downloads = Environment.getExternalStoragePublicDirectory(
+                            Environment.DIRECTORY_DOWNLOADS
+                        )
+                        File(downloads, "trck/${savedPath.removePrefix("Downloads/trck/")}")
+                    }
+                }
+                savedPath.startsWith("/") -> File(savedPath)
+                savedPath.startsWith("Cache fallback: ") ->
+                    File(savedPath.removePrefix("Cache fallback: "))
+                else -> null
+            }
+            if (file == null || !file.exists()) {
+                Log.w(TAG, "recomputeDistanceFromSavedGpx: cannot resolve path '$savedPath'")
+                return -1.0
+            }
+            val text = file.readText(Charsets.UTF_8)
+            // Parse each <trkseg> independently and sum intra-segment
+            // distances. Inter-segment jumps (across pauses / gaps) are NOT
+            // counted — they're not real movement.
+            val segRegex = Regex("<trkseg>(.*?)</trkseg>", RegexOption.DOT_MATCHES_ALL)
+            val ptRegex = Regex(
+                "<trkpt lat=\"([^\"]+)\" lon=\"([^\"]+)\">",
+                RegexOption.DOT_MATCHES_ALL
+            )
+            var total = 0.0
+            var parsed = 0
+            for (segMatch in segRegex.findAll(text)) {
+                val segContent = segMatch.groupValues[1]
+                var prevLat: Double? = null
+                var prevLon: Double? = null
+                for (m in ptRegex.findAll(segContent)) {
+                    val lat = m.groupValues[1].toDoubleOrNull() ?: continue
+                    val lon = m.groupValues[2].toDoubleOrNull() ?: continue
+                    parsed++
+                    val pLat = prevLat
+                    val pLon = prevLon
+                    if (pLat != null && pLon != null) {
+                        total += haversineMeters(pLat, pLon, lat, lon)
+                    }
+                    prevLat = lat
+                    prevLon = lon
+                }
+            }
+            Log.i(TAG, "recomputeDistanceFromSavedGpx: parsed=$parsed total=${total}m from $savedPath")
+            return total
+        } catch (e: Exception) {
+            Log.w(TAG, "recomputeDistanceFromSavedGpx failed for '$savedPath'", e)
+            return -1.0
+        }
     }
 
     /**
