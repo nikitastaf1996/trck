@@ -2549,11 +2549,18 @@ class GpsRecorderService : Service(), LocationListener {
      * point [pLat, pLon] to the great circle through [aLat, aLon] and
      * [bLat, bLon], in meters. Always returned as a non-negative value.
      *
-     * If a and b are the same point, falls back to the straight-line
-     * haversine distance from a to p (so the caller doesn't have to special-
-     * case degenerate segments).
+     * L12 fix: when a and b coincide (degenerate segment), the function now
+     * returns 0.0 instead of the haversine distance from a to p. The previous
+     * behavior was harmful for Douglas-Peucker: a "segment" with identical
+     * endpoints would keep every intermediate point whose distance from that
+     * single point exceeded epsilon — effectively keeping everything, the
+     * opposite of simplification. A degenerate segment represents a single
+     * location and has no meaningful "perpendicular distance" to measure;
+     * returning 0.0 causes Douglas-Peucker to drop all intermediate points
+     * (none of them are farther than epsilon from the segment), which is
+     * correct because the segment is meaningless.
      *
-     * Formula:
+     * Formula (non-degenerate case):
      *   δ13 = d13 / R            (angular distance from a to p)
      *   θ13 = bearing(a → p)
      *   θ12 = bearing(a → b)
@@ -2564,9 +2571,11 @@ class GpsRecorderService : Service(), LocationListener {
         aLat: Double, aLon: Double,
         bLat: Double, bLon: Double
     ): Double {
-        // Degenerate segment: a and b coincide. Return haversine(a, p).
+        // L12 fix: degenerate segment (a and b coincide). Return 0.0 so
+        // Douglas-Peucker drops all intermediate points in such a segment
+        // (they can't be farther than epsilon from a meaningless segment).
         if (aLat == bLat && aLon == bLon) {
-            return haversineMeters(aLat, aLon, pLat, pLon)
+            return 0.0
         }
         val r = 6_371_000.0
         val d13 = haversineMeters(aLat, aLon, pLat, pLon) / r
