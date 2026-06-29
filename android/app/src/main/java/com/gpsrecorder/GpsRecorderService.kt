@@ -2218,13 +2218,28 @@ class GpsRecorderService : Service(), LocationListener {
             }
 
             // 2. Smooth each point within this segment independently.
+            //
+            // L2 fix: elevation MUST be weighted-averaged just like lat/lon.
+            // The previous implementation tracked `nEle` (raw count of
+            // non-null-elevation points in the window) and divided by it,
+            // which produced `sumEleVal / nEle` — a value roughly
+            // `sumW / nEle`-times too small (for a symmetric ±5 kernel
+            // with sumW ≈ 2.0, every smoothed elevation came out at
+            // ~40% of its true value). GPX viewers that plot elevation
+            // showed a track sitting far below its real altitude.
+            //
+            // We now track `sumWEle` (sum of the kernel weights actually
+            // used for elevation points) and divide by it. If no
+            // elevation points fall in the window, the output has no
+            // <ele> tag (preserving whatever the input had — typically
+            // nothing, which is correct).
             val smoothed = ArrayList<GpxTrkPt>(parsed.size)
             for (i in parsed.indices) {
                 var sumW = 0.0
                 var sumLat = 0.0
                 var sumLon = 0.0
                 var sumEleVal = 0.0
-                var nEle = 0
+                var sumWEle = 0.0
                 for (kOff in 0 until w.size) {
                     val j = i + (kOff - GAUSSIAN_HALF_WINDOW)
                     if (j < 0 || j >= parsed.size) continue
@@ -2235,12 +2250,12 @@ class GpsRecorderService : Service(), LocationListener {
                     val e = parsed[j].ele
                     if (e != null) {
                         sumEleVal += e * weight
-                        nEle++
+                        sumWEle += weight
                     }
                 }
                 val newLat = if (sumW > 0.0) sumLat / sumW else parsed[i].lat
                 val newLon = if (sumW > 0.0) sumLon / sumW else parsed[i].lon
-                val newEle = if (nEle > 0) sumEleVal / nEle else null
+                val newEle = if (sumWEle > 0.0) sumEleVal / sumWEle else null
                 smoothed.add(
                     GpxTrkPt(
                         lat = newLat,
