@@ -1214,7 +1214,10 @@ function App(): React.ReactElement {
           <Text style={styles.settingsHeaderText}>НАСТРОЙКИ</Text>
           {settingsLocked && (
             <Text style={styles.settingsLockedBadge}>
-              🔒 Заблокировано на время записи
+              {/* U21: expand the badge text so a first-time user knows HOW to
+                  unlock — previously just said 'Заблокировано на время записи'
+                  with no hint that stopping the recording would unlock it. */}
+              🔒 Заблокировано на время записи (остановите, чтобы изменить)
             </Text>
           )}
         </View>
