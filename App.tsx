@@ -373,7 +373,9 @@ function App(): React.ReactElement {
         let granted = await GpsRecorder.hasPermissions();
         if (!granted) {
           await GpsRecorder.requestPermissions();
-          await new Promise((r) => setTimeout(r, 800));
+          // U23: wrap r in a 0-arg arrow so setTimeout's (...args: any[])=>void
+          // type is satisfied under strict mode (r itself expects 1 arg).
+          await new Promise<void>((r) => setTimeout(() => r(), 800));
           granted = await GpsRecorder.hasPermissions();
         }
         if (!mounted) return;
@@ -583,7 +585,10 @@ function App(): React.ReactElement {
         // The native side sends the post-save distance (recomputed from the
         // saved GPX file, post-smoothing) so the UI shows the true track
         // length. Negative means "not available" — keep the live distance.
-        const fd = (ev as any).finalDistanceM;
+        // U23: removed the (ev as any).finalDistanceM cast — the
+        // GpsSavedEvent type in NativeGpsRecorder.ts already declares
+        // finalDistanceM?: number, so the cast was unnecessary.
+        const fd = ev.finalDistanceM;
         setLastSavedDistance(typeof fd === 'number' && fd >= 0 ? fd : null);
         // U8: setPointCount(0) removed — unused state.
         setElapsedMs(0);
@@ -801,7 +806,9 @@ function App(): React.ReactElement {
 
   const handleGrantPermissions = useCallback(async () => {
     await GpsRecorder.requestPermissions();
-    await new Promise((r) => setTimeout(r, 800));
+    // U23: wrap r in a 0-arg arrow so setTimeout's (...args: any[])=>void
+    // type is satisfied under strict mode (r itself expects 1 arg).
+    await new Promise<void>((r) => setTimeout(() => r(), 800));
     const granted = await GpsRecorder.hasPermissions();
     setHasPermissions(granted);
     if (granted) {
