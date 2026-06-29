@@ -29,6 +29,13 @@ export type GpsLocationEvent = {
 
 export type GpsDurationEvent = {
   elapsedMs: number;
+  // L8 fix: movingMs is now emitted on every 1 Hz duration tick so the JS
+  // pace computation doesn't oscillate between the (frequent) duration
+  // event and the (much less frequent) location event's movingMs. Optional
+  // for backward compatibility with native modules that haven't been
+  // updated yet — when present, App.tsx prefers it over the location
+  // event's movingMs.
+  movingMs?: number;
 };
 
 export type GpsStateEvent = {

@@ -374,6 +374,13 @@ function App(): React.ReactElement {
         if (startTimeRef.current == null) {
           startTimeRef.current = Date.now() - ev.elapsedMs;
         }
+        // L8 fix: prefer the duration event's movingMs over the (stale)
+        // location event's movingMs. The duration tick fires every second,
+        // so the displayed avg pace no longer oscillates between the live
+        // duration tick and the much-less-frequent location event.
+        if (typeof ev.movingMs === 'number') {
+          setMovingMs(ev.movingMs);
+        }
       }),
       subscribe('state', (ev: GpsStateEvent) => {
         if (ev.isRecording) {

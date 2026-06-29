@@ -108,10 +108,16 @@ class GpsRecorderModule(private val reactContext: ReactApplicationContext) :
             module.send("location", map)
         }
 
-        fun emitDuration(elapsedMs: Long) {
+        fun emitDuration(elapsedMs: Long, movingMs: Long = 0L) {
             val module = instance ?: return
             val map = Arguments.createMap().apply {
                 putDouble("elapsedMs", elapsedMs.toDouble())
+                // L8 fix: include movingMs in the 1 Hz duration tick so the JS
+                // pace computation doesn't oscillate second-by-second between
+                // the live 'duration' tick and the much-less-frequent 'location'
+                // event's movingMs (which can be 0 for many seconds while the
+                // user is stationary under auto-pause).
+                putDouble("movingMs", movingMs.toDouble())
             }
             module.send("duration", map)
         }

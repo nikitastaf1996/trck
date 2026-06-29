@@ -260,11 +260,26 @@ class GpsRecorderService : Service(), LocationListener {
     @Volatile private var timeSamplingCounter: Int = 0
 
     // Duration tick runnable
+    //
+    // L8 fix: emit movingMs alongside elapsedMs on every 1 Hz tick. The JS
+    // pace computation uses movingMs when auto-pause / gap detection is on,
+    // so previously the displayed avg pace oscillated second-by-second
+    // because movingMs was only updated on 'location' events (1 Hz while
+    // moving, much less while stationary). With this fix the 'duration'
+    // event carries a fresh movingMs every tick — when auto-paused or
+    // signal-lost, movingMs stays frozen at its committed value; otherwise
+    // it ticks forward in lock-step with elapsedMs (modulo any pauses).
     private val durationTick = object : Runnable {
         override fun run() {
             if (isRecording) {
-                val elapsed = System.currentTimeMillis() - startTimeMs
-                GpsRecorderModule.emitDuration(elapsed)
+                val now = System.currentTimeMillis()
+                val elapsed = now - startTimeMs
+                val currentMovingMs = if (isAutoPaused || signalLost) {
+                    movingMs
+                } else {
+                    liveMovingMs(now)
+                }
+                GpsRecorderModule.emitDuration(elapsed, currentMovingMs)
                 handler.postDelayed(this, 1000L)
             }
         }
