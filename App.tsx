@@ -88,6 +88,27 @@ function pad2(n: number): string {
   return n < 10 ? `0${n}` : String(n);
 }
 
+/**
+ * U5: Russian plural-forms helper.
+ *
+ * Russian has three plural forms:
+ *   - 1, 21, 31, …  → forms[0]  ("точка")
+ *   - 2, 3, 4, 22, 23, 24, …  → forms[1]  ("точки")
+ *   - 0, 5–20, 25–30, …  → forms[2]  ("точек")
+ *
+ * The 11–14 exception is handled by the mod100 check (11–14 all share the
+ * same form as 5–20). The helper works for any noun — pass the three forms
+ * in [one, few, many] order.
+ */
+function pluralRu(n: number, forms: [string, string, string]): string {
+  const abs = Math.abs(n);
+  const mod10 = abs % 10;
+  const mod100 = abs % 100;
+  if (mod10 === 1 && mod100 !== 11) return forms[0];
+  if (mod10 >= 2 && mod10 <= 4 && (mod100 < 10 || mod100 >= 20)) return forms[1];
+  return forms[2];
+}
+
 function formatDuration(ms: number): string {
   const totalSec = Math.max(0, Math.floor(ms / 1000));
   const h = Math.floor(totalSec / 3600);
@@ -954,7 +975,7 @@ function App(): React.ReactElement {
               : isStopping
               ? 'ОСТАНОВКА…'
               : pointCount > 0
-              ? `${pointCount} ТОЧЕК`
+              ? `${pointCount} ${pluralRu(pointCount, ['ТОЧКА', 'ТОЧКИ', 'ТОЧЕК'])}`
               : 'ОЖИДАНИЕ'}
           </Text>
         </View>
@@ -1234,7 +1255,8 @@ function App(): React.ReactElement {
           <StepperRow
             label="Шаг N"
             value={timeSamplingN}
-            unit={timeSamplingN === 1 ? 'точка' : 'точек'}
+            // U5: correct Russian plural form for the unit label.
+            unit={pluralRu(timeSamplingN, ['точка', 'точки', 'точек'])}
             min={1}
             max={60}
             disabled={settingsLocked}
