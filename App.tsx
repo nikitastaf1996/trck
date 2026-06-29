@@ -917,8 +917,15 @@ function App(): React.ReactElement {
 
         {/* Phase 4: signal-loss banner. Shown when the gap watchdog in the
             service has declared signal lost (no fix in 15+ seconds) while a
-            recording is in progress. */}
-        {isRecording && signalLost && (
+            recording is in progress.
+            U9: defensively suppress this banner when isAutoPaused is true.
+            The native service already clears signalLost when entering auto-
+            pause (the two are mutually exclusive on the native side), but
+            the JS UI renders them in separate conditional blocks. Adding
+            && !isAutoPaused here ensures only ONE banner can ever render
+            even if both flags somehow end up true simultaneously (e.g.
+            during a transition race between the two native watchdogs). */}
+        {isRecording && signalLost && !isAutoPaused && (
           <View style={styles.signalLostBanner}>
             <Text style={styles.signalLostTitle}>ПОТЕРЯ СИГНАЛА GPS</Text>
             <Text style={styles.signalLostText}>
