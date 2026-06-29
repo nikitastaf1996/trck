@@ -296,6 +296,11 @@ function App(): React.ReactElement {
   // change). Without this ref, the handler closure would capture the initial
   // false value and never see auto-pause activate.
   const isAutoPausedRef = useRef<boolean>(false);
+  // U16: handleStop schedules a 1 s fallback syncStateFromNative() in case
+  // the 'saved' event is delayed or lost. We track the timeout id so the
+  // 'saved' event handler can cancel it (avoiding a UI flicker between
+  // 'stopping' and 'idle' after the saved card is already shown).
+  const stopTimeoutRef = useRef<number | null>(null);
   // Bugfix: mirror gapDetectionEnabled too, so the saved-card pace logic
   // can read it from the (once-set-up) saved-event closure. See the
   // paceTimeMs comment above for why gap detection now also affects pace.
@@ -533,6 +538,14 @@ function App(): React.ReactElement {
         }
       }),
       subscribe('saved', (ev: GpsSavedEvent) => {
+        // U16: cancel the 1 s fallback syncStateFromNative() that handleStop
+        // scheduled — the 'saved' event has arrived, so we don't need the
+        // fallback and don't want it to fire after we've already transitioned
+        // to 'idle' (would cause a brief flicker back to 'stopping').
+        if (stopTimeoutRef.current != null) {
+          clearTimeout(stopTimeoutRef.current);
+          stopTimeoutRef.current = null;
+        }
         // Snapshot the live timing values BEFORE we reset them, so the
         // saved card can show the post-save average pace over the final
         // distance / moving time. We read from refs because this closure
@@ -730,9 +743,16 @@ function App(): React.ReactElement {
     setRecordingState('stopping');
     try {
       await GpsRecorder.stop();
-      setTimeout(() => syncStateFromNative(), 1000);
-    } catch (e: any) {
-      setErrorMsg(e?.message ?? String(e));
+      // U16: track the timeout so the 'saved' event handler can cancel it.
+      // Without this, a delayed syncStateFromNative() can fire AFTER the
+      // 'saved' event has already transitioned the UI to 'idle' + shown
+      // the saved card — causing a brief flicker back to 'stopping'.
+      stopTimeoutRef.current = setTimeout(() => {
+        stopTimeoutRef.current = null;
+        syncStateFromNative();
+      }, 1000) as unknown as number;
+    } catch (e: unknown) {
+      setErrorMsg(e instanceof Error ? e.message : String(e));
       setRecordingState('recording');
     }
   }, [syncStateFromNative]);
