@@ -172,7 +172,12 @@ function computeCurrentPace(speedMps: number | null | undefined): string | null 
 function App(): React.ReactElement {
   const [recordingState, setRecordingState] = useState<RecordingState>('idle');
   const [elapsedMs, setElapsedMs] = useState<number>(0);
-  const [pointCount, setPointCount] = useState<number>(0);
+  // U8: pointCount state removed — it was only read by the now-dead
+  // `pointCount > 0` status branch. The 'state' event resets it to 0 when
+  // recording stops, so when we're not recording it's always 0; when we
+  // ARE recording, the status row shows 'ЗАПИСЬ' / 'АВТОПАУЗА' / etc.
+  // anyway. Keeping the state (and updating it on every location event)
+  // was just causing unnecessary re-renders for a value nobody reads.
   const [distance, setDistance] = useState<number>(0);
   const [currentSpeed, setCurrentSpeed] = useState<number | null>(null);
   const [fixType, setFixType] = useState<GpsFixType>('no fix');
@@ -295,7 +300,7 @@ function App(): React.ReactElement {
       const state: GpsFullState = await GpsRecorder.getState();
       if (state.isRecording) {
         setRecordingState((prev) => (prev === 'stopping' ? prev : 'recording'));
-        setPointCount(state.pointCount);
+        // U8: setPointCount(state.pointCount) removed — unused state.
         // L24 fix: don't let a getState() poll overwrite elapsedMs with an
         // older value. The duration tick (1 Hz) is the authoritative source
         // for elapsedMs; the poll is a fallback for when events are dropped.
@@ -425,7 +430,7 @@ function App(): React.ReactElement {
       }),
       subscribe('location', (ev: GpsLocationEvent) => {
         // Recording-time updates from the service.
-        setPointCount(ev.pointCount);
+        // U8: setPointCount(ev.pointCount) removed — unused state.
         if (typeof ev.distance === 'number') setDistance(ev.distance);
         if (ev.fixType) setFixType(ev.fixType);
         if (ev.accuracy != null) setAccuracy(ev.accuracy);
@@ -486,7 +491,7 @@ function App(): React.ReactElement {
       subscribe('state', (ev: GpsStateEvent) => {
         if (ev.isRecording) {
           setRecordingState('recording');
-          setPointCount(ev.pointCount);
+          // U8: setPointCount(ev.pointCount) removed — unused state.
           setElapsedMs(ev.elapsedMs);
           startTimeRef.current = Date.now() - ev.elapsedMs;
           // Phase 1/3/4: sync live pause / signal / moving-time on state
@@ -496,7 +501,7 @@ function App(): React.ReactElement {
           if (typeof ev.movingMs === 'number') setMovingMs(ev.movingMs);
         } else {
           setRecordingState('idle');
-          setPointCount(0);
+          // U8: setPointCount(0) removed — unused state.
           setElapsedMs(0);
           setDistance(0);
           setCurrentSpeed(null);
@@ -534,7 +539,7 @@ function App(): React.ReactElement {
         // length. Negative means "not available" — keep the live distance.
         const fd = (ev as any).finalDistanceM;
         setLastSavedDistance(typeof fd === 'number' && fd >= 0 ? fd : null);
-        setPointCount(0);
+        // U8: setPointCount(0) removed — unused state.
         setElapsedMs(0);
         setDistance(0);
         setCurrentSpeed(null);
@@ -638,7 +643,7 @@ function App(): React.ReactElement {
       }
 
       setElapsedMs(0);
-      setPointCount(0);
+      // U8: setPointCount(0) removed — unused state.
       setDistance(0);
       setCurrentSpeed(null);
       setLastSavedPath(null);
@@ -978,6 +983,12 @@ function App(): React.ReactElement {
             ]}
           />
           <Text style={styles.statusText}>
+            {/* U8: removed the dead `pointCount > 0 ? \`\${pointCount} ТОЧЕК\``
+                branch — the 'state' event handler resets pointCount to 0
+                whenever recording stops, so when we're NOT recording the
+                count is always 0 and the branch is unreachable. The
+                'ОЖИДАНИЕ' fallback is the only reachable not-recording
+                status now. */}
             {isAutoPaused
               ? 'АВТОПАУЗА'
               : signalLost
@@ -986,8 +997,6 @@ function App(): React.ReactElement {
               ? 'ЗАПИСЬ'
               : isStopping
               ? 'ОСТАНОВКА…'
-              : pointCount > 0
-              ? `${pointCount} ${pluralRu(pointCount, ['ТОЧКА', 'ТОЧКИ', 'ТОЧЕК'])}`
               : 'ОЖИДАНИЕ'}
           </Text>
         </View>
