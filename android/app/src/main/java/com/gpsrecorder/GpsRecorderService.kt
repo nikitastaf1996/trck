@@ -520,8 +520,14 @@ class GpsRecorderService : Service(), LocationListener {
         }
         lastResumeMs = null
 
-        // Final flush + finalize the GPX file
+        // Final flush + finalize the GPX file.
+        //
+        // L5 fix: when the buffer is empty (or no segment has ≥ 2 points),
+        // finalizeGpxFile() returns "" — the empty sentinel. In that case we
+        // do NOT recompute distance, do NOT emit 'saved' (no 'GPX СОХРАНЁН'
+        // toast, no file in Downloads/trck/), and just emit the stopped state.
         val savedFilePath = finalizeGpxFile()
+        val savedOk = savedFilePath.isNotEmpty()
 
         // Recompute the final distance from the SAVED GPX file so the value
         // the user sees in the UI matches the track length they will see when
@@ -537,7 +543,7 @@ class GpsRecorderService : Service(), LocationListener {
         // memory segments) so we capture whatever smoothing / filtering was
         // applied at finalize time. On failure we fall back to -1.0, which
         // the JS side interprets as "keep the live-accumulated distance".
-        val finalDistanceM = recomputeDistanceFromSavedGpx(savedFilePath)
+        val finalDistanceM = if (savedOk) recomputeDistanceFromSavedGpx(savedFilePath) else -1.0
 
         // Clear persisted state
         clearPersistedState()
@@ -548,7 +554,14 @@ class GpsRecorderService : Service(), LocationListener {
         // Tell JS (if alive) that we saved a file. Include the final distance
         // so the UI can show the post-save, post-smoothing track length
         // instead of the live-accumulated value.
-        GpsRecorderModule.emitSaved(savedFilePath, pointCount, finalDistanceM)
+        //
+        // L5 fix: only emit 'saved' when we actually wrote a file. The empty
+        // sentinel means finalizeGpxFile() bailed out early because the buffer
+        // was empty — emitting a 'saved' event in that case would make the UI
+        // flash a 'GPX СОХРАНЁН' card with no real file behind it.
+        if (savedOk) {
+            GpsRecorderModule.emitSaved(savedFilePath, pointCount, finalDistanceM)
+        }
         GpsRecorderModule.emitState(false, 0, 0L, false, false, 0L)
 
         // Stop foreground + service
@@ -1863,6 +1876,26 @@ class GpsRecorderService : Service(), LocationListener {
     private fun finalizeGpxFile(): String {
         val segments = segmentsSnapshot()
         val totalPoints = segments.sumOf { it.size }
+
+        // L5 fix: do NOT write an empty GPX file to Downloads/trck/. This
+        // can happen if startLocationUpdates() failed and stopRecording()
+        // was called before any fix arrived (defensive — L1 should already
+        // prevent this, but a separate guard here means a future code path
+        // that calls finalizeGpxFile on an empty buffer can't introduce the
+        // bug back). We also require at least one segment with ≥ 2 points —
+        // a single 1-point segment can't form a line and is useless to GPX
+        // consumers (Strava, OSM, etc.). The temp file IS deleted so no
+        // orphan is left behind.
+        //
+        // Return early WITHOUT emitting a 'saved' event — the caller
+        // (stopRecording) checks for the empty-path sentinel and skips
+        // emitSaved(...) so the UI does not show a 'GPX СОХРАНЁН' toast.
+        val hasUsableSegment = segments.any { it.size >= 2 }
+        if (totalPoints == 0 || !hasUsableSegment) {
+            Log.i(TAG, "Skipping finalize: empty buffer (totalPoints=$totalPoints)")
+            try { getTempFile().delete() } catch (_: Exception) {}
+            return ""
+        }
 
         val timestamp = SimpleDateFormat("yyyy-MM-dd_HH-mm-ss", Locale.US)
             .format(Date(startTimeMs))
