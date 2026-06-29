@@ -564,11 +564,9 @@ class GpsRecorderModule(private val reactContext: ReactApplicationContext) :
         }
     }
 
-    @ReactMethod
-    fun isRecording(promise: Promise) {
-        val prefs = reactContext.getSharedPreferences("gps_recorder_state", Context.MODE_PRIVATE)
-        promise.resolve(prefs.getBoolean("is_recording", false))
-    }
+    // O17: isRecording() @ReactMethod removed — superseded by getState().isRecording.
+    // The JS side already polls getState() for live state, and the native module
+    // still exposes `is_recording` via the state event for backward compatibility.
 
     // ---- Post-processing setting ----
     //
@@ -1101,11 +1099,16 @@ class GpsRecorderModule(private val reactContext: ReactApplicationContext) :
         }
     }
 
+    // O18: These are required by ReactContextBaseJavaModule's NativeEventEmitter
+    // contract, but we emit events via DeviceEventEmitter directly (see
+    // emitLocation/emitState/etc.). The JS side subscribes via
+    // DeviceEventEmitter.addListener (see NativeGpsRecorder.ts), so these
+    // stubs are never called. Kept as no-ops for API compatibility.
     @ReactMethod
-    fun addListener(eventName: String) { /* required by NativeEventEmitter, no-op */ }
+    fun addListener(eventName: String) { /* no-op — see O18 comment above */ }
 
     @ReactMethod
-    fun removeListeners(count: Int) { /* required by NativeEventEmitter, no-op */ }
+    fun removeListeners(count: Int) { /* no-op — see O18 comment above */ }
 
     @Suppress("DEPRECATION")
     override fun onCatalystInstanceDestroy() {

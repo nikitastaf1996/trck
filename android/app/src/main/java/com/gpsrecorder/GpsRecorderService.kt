@@ -166,7 +166,7 @@ class GpsRecorderService : Service(), LocationListener {
         private const val GAUSSIAN_SIGMA = 1.5
 
         // ---- Legacy post-processing algorithm thresholds ----
-        // (kept as constants so they're easy to tune; documented in postProcessGpx)
+        // (kept as constants so they're easy to tune.)
         private const val POST_PROCESS_ACCURACY_THRESHOLD_M = 15.0f
         private const val POST_PROCESS_JUMP_THRESHOLD_M = 15.0
         private const val POST_PROCESS_GAP_THRESHOLD_S = 5.0
@@ -804,10 +804,12 @@ class GpsRecorderService : Service(), LocationListener {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
+        // O11: use Russian plurals for the point count (точка / точки / точек).
+        val pointsStr = resources.getQuantityString(R.plurals.notification_points, points, points)
         val text = when {
-            signalLost -> getString(R.string.notification_text_signal_lost, points, formatDuration(elapsedMs))
-            paused -> getString(R.string.notification_text_paused, points, formatDuration(elapsedMs))
-            else -> getString(R.string.notification_text, points, formatDuration(elapsedMs))
+            signalLost -> getString(R.string.notification_text_signal_lost, pointsStr, formatDuration(elapsedMs))
+            paused -> getString(R.string.notification_text_paused, pointsStr, formatDuration(elapsedMs))
+            else -> getString(R.string.notification_text, pointsStr, formatDuration(elapsedMs))
         }
 
         return NotificationCompat.Builder(this, CHANNEL_ID)
@@ -1014,20 +1016,6 @@ class GpsRecorderService : Service(), LocationListener {
         prevLat = null
         prevLon = null
         prevTimeMs = null
-    }
-
-    /**
-     * Returns a flat snapshot of all points across all finalized segments
-     * plus the currently-active segment. Used by callers that need a single
-     * ordered list (e.g. for total count or temp-file flushing).
-     */
-    private fun allPointsSnapshot(): List<GpsPoint> = synchronized(pointBufferLock) {
-        val out = ArrayList<GpsPoint>(
-            (trackSegments.size.coerceAtLeast(1)) * 64 + currentSegment.size
-        )
-        for (seg in trackSegments) out.addAll(seg)
-        out.addAll(currentSegment)
-        out
     }
 
     /**
@@ -2359,9 +2347,7 @@ class GpsRecorderService : Service(), LocationListener {
 
         val rawBytes = rawGpxContent.toByteArray(Charsets.UTF_8)
         // On-the-fly filtering (if enabled) was already applied in onLocationChanged,
-        // so the buffer is clean by this point. The legacy offline post-processor
-        // (postProcessGpx) is intentionally NOT invoked here — it has been superseded
-        // by the on-the-fly filter. The optional finalize-time steps are:
+        // so the buffer is clean by this point. The optional finalize-time steps are:
         //   1. Gaussian kernel smoothing (controlled by its own setting).
         //   2. Douglas-Peucker simplification (controlled by its own setting).
         // They chain in that order: Gaussian first (to suppress single-fix
@@ -2548,133 +2534,6 @@ class GpsRecorderService : Service(), LocationListener {
     }
 
     // ------------------------------------------------------------------
-    // Post-processing algorithm
-    // ------------------------------------------------------------------
-
-    /**
-     * Post-processes the raw GPX content. Implements the user-specified algorithm:
-     *
-     *   1. Parse all trkpt (lat/lon/ele/time/speed/accuracy).
-     *   2. Sort by timestamp ascending (stable).
-     *   3. Drop points with accuracy missing or >= 15.0 m.
-     *   4. Drop duplicate-timestamp points (dt == 0).
-     *   5. Defensive jump sweep: drop points still producing >= 15.0 m jump vs
-     *      previous kept.
-     *   6. Interpolate remaining outages (gaps >= 5.0 s) at 1.0 Hz. Synthetic
-     *      points are tagged <interpolated>true</interpolated> in <extensions>.
-     *
-     * If the input has no parseable trkpt, it is returned unchanged so the user
-     * still gets a (raw) file rather than nothing.
-     */
-    private fun postProcessGpx(rawGpx: String): String {
-        // 1. Parse all trkpt
-        val parsed = mutableListOf<GpxTrkPt>()
-        val regex = Regex("<trkpt lat=\"([^\"]+)\" lon=\"([^\"]+)\">(.*?)</trkpt>", RegexOption.DOT_MATCHES_ALL)
-        for (m in regex.findAll(rawGpx)) {
-            val lat = m.groupValues[1].toDoubleOrNull() ?: continue
-            val lon = m.groupValues[2].toDoubleOrNull() ?: continue
-            val inner = m.groupValues[3]
-            val ele = Regex("<ele>([^<]+)</ele>").find(inner)?.groupValues?.get(1)?.toDoubleOrNull()
-            val speed = Regex("<speed>([^<]+)</speed>").find(inner)?.groupValues?.get(1)?.toFloatOrNull()
-            val acc = Regex("<accuracy>([^<]+)</accuracy>").find(inner)?.groupValues?.get(1)?.toFloatOrNull()
-            val timeIso = Regex("<time>([^<]+)</time>").find(inner)?.groupValues?.get(1)
-            val timeMs = parseIsoTime(timeIso) ?: continue
-            parsed.add(GpxTrkPt(lat, lon, ele, speed, acc, timeMs, interpolated = false))
-        }
-        if (parsed.isEmpty()) {
-            Log.w(TAG, "postProcessGpx: no trkpt found, returning raw input")
-            return rawGpx
-        }
-        Log.i(TAG, "postProcessGpx: parsed ${parsed.size} points")
-
-        // 2. Sort by timestamp ascending (stable — Kotlin's sortedBy is stable).
-        val sorted = parsed.sortedBy { it.timeMs }
-
-        // 3. Drop points with accuracy missing or >= 15.0 m.
-        val filteredAcc = sorted.filter { p ->
-            val a = p.accuracy
-            a != null && a < POST_PROCESS_ACCURACY_THRESHOLD_M
-        }
-        Log.i(TAG, "postProcessGpx: after accuracy filter -> ${filteredAcc.size}")
-
-        // 4. Drop duplicate-timestamp points (dt == 0).
-        val filteredDup = ArrayList<GpxTrkPt>(filteredAcc.size)
-        var lastT = Long.MIN_VALUE
-        for (p in filteredAcc) {
-            if (p.timeMs != lastT) {
-                filteredDup.add(p)
-                lastT = p.timeMs
-            }
-        }
-        Log.i(TAG, "postProcessGpx: after duplicate-timestamp filter -> ${filteredDup.size}")
-
-        // 5. Defensive jump sweep: drop points still producing >= 15.0 m jump vs
-        //    previous kept. (We use a fresh threshold constant so this stays
-        //    decoupled from the recording-time ACCURACY_THRESHOLD_M.)
-        val filteredJump = ArrayList<GpxTrkPt>(filteredDup.size)
-        for (p in filteredDup) {
-            val prev = filteredJump.lastOrNull()
-            if (prev == null) {
-                filteredJump.add(p)
-            } else {
-                val d = haversineMeters(prev.lat, prev.lon, p.lat, p.lon)
-                if (d < POST_PROCESS_JUMP_THRESHOLD_M) {
-                    filteredJump.add(p)
-                }
-                // else: drop (>= 15 m jump from previous kept)
-            }
-        }
-        Log.i(TAG, "postProcessGpx: after jump sweep -> ${filteredJump.size}")
-
-        // 6. Interpolate remaining outages (gaps >= 5.0 s) at 1.0 Hz.
-        //    Synthetic points are tagged <interpolated>true</interpolated>.
-        val final = ArrayList<GpxTrkPt>(filteredJump.size * 2)
-        if (filteredJump.isNotEmpty()) {
-            final.add(filteredJump[0])
-            for (i in 1 until filteredJump.size) {
-                val prev = filteredJump[i - 1]
-                val curr = filteredJump[i]
-                val dtMs = curr.timeMs - prev.timeMs
-                val dtSec = dtMs / 1000.0
-                if (dtSec >= POST_PROCESS_GAP_THRESHOLD_S) {
-                    // Add a synthetic point at every whole second strictly between
-                    // prev and curr. E.g. dt = 7.0s -> k = 1..6 (6 points).
-                    var k = 1
-                    while (true) {
-                        val tSyn = prev.timeMs + k * 1000L
-                        if (tSyn >= curr.timeMs) break
-                        val frac = (tSyn - prev.timeMs).toDouble() / dtMs.toDouble()
-                        val lat = prev.lat + (curr.lat - prev.lat) * frac
-                        val lon = prev.lon + (curr.lon - prev.lon) * frac
-                        val ele = if (prev.ele != null && curr.ele != null)
-                            prev.ele + (curr.ele - prev.ele) * frac else null
-                        val speed = if (prev.speed != null && curr.speed != null)
-                            (prev.speed + (curr.speed - prev.speed) * frac).toFloat() else null
-                        final.add(GpxTrkPt(lat, lon, ele, speed, null, tSyn, interpolated = true))
-                        k++
-                    }
-                }
-                final.add(curr)
-            }
-        }
-        Log.i(TAG, "postProcessGpx: after interpolation -> ${final.size} points")
-
-        // Rebuild GPX. Preserve the original <name> if present, else use a default.
-        val origName = Regex("<name>([^<]*)</name>").find(rawGpx)?.groupValues?.get(1)
-            ?: "GPS Recording"
-        return buildString {
-            append(gpxHeader())
-            append("  <trk>\n")
-            append("    <name>").append(origName).append("</name>\n")
-            append("    <trkseg>\n")
-            for (p in final) {
-                append(formatGpxPointWithInterpolated(p))
-            }
-            append("    </trkseg>\n")
-            append("  </trk>\n")
-            append("</gpx>\n")
-        }
-    }
 
     /**
      * Gaussian / kernel smoothing of the GPX track.

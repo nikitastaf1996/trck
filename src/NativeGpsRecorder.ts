@@ -120,7 +120,6 @@ export type GpsRecorderEvents = {
 type GpsRecorderNativeType = {
   start(): Promise<void>;
   stop(): Promise<void>;
-  isRecording(): Promise<boolean>;
   getState(): Promise<GpsFullState>;
   requestPermissions(): Promise<boolean>;
   hasPermissions(): Promise<boolean>;
@@ -168,7 +167,6 @@ type GpsRecorderNativeType = {
 const NativeGpsRecorder = (NativeModules.GpsRecorder as GpsRecorderNativeType) || {
   start: async () => {},
   stop: async () => {},
-  isRecording: async () => false,
   getState: async () => ({
     isRecording: false,
     pointCount: 0,
@@ -213,7 +211,6 @@ const NativeGpsRecorder = (NativeModules.GpsRecorder as GpsRecorderNativeType) |
 export const GpsRecorder = {
   start: () => NativeGpsRecorder.start(),
   stop: () => NativeGpsRecorder.stop(),
-  isRecording: () => NativeGpsRecorder.isRecording(),
   getState: () => NativeGpsRecorder.getState(),
   requestPermissions: () => NativeGpsRecorder.requestPermissions(),
   hasPermissions: () => NativeGpsRecorder.hasPermissions(),

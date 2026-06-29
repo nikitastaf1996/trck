@@ -18,8 +18,6 @@ class MainActivity : ReactActivity() {
     companion object {
         private const val TAG = "MainActivity"
 
-        @Volatile private var instance: MainActivity? = null
-
         /**
          * Process-wide flag: becomes true the first time we successfully fire the
          * permission dialog in this process. Prevents spamming the user with dialogs
@@ -29,15 +27,6 @@ class MainActivity : ReactActivity() {
          * start asks again (which is what we want).
          */
         @Volatile private var hasRequestedInThisProcess = false
-
-        /**
-         * Called from GpsRecorderModule.requestPermissions(). Always tries to launch
-         * the system permission dialog (ignores the auto-launch flag), because the
-         * user explicitly tapped the "Grant permissions" button.
-         */
-        fun requestRequiredPermissions(activity: MainActivity?) {
-            activity?.requestAllPermissionsFromJs()
-        }
     }
 
     /**
@@ -177,7 +166,6 @@ class MainActivity : ReactActivity() {
 
     override fun onResume() {
         super.onResume()
-        instance = this
         // Auto-request on first resume so the user doesn't have to grant permissions
         // manually from Android Settings.
         maybeAutoRequestPermissions()

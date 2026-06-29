@@ -36,7 +36,6 @@ import {
   AppState,
   Platform,
   Pressable,
-  SafeAreaView,
   ScrollView,
   StatusBar,
   StyleSheet,
@@ -53,6 +52,9 @@ import {
   type GpsFixType,
   type GpsGnssEvent,
 } from './src/NativeGpsRecorder';
+// O19: use react-native-safe-area-context instead of the deprecated built-in.
+// The built-in SafeAreaView from 'react-native' is unreliable on Android notches.
+import { SafeAreaView } from 'react-native-safe-area-context';
 
 type RecordingState = 'idle' | 'recording' | 'stopping';
 
@@ -1077,7 +1079,7 @@ function App(): React.ReactElement {
   const avgPace = computeAvgPace(paceTimeMs, distance);
 
   return (
-    <SafeAreaView style={styles.container}>
+    <SafeAreaView style={styles.container} edges={['top', 'bottom']}>
       <StatusBar barStyle="dark-content" backgroundColor={COLOR.bg} />
       <ScrollView
         contentContainerStyle={styles.scrollContent}
