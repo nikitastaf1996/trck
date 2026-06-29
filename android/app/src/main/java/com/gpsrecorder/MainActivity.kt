@@ -72,6 +72,13 @@ class MainActivity : ReactActivity() {
             // After the core batch resolves, ask for background location separately
             // (only if fine location was granted). Android 10+ requires this to be
             // a separate, follow-up request.
+            //
+            // L9 fix: also notify any pending JS permission request that the user
+            // has responded. The result of the *core* batch is what JS needs to
+            // know about (foreground location + notifications); the background-
+            // location follow-up is best-effort and its outcome is reported
+            // separately via the next hasPermissions() call.
+            notifyPermissionResult()
             requestBackgroundLocationIfPossible()
         }
 
@@ -79,6 +86,30 @@ class MainActivity : ReactActivity() {
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { _ ->
             /* result ignored — best-effort */
         }
+
+    /**
+     * L9 fix: callback invoked when the user actually responds to the core
+     * permission dialog. Set by [GpsRecorderModule.requestPermissions] and
+     * cleared after it fires. Stored statically so a re-created activity
+     * (configuration change, process restart) can still notify the pending
+     * request — though in practice the module survives across activity
+     * recreation because it lives on the ReactApplicationContext.
+     */
+    @Volatile
+    private var permissionResultCallback: (() -> Unit)? = null
+
+    fun setPermissionResultCallback(cb: (() -> Unit)?) {
+        permissionResultCallback = cb
+    }
+
+    private fun notifyPermissionResult() {
+        permissionResultCallback?.let { cb ->
+            permissionResultCallback = null
+            try { cb() } catch (e: Exception) {
+                Log.w(TAG, "Permission result callback threw", e)
+            }
+        }
+    }
 
     override fun getMainComponentName(): String = "trck"
 

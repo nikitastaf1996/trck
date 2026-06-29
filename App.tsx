@@ -478,12 +478,11 @@ function App(): React.ReactElement {
     try {
       let granted = await GpsRecorder.hasPermissions();
       if (!granted) {
-        await GpsRecorder.requestPermissions();
-        for (let i = 0; i < 30; i++) {
-          await new Promise((r) => setTimeout(r, 1000));
-          granted = await GpsRecorder.hasPermissions();
-          if (granted) break;
-        }
+        // L9 fix: requestPermissions() now resolves only after the user
+        // actually responds to the system dialog, so we no longer need the
+        // 30-second polling loop. The await below blocks until the user
+        // taps Allow or Deny.
+        granted = await GpsRecorder.requestPermissions();
         setHasPermissions(granted);
         if (granted) {
           try { await GpsRecorder.startGnssMonitor(); } catch { /* ignore */ }

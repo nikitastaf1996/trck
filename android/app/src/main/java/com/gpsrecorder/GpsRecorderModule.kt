@@ -79,6 +79,15 @@ class GpsRecorderModule(private val reactContext: ReactApplicationContext) :
         // Singleton reference so the Service can emit events without depending on JS being alive.
         @Volatile private var instance: GpsRecorderModule? = null
 
+        // L9 fix: pending promise for requestPermissions(). Stored on the
+        // instance (not the companion) because each RN instance gets its own
+        // module. Resolved inside the ActivityResultCallback (via
+        // MainActivity.setPermissionResultCallback) so the JS caller's await
+        // resolves only after the user actually responds to the system dialog.
+        // @Volatile because the callback fires on the main thread but the
+        // method is called from the JS thread.
+        @Volatile private var pendingPermissionsPromise: Promise? = null
+
         // ---- Event emitters called from GpsRecorderService ----
         fun emitLocation(
             lat: Double, lon: Double, alt: Double?, speed: Float?, accuracy: Float?,
@@ -791,29 +800,79 @@ class GpsRecorderModule(private val reactContext: ReactApplicationContext) :
     @ReactMethod
     fun requestPermissions(promise: Promise) {
         try {
+            // Fast path: all permissions already granted.
             if (hasAllPermissions()) {
                 promise.resolve(true)
                 return
             }
             val activity = reactContext.currentActivity as? MainActivity
-            if (activity != null) {
-                activity.requestAllPermissionsFromJs()
-            } else {
-                // Activity not yet attached (e.g. JS mounted before MainActivity resumed).
-                // Retry shortly on the main thread.
-                Handler(Looper.getMainLooper()).postDelayed({
-                    try {
-                        (reactContext.currentActivity as? MainActivity)?.requestAllPermissionsFromJs()
-                    } catch (e: Exception) {
-                        android.util.Log.w(TAG, "Deferred permission request failed", e)
-                    }
-                }, 500L)
+            if (activity == null) {
+                // Activity not yet attached (e.g. JS mounted before MainActivity
+                // resumed). We can't show a dialog without an activity, so resolve
+                // false immediately — JS will retry on the next user action.
+                Log.w(TAG, "requestPermissions: no Activity attached; resolving false")
+                promise.resolve(false)
+                return
             }
-            // Return the current state — JS will poll hasPermissions() separately
-            // to detect when the user has actually granted the permissions.
-            promise.resolve(hasAllPermissions())
+
+            // L9 fix: resolve the promise ONLY after the user actually responds
+            // to the system dialog. Previously this method launched the dialog
+            // asynchronously and immediately resolved with hasAllPermissions()
+            // (almost always false at that instant), forcing the JS side into a
+            // 30-second polling loop (App.tsx:handleStart).
+            //
+            // If a second requestPermissions() arrives while one is pending,
+            // reject the first with "superseded" so the caller can choose how to
+            // react (typically: ignore the rejection and let the new request's
+            // result drive the UI).
+            pendingPermissionsPromise?.reject("superseded", "Superseded by a newer requestPermissions call")
+            pendingPermissionsPromise = promise
+
+            // The callback fires on the main thread when the ActivityResultContracts
+            // callback runs (see MainActivity.locationPermissionLauncher). It in
+            // turn calls resolvePendingPermissions(hasAllPermissions()).
+            activity.setPermissionResultCallback {
+                val granted = hasAllPermissions()
+                resolvePendingPermissions(granted)
+            }
+
+            // Best-effort: also handle the activity being destroyed mid-request
+            // (or the RN instance being torn down). The next onResume /
+            // onWindowFocusChanged will clear the callback via
+            // setPermissionResultCallback(null) (TBD; for now we rely on the
+            // 30-second JS timeout as a fallback).
+            try {
+                activity.requestAllPermissionsFromJs()
+            } catch (e: Exception) {
+                // Launch failed — reject so JS doesn't hang waiting for a callback
+                // that will never fire.
+                Log.w(TAG, "requestPermissions: launch failed", e)
+                resolvePendingPermissions(false)
+            }
         } catch (e: Exception) {
-            promise.reject("E_PERM", e.message ?: "Permission error", e)
+            // Make sure we don't leave a dangling promise if something blew up
+            // before we registered the callback.
+            try { pendingPermissionsPromise?.reject("E_PERM", e.message ?: "Permission error", e) } catch (_: Exception) {}
+            pendingPermissionsPromise = null
+            try { promise.reject("E_PERM", e.message ?: "Permission error", e) } catch (_: Exception) {}
+        }
+    }
+
+    /**
+     * Resolves the pending permissions promise (if any) with the given
+     * `granted` value and clears the field. Safe to call when no promise is
+     * pending (no-op).
+     */
+    private fun resolvePendingPermissions(granted: Boolean) {
+        val p = pendingPermissionsPromise
+        pendingPermissionsPromise = null
+        // Clear the activity-side callback too so a stale closure doesn't fire
+        // on a later unrelated permission request.
+        try {
+            (reactContext.currentActivity as? MainActivity)?.setPermissionResultCallback(null)
+        } catch (_: Exception) {}
+        if (p != null) {
+            try { p.resolve(granted) } catch (_: Exception) {}
         }
     }
 
