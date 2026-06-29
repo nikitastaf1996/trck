@@ -604,7 +604,14 @@ class GpsRecorderService : Service(), LocationListener {
                 startForeground(NOTIFICATION_ID, notification)
             }
         } catch (e: Exception) {
+            // L10 fix: this is fatal — without startForeground the service
+            // will be killed by the system within a few seconds. Emit a
+            // fatal error so the UI resets to idle and the user can retry.
             Log.e(TAG, "startForeground failed", e)
+            GpsRecorderModule.emitError(
+                "Failed to start foreground service: ${e.message}",
+                fatal = true
+            )
         }
     }
 
@@ -707,7 +714,7 @@ class GpsRecorderService : Service(), LocationListener {
         }
         val lm = locationManager ?: run {
             Log.e(TAG, "No LocationManager")
-            GpsRecorderModule.emitError("Location service unavailable")
+            GpsRecorderModule.emitError("Location service unavailable", fatal = true)
             stopRecording()
             return false
         }
@@ -717,7 +724,7 @@ class GpsRecorderService : Service(), LocationListener {
             != PackageManager.PERMISSION_GRANTED
         ) {
             Log.e(TAG, "No FINE_LOCATION permission")
-            GpsRecorderModule.emitError("Location permission not granted")
+            GpsRecorderModule.emitError("Location permission not granted", fatal = true)
             stopRecording()
             return false
         }
@@ -732,7 +739,10 @@ class GpsRecorderService : Service(), LocationListener {
         }
         if (providers.isEmpty()) {
             Log.e(TAG, "No location provider enabled")
-            GpsRecorderModule.emitError("No location provider enabled. Please enable location in settings.")
+            GpsRecorderModule.emitError(
+                "No location provider enabled. Please enable location in settings.",
+                fatal = true
+            )
             stopRecording()
             return false
         }
@@ -1578,7 +1588,16 @@ class GpsRecorderService : Service(), LocationListener {
             Log.i(TAG, "recomputeDistanceFromSavedGpx: parsed=$parsed total=${total}m from $savedPath")
             return total
         } catch (e: Exception) {
+            // L10 fix: non-fatal error. The recording has already been saved
+            // successfully (this function is called AFTER the GPX file is
+            // written). The UI falls back to the live-accumulated distance
+            // (finalDistanceM = -1.0). Do NOT reset the UI to idle — the
+            // user's recording is intact.
             Log.w(TAG, "recomputeDistanceFromSavedGpx failed for '$savedPath'", e)
+            GpsRecorderModule.emitError(
+                "Could not recompute distance from saved GPX file; showing live distance instead.",
+                fatal = false
+            )
             return -1.0
         }
     }

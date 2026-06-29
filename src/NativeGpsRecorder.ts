@@ -61,6 +61,14 @@ export type GpsSavedEvent = {
 
 export type GpsErrorEvent = {
   message: string;
+  // L10 fix: when true, the native service has actually stopped (or is about
+  // to stop) — e.g. missing permission, no provider enabled, startForeground
+  // threw. The JS UI SHOULD reset to idle so the user can press START again.
+  // When false, the error is informational (e.g. distance recompute failed)
+  // and the recording is still running — the UI MUST NOT reset to idle in
+  // that case, or the user could press START while a recording is in
+  // progress and lose the in-progress track.
+  fatal?: boolean;
 };
 
 /**

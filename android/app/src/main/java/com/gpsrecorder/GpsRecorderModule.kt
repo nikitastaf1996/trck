@@ -171,9 +171,33 @@ class GpsRecorderModule(private val reactContext: ReactApplicationContext) :
             module.send("saved", map)
         }
 
-        fun emitError(message: String) {
+        /**
+         * Emits an 'error' event to JS.
+         *
+         * L10 fix: errors are now classified as fatal or non-fatal.
+         *
+         *  - Fatal: the service has actually stopped (or is about to stop).
+         *    Examples: missing location permission, no provider enabled,
+         *    startForeground threw. The JS UI SHOULD reset to idle when it
+         *    sees a fatal error so the user can press START again.
+         *
+         *  - Non-fatal: a transient / informational failure that does NOT
+         *    tear down the service. Example: recomputeDistanceFromSavedGpx
+         *    failed (UI falls back to the live-accumulated distance). The
+         *    JS UI MUST NOT reset to idle on a non-fatal error — doing so
+         *    would enable the user to press START while a recording is
+         *    actually still running on the native side, which would reset
+         *    state and lose the in-progress track.
+         *
+         * The `fatal` flag is included in the event payload so the JS
+         * handler can decide whether to flip the UI to idle.
+         */
+        fun emitError(message: String, fatal: Boolean = false) {
             val module = instance ?: return
-            val map = Arguments.createMap().apply { putString("message", message) }
+            val map = Arguments.createMap().apply {
+                putString("message", message)
+                putBoolean("fatal", fatal)
+            }
             module.send("error", map)
         }
 

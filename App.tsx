@@ -440,8 +440,15 @@ function App(): React.ReactElement {
         recentSpeedsRef.current = [];
       }),
       subscribe('error', (ev) => {
+        // L10 fix: only reset the UI to idle on FATAL errors. Non-fatal
+        // errors (e.g. distance recompute failed) are informational — the
+        // recording is still running and resetting to idle would let the
+        // user press START while a recording is in progress, losing the
+        // in-progress track.
         setErrorMsg(ev.message);
-        setRecordingState('idle');
+        if (ev.fatal) {
+          setRecordingState('idle');
+        }
       }),
     ];
 
