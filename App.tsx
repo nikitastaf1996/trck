@@ -121,13 +121,23 @@ function formatDuration(ms: number): string {
 /**
  * Formats a distance in meters as a runner-friendly string with the unit
  * separated, so the UI can render the number largely and the unit small:
- *   - < 1000 m  -> { value: "123", unit: "m" }
- *   - >= 1000 m -> { value: "1.23", unit: "km" }
+ *   - < 1500 m   -> { value: "123", unit: "m" }   (was: < 1000 m)
+ *   - < 10000 m  -> { value: "1.50", unit: "km" } (2-decimal km)
+ *   - >= 10000 m -> { value: "10.0", unit: "km" } (1-decimal km)
+ *
+ * U11: changed the m→km boundary from 1000 m to 1500 m so that 1000 m →
+ * "1000 m" (not "1.00 km" — an abrupt precision drop). The 1500 m threshold
+ * keeps the unit consistent within a typical short-run distance band and
+ * only switches to km once 1.50 km reads cleaner than 1500 m.
+ *
+ * U11: also added a NaN / Infinity / negative guard so a buggy distance
+ * accumulator can't render "NaN km" or "Infinity km" — falls back to "0 m".
  */
 function formatDistance(distanceM: number): { value: string; unit: string } {
-  if (!distanceM || distanceM <= 0) return { value: '0', unit: 'm' };
-  if (distanceM < 1000) return { value: String(Math.round(distanceM)), unit: 'm' };
-  return { value: (distanceM / 1000).toFixed(2), unit: 'km' };
+  if (!Number.isFinite(distanceM) || distanceM < 0) return { value: '0', unit: 'm' };
+  if (distanceM < 1500) return { value: String(Math.round(distanceM)), unit: 'm' };
+  if (distanceM < 10000) return { value: (distanceM / 1000).toFixed(2), unit: 'km' };
+  return { value: (distanceM / 1000).toFixed(1), unit: 'km' };
 }
 
 /**
