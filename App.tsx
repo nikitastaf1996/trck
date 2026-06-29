@@ -1108,7 +1108,16 @@ function App(): React.ReactElement {
         {/* Primary stats: TIME, DISTANCE, PACE, AVG PACE */}
         <BigStat
           label="ВРЕМЯ"
-          value={formatDuration(elapsedMs)}
+          // U22: when auto-paused, prefix the time with "⏸ " so it's
+          // crystal clear the displayed time is wall-clock (still ticking)
+          // but the recording is paused. The amber colour + the
+          // "АВТОПАУЗА · запись приостановлена" badge below already signal
+          // pause, but users may still perceive the ticking timer as
+          // "still recording time while paused" — the prefix removes
+          // that ambiguity. (Alternative fix per TODO; the main fix would
+          // switch the main timer to movingMs and show both times, but
+          // that requires restructuring the BigStat layout.)
+          value={isAutoPaused ? `⏸ ${formatDuration(elapsedMs)}` : formatDuration(elapsedMs)}
           // Phase 3: when auto-pause is active, render the TIME value in
           // amber and show a small "ПАУЗА" indicator above it so the user
           // knows the timer is wall-clock but recording is paused.
