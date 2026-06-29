@@ -1265,6 +1265,23 @@ function App(): React.ReactElement {
         {errorMsg && (
           <View style={styles.errorCard}>
             <Text style={styles.errorText}>{errorMsg}</Text>
+            {/* U2: when permissions are missing (permanently denied or just
+                not yet granted), offer a button that opens the system app
+                settings page so the user can grant them. The native module
+                GpsRecorder.openAppSettings() is already exported; we just
+                call it. The existing AppState listener (mount useEffect)
+                re-checks hasPermissions when the user returns and updates
+                the card automatically. */}
+            {!hasPermissions && (
+              <Pressable
+                style={styles.openSettingsBtn}
+                onPress={() => {
+                  GpsRecorder.openAppSettings().catch(() => { /* ignore */ });
+                }}
+              >
+                <Text style={styles.openSettingsBtnText}>Открыть настройки</Text>
+              </Pressable>
+            )}
           </View>
         )}
 
@@ -1814,6 +1831,23 @@ const styles = StyleSheet.create({
     marginBottom: 16, borderWidth: 1, borderColor: COLOR.errorBorder,
   },
   errorText: { color: COLOR.errorText, fontSize: 13 },
+  // U2: "Открыть настройки" button shown inside the error card when the user
+  // is missing permissions. Tapping it calls GpsRecorder.openAppSettings(),
+  // which opens the Android system app-details page (where the user can
+  // grant location / notification permissions manually).
+  openSettingsBtn: {
+    marginTop: 10,
+    paddingVertical: 8,
+    paddingHorizontal: 12,
+    borderRadius: 8,
+    backgroundColor: COLOR.errorBorder,
+    alignSelf: 'flex-start',
+  },
+  openSettingsBtnText: {
+    color: COLOR.errorText,
+    fontSize: 13,
+    fontWeight: '600',
+  },
   // ---- Footer ----
   footerNote: { marginTop: 8 },
   footerText: {
