@@ -458,8 +458,20 @@ class GpsRecorderService : Service(), LocationListener {
         // startForegroundService()).
         startForegroundIfNeeded()
 
-        // Start GPS + GNSS status tracking
-        startLocationUpdates()
+        // Start GPS + GNSS status tracking.
+        //
+        // L1 fix: startLocationUpdates() now returns Boolean. If it returns
+        // false it has ALREADY called stopRecording() (which finalized state,
+        // released the wakelock, emitted state=false, and called stopSelf()).
+        // We MUST bail out here without registering the GNSS callback, posting
+        // the tick handlers, writing a new temp file header, or emitting
+        // state=true — otherwise the UI would flip to "recording" on a
+        // service that has already been torn down, and an orphan temp file
+        // would be left in externalCacheDir. L5/L6/L7 are all consequences
+        // of NOT having this early-return.
+        if (!startLocationUpdates()) {
+            return  // startLocationUpdates already cleaned up via stopRecording()
+        }
         startGnssStatusTracking()
 
         // Start duration tick + periodic flush
@@ -645,13 +657,31 @@ class GpsRecorderService : Service(), LocationListener {
         nm.notify(NOTIFICATION_ID, buildNotification(pointCount, getElapsedMs()))
     }
 
-    private fun startLocationUpdates() {
+    /**
+     * Starts location updates from the available providers.
+     *
+     * Returns `true` if updates were successfully requested (or at least one
+     * provider was attempted without a hard failure). Returns `false` if a
+     * precondition failed — in that case this method has ALREADY called
+     * [stopRecording] (which finalizes any state, releases the wakelock, and
+     * calls [stopSelf]) and the caller MUST bail out immediately without
+     * touching any further recording state (GNSS callback registration, tick
+     * handlers, temp file header, emit-state-true, etc.).
+     *
+     * This return-value contract is the fix for the L1 bug where
+     * `startRecording()` kept going after `stopRecording()` had already torn
+     * the service down, leaving the UI showing "recording" on a stopped
+     * service and an orphan temp file in `externalCacheDir`.
+     */
+    private fun startLocationUpdates(): Boolean {
         if (locationManager == null) {
             locationManager = getSystemService(LOCATION_SERVICE) as LocationManager
         }
         val lm = locationManager ?: run {
             Log.e(TAG, "No LocationManager")
-            return
+            GpsRecorderModule.emitError("Location service unavailable")
+            stopRecording()
+            return false
         }
 
         // Check permissions
@@ -661,7 +691,7 @@ class GpsRecorderService : Service(), LocationListener {
             Log.e(TAG, "No FINE_LOCATION permission")
             GpsRecorderModule.emitError("Location permission not granted")
             stopRecording()
-            return
+            return false
         }
 
         // Prefer GPS provider, fall back to network if needed
@@ -676,7 +706,7 @@ class GpsRecorderService : Service(), LocationListener {
             Log.e(TAG, "No location provider enabled")
             GpsRecorderModule.emitError("No location provider enabled. Please enable location in settings.")
             stopRecording()
-            return
+            return false
         }
 
         for (p in providers) {
@@ -709,6 +739,7 @@ class GpsRecorderService : Service(), LocationListener {
         // with fix status as soon as the app opens, so removing this seed does
         // not degrade UX. The service simply waits for the first real fix from
         // requestLocationUpdates() above, which is guaranteed to be fresh.
+        return true
     }
 
     private fun stopLocationUpdates() {
