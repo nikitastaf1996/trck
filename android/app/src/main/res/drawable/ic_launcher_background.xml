@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Adaptive launcher icon background for trck (O26).
+
+  Solid white background so the navy "T" foreground (ic_launcher_foreground.xml)
+  has high contrast on all launcher shapes.
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M0,0 h108 v108 h-108 z" />
+</vector>

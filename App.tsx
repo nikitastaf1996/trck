@@ -111,6 +111,9 @@ function pluralRu(n: number, forms: [string, string, string]): string {
   return forms[2];
 }
 
+// O24: This is duplicated in GpsRecorderService.kt (formatDuration). The two
+// MUST stay in sync — if you change the format here, change the Kotlin
+// version too. See CHANGELOG.md / TODO 4, O24 for context.
 function formatDuration(ms: number): string {
   const totalSec = Math.max(0, Math.floor(ms / 1000));
   const h = Math.floor(totalSec / 3600);

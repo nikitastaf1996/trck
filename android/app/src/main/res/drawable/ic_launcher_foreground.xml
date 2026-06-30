@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Adaptive launcher icon foreground for trck (O26).
+
+  The foreground is a stylized "T" (for trck) drawn as a vector path centered
+  on the 108x108dp adaptive-icon canvas. The safe zone for adaptive icons is
+  the inner 72x72dp (the outer 18dp on each side may be masked by the launcher
+  shape — circle, squircle, rounded square, etc.). Our "T" is sized to fit
+  inside the safe zone with comfortable padding.
+
+  Color: #0A2463 (deep navy, matching the app's primary color — see COLOR.primary
+  in App.tsx).
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Top horizontal bar of the T -->
+    <path
+        android:fillColor="#0A2463"
+        android:pathData="M30,38 h48 v8 h-19 v34 h-10 v-34 h-19 z" />
+</vector>

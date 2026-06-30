@@ -56,6 +56,18 @@ Key features:
                 └── values/strings.xml
 ```
 
+### App-name divergence (O6)
+
+The user-facing app name is **`trck`** (set in `app.json`, `strings.xml`, and
+`AndroidManifest.xml`'s `android:label`). The Gradle `rootProject.name` is
+also `trck` (see `android/settings.gradle`). However, the **`applicationId`**
+in `android/app/build.gradle` is `com.gpsrecorder` — this MUST NOT change,
+because Android treats the `applicationId` as the package identity. Changing
+it would make Android treat the app as a different package, losing all user
+data (saved GPX files in the app's external cache, SharedPreferences) and
+breaking the sideloaded-APK upgrade path (Android refuses to install an APK
+whose `applicationId` differs from the installed one).
+
 ## Why the APK is committed to this repo
 
 > **TL;DR:** The user's dev PC is broken. They cannot build the APK locally. The
@@ -98,9 +110,15 @@ working Android build environment) editing this repo:
    git add -A
    git commit -m "describe the change"
    ```
+2.5. **Increment `versionCode`** in `android/app/build.gradle` (O25):
+        - Change `versionCode N` to `versionCode N+1`.
+        - Optionally update `versionName` (e.g. from `"1.1"` to `"1.2"`).
+        - Commit this change together with the source change. Android's
+          package installer refuses sideloaded-APK upgrades when the
+          `versionCode` does not strictly increase.
 3. **Set up your environment** (only needed once per shell session):
    ```bash
-   export ANDROID_HOME=/path/to/android-sdk          # must contain platforms;android-36, build-tools;36.0.0, ndk;27.1.12297006
+   export ANDROID_HOME=/path/to/android-sdk          # must contain platforms;android-35, build-tools;35.0.0, ndk;27.1.12297006
    export ANDROID_SDK_ROOT=$ANDROID_HOME
    export JAVA_HOME=/path/to/jdk-21                  # OpenJDK 21+
    export PATH=$JAVA_HOME/bin:$ANDROID_HOME/platform-tools:$PATH
@@ -150,8 +168,8 @@ To rebuild the APK you need:
 - **OpenJDK 21** (or newer) — `java -version` should report 21.x.
 - **Android SDK** with these components installed (via `sdkmanager`):
   - `platform-tools`
-  - `platforms;android-36` (the app's `compileSdkVersion`)
-  - `build-tools;36.0.0`
+  - `platforms;android-35` (the app's `compileSdkVersion` — O2 pinned to 35)
+  - `build-tools;35.0.0`
   - `ndk;27.1.12297006` (matches `ndkVersion` in `android/build.gradle`)
 - **Node.js 22+** and **npm** — for installing JS dependencies before the JS
   bundle can be packaged into the APK.
@@ -162,6 +180,45 @@ installed, they must use a Python `paramiko`-based SSH wrapper as
 `GIT_SSH_COMMAND`. The original such wrapper lives at
 `/home/z/my-project/scripts/ssh-wrapper.py` in the build agent's environment;
 the pattern is reproducible if needed elsewhere.
+
+**If `android/app/debug.keystore` is missing** (O4 — the keystore is no
+longer tracked in git), regenerate it with:
+
+```bash
+keytool -genkey -v -keystore android/app/debug.keystore \
+  -storepass android -alias androiddebugkey -keypass android \
+  -keyalg RSA -keysize 2048 -validity 10000
+```
+
+(`react-native init` does this automatically on a fresh project, so a fresh
+clone on a developer machine with RN installed will already have it. The
+command above is for the case where the file is missing on a CI / build-agent
+machine that does not have RN scaffolding.)
+
+## Signing (O3)
+
+The release APK is signed with the **debug keystore** — the same one used to
+sign debug builds. See `android/app/build.gradle` → `signingConfigs.release`
+(actually `signingConfigs.debug`, reused for the release variant).
+
+- This is **intentional** for the user's personal sideloading use case. They
+  install the APK directly from the GitHub repo's `apk/trck-release.apk` and
+  do not distribute it through the Play Store.
+- The debug keystore is **not** in version control (O4 — added to
+  `.gitignore`). It is regenerated on each fresh clone with the `keytool`
+  command above. The signing certificate therefore differs between machines,
+  but Android's `applicationId` matches so sideloaded upgrades still work
+  **as long as the APK is rebuilt on the same machine each time**. If you
+  switch machines, the user will need to uninstall the old APK first.
+- Before any wider distribution (Play Store, F-Droid, direct download from a
+  public website), you MUST:
+  1. Generate a real keystore with `keytool` (long validity, strong
+     passwords, stored somewhere safe — NOT in the repo).
+  2. Configure `signingConfigs.release` in `android/app/build.gradle` to
+     point at it.
+  3. Re-sign every release APK with that keystore.
+  4. Keep the keystore safe — losing it means the app can never be updated
+     on existing installs.
 
 ## Local dev (for reference)
 

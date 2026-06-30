@@ -391,14 +391,10 @@ class GpsRecorderService : Service(), LocationListener {
                 // bypassed, so the track stays as one continuous segment
                 // even across outages — the legacy pre-Phase-4 behaviour).
                 //
-                // Bugfix: also suppress the watchdog while isAutoPaused is
-                // true. When the user is stationary Android throttles
-                // location updates (min-distance = 1 m), so no fixes arrive
-                // even though the GPS hardware is fine. Treating that as a
-                // signal loss is wrong — we already know the user is just
-                // standing still — and it caused the "ПОТЕРЯ СИГНАЛА GPS"
-                // banner to appear on top of the "АВТОПАУЗА" banner in the
-                // UI, which is contradictory and confusing.
+                // Suppress the watchdog while auto-paused: stationary users
+                // legitimately have no incoming fixes (Android throttles
+                // updates), so showing the signal-lost banner on top of the
+                // auto-pause banner would be contradictory. See CHANGELOG.md.
                 if (isGapDetectionEnabled() && !signalLost && !isAutoPaused && lastFixTimeMs > 0L) {
                     val sinceLast = now - lastFixTimeMs
                     if (sinceLast > GAP_THRESHOLD_MS) {
@@ -639,12 +635,10 @@ class GpsRecorderService : Service(), LocationListener {
         // Finalize the moving-time accumulator (add the segment from the
         // last resume up to the LAST FIX to movingMs).
         //
-        // Bugfix: cap the delta at lastFixTimeMs rather than "now". If the
-        // user stopped walking 5 seconds before pressing STOP (and the
-        // auto-pause hadn't triggered yet because the window hadn't filled),
-        // those 5 seconds of standing-still should NOT count as moving time.
-        // Capping at lastFixTimeMs makes movingMs consistent with the
-        // liveMovingMs value the UI was showing right before STOP.
+        // Cap the delta at lastFixTimeMs (not "now") so any standing-still
+        // time between the last fix and pressing STOP is not counted as
+        // moving time. This keeps movingMs consistent with the liveMovingMs
+        // value the UI was showing right before STOP. See CHANGELOG.md.
         lastResumeMs?.let { r ->
             val cap = if (lastFixTimeMs > 0L) lastFixTimeMs else System.currentTimeMillis()
             if (cap > r) movingMs += (cap - r)
@@ -1132,11 +1126,9 @@ class GpsRecorderService : Service(), LocationListener {
      * segment so the post-pause segment is distinct, freezes the moving-time
      * accumulator, and updates the foreground notification.
      *
-     * Bugfix: also clears `signalLost`. When the user is stationary we already
-     * know why no fixes are arriving (Android throttles updates when the min-
-     * distance criterion isn't met), so showing the "ПОТЕРЯ СИГНАЛА GPS"
-     * banner on top of "АВТОПАУЗА" is contradictory and confuses users
-     * (see GitHub issue: "gap detection and pause detection get mixed up").
+     * Also clears `signalLost`: stationary users legitimately have no
+     * incoming fixes, so showing the signal-lost banner on top of the
+     * auto-pause banner would be contradictory. See CHANGELOG.md.
      */
     private fun enterAutoPause(now: Long) {
         isAutoPaused = true
@@ -1202,13 +1194,12 @@ class GpsRecorderService : Service(), LocationListener {
      * gate doesn't compare across the gap. Distance across the gap is NOT
      * added to totalDistanceM (prevLat is null after reset).
      *
-     * Bugfix: also resume the moving-time accumulator from `now`. While the
-     * gap was active the watchdog froze movingMs (see [flushTick]) so the
-     * gap time was NOT counted as moving time. Now that the user has a fix
-     * again we resume accumulating from this instant — but only if the user
-     * is actually moving. If they're stationary the auto-pause path further
-     * down in onLocationChanged will immediately re-freeze movingMs via
-     * enterAutoPause(), so this is safe.
+     * Also resumes the moving-time accumulator from `now`. While the gap
+     * was active the watchdog froze movingMs (see [flushTick]); now that a
+     * fix has arrived we resume accumulating. If the user is actually
+     * stationary, the auto-pause path further down in onLocationChanged
+     * will immediately re-freeze movingMs via enterAutoPause(), so this is
+     * safe. See CHANGELOG.md.
      */
     private fun handleGapRecovery(now: Long) {
         resetValidationCursor()
@@ -1271,14 +1262,10 @@ class GpsRecorderService : Service(), LocationListener {
         // honor a previously-declared signalLost by clearing it without
         // splitting the segment.
         //
-        // Bugfix: also skip this entire block while isAutoPaused is true.
-        // When the user is stationary the gap-detection logic is irrelevant
-        // — the lack of fresh fixes is expected (Android throttles updates
-        // when min-distance isn't met), and we already finalized the
-        // current segment when auto-pause was entered. Running handleGapRecovery
-        // here would create a spurious second segment split and produce
-        // 1-point segments in the final GPX (the "5 segments, one of them
-        // only 1 point" pattern observed in real walks).
+        // Skip this block while auto-paused: stationary users have no
+        // incoming fixes by design, and the current segment was already
+        // finalized on auto-pause entry. Running handleGapRecovery here
+        // would create spurious 1-point segments in the GPX. See CHANGELOG.md.
         if (isGapDetectionEnabled() && !isAutoPaused) {
             val gapDetected = lastFixTimeMs > 0L && (pt.timeMs - lastFixTimeMs) > GAP_THRESHOLD_MS
             if (gapDetected || signalLost) {
@@ -1509,13 +1496,11 @@ class GpsRecorderService : Service(), LocationListener {
                 // saveLiveState + emit before returning — same pattern as the
                 // time-sampling drop above.
                 //
-                // Bugfix: distanceToAdd is staged here but only committed to
-                // totalDistanceM *after* the radial filter check passes. The
-                // previous version did `totalDistanceM += d` before the radial
-                // check, so a dropped (too-close) fix would leak its step
-                // distance into the accumulator while prevLat/prevLon stayed
-                // put — the next accepted fix then re-computed distance from
-                // the same cursor, double-counting the dropped step.
+                // Stage distanceToAdd in a local and only commit to
+                // totalDistanceM *after* the radial filter check passes, so
+                // the cursor and the accumulator always advance together
+                // (otherwise dropped fixes would double-count their step
+                // distance). See CHANGELOG.md.
                 if (isRadialDistanceFilterEnabled()) {
                     val threshold = getRadialDistanceThresholdM().toDouble()
                     if (d < threshold) {
@@ -1590,11 +1575,11 @@ class GpsRecorderService : Service(), LocationListener {
         // Emit the event with pointCount + auto-pause / signal state so the JS
         // UI can reflect pause / gap status in real time.
         //
-        // Bugfix: emit liveMovingMs(pt.timeMs) rather than the frozen movingMs
-        // field. The frozen value is only updated at auto-pause transitions,
-        // so between transitions the displayed avg pace was wildly off (e.g.
-        // 0:02/km or 6:20/km). liveMovingMs adds the time elapsed since the
-        // last resume so the value tracks the actual walk second-by-second.
+        // Emit liveMovingMs(pt.timeMs): the frozen movingMs field is only
+        // updated at auto-pause transitions, so between transitions it would
+        // make the displayed avg pace wildly off. liveMovingMs adds the time
+        // elapsed since the last resume so the value tracks the actual walk
+        // second-by-second. See CHANGELOG.md.
         GpsRecorderModule.emitLocation(
             pt.lat, pt.lon, pt.alt, pt.speed, pt.accuracy,
             computeFixType(), totalDistanceM, pt.timeMs, pointCount,
@@ -1830,11 +1815,9 @@ class GpsRecorderService : Service(), LocationListener {
      * Writes the current recording state + last fix to SharedPreferences.
      * Called on every GPS fix so that [GpsRecorderModule.getState] can return fresh data.
      *
-     * Bugfix: persist the LIVE moving time (liveMovingMs) rather than the
-     * frozen movingMs field. JS polls getState() every 2 seconds as a
-     * fallback when event delivery is unreliable, and previously the polled
-     * movingMs was just as stale as the emitted one — same 0:02/km or
-     * 6:20/km bug surfaced through this path too.
+     * Persists the LIVE moving time (liveMovingMs) so JS's 2-second
+     * getState() polling fallback sees a fresh value, not the stale frozen
+     * one. See CHANGELOG.md.
      */
     private fun saveLiveState(lastFix: GpsPoint? = null, force: Boolean = false) {
         // L25 fix: throttle to once per SAVE_LIVE_STATE_THROTTLE_MS unless
@@ -3281,6 +3264,9 @@ class GpsRecorderService : Service(), LocationListener {
     private fun getElapsedMs(): Long =
         if (isRecording) System.currentTimeMillis() - startTimeMs else 0L
 
+    // O24: This is duplicated in App.tsx (formatDuration). The two MUST stay
+    // in sync — if you change the format here, change the JS version too.
+    // See CHANGELOG.md / TODO 4, O24 for context.
     private fun formatDuration(ms: Long): String {
         val totalSec = ms / 1000
         val h = totalSec / 3600
