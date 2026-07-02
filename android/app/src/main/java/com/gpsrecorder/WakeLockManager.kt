@@ -1,5 +1,6 @@
 package com.gpsrecorder
 
+import android.content.Context
 import android.os.PowerManager
 import android.util.Log
 
@@ -22,7 +23,7 @@ class WakeLockManager(private val service: GpsRecorderService) {
 
     fun acquire() {
         if (wakeLock?.isHeld == true) return
-        val pm = service.getSystemService(GpsRecorderService.POWER_SERVICE) as PowerManager
+        val pm = service.getSystemService(Context.POWER_SERVICE) as PowerManager
         wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "trck:Recording")
         wakeLock?.setReferenceCounted(false)
         try {

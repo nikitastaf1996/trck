@@ -5,6 +5,7 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
+import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.os.Build
@@ -101,7 +102,7 @@ class GpsRecorderNotification(private val service: GpsRecorderService) {
 
     fun ensureNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val nm = service.getSystemService(GpsRecorderService.NOTIFICATION_SERVICE) as NotificationManager
+            val nm = service.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
             if (nm.getNotificationChannel(CHANNEL_ID) == null) {
                 val channel = NotificationChannel(
                     CHANNEL_ID,
@@ -184,7 +185,7 @@ class GpsRecorderNotification(private val service: GpsRecorderService) {
     }
 
     fun updateNotification(snapshot: NotificationSnapshot) {
-        val nm = service.getSystemService(GpsRecorderService.NOTIFICATION_SERVICE) as NotificationManager
+        val nm = service.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         nm.notify(NOTIFICATION_ID, buildNotification(snapshot))
     }
 

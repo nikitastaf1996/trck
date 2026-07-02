@@ -152,7 +152,7 @@ class LocationSource(
                 }
                 satellitesUsed = used
                 try {
-                    onGnssStatusPersist(used, computeFixType())
+                    onGnssStatusPersist(used, computeFixType(service.lastFixTimeMs))
                 } catch (e: Exception) {
                     Log.w(tag, "Failed to persist GNSS status", e)
                 }

@@ -46,7 +46,7 @@ class AutoPauseHandler internal constructor(
         // Push to sliding raw window and prune entries older than the window.
         service.rawWindow.add(pt)
         val windowCutoff = pt.timeMs - AutoPauseGapController.RAW_WINDOW_MS
-        while (service.rawWindow.isNotEmpty() && service.rawWindow.peek().timeMs < windowCutoff) {
+        while (service.rawWindow.isNotEmpty() && service.rawWindow.peek()!!.timeMs < windowCutoff) {
             service.rawWindow.poll()
         }
 
