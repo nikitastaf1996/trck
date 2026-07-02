@@ -36,7 +36,6 @@ import {
   Pressable,
   ScrollView,
   StatusBar,
-  StyleSheet,
   Text,
   View,
 } from 'react-native';
@@ -72,6 +71,7 @@ import {
   pluralRu,
   type RecordingState,
 } from './src/styles';
+import { appStyles as styles } from './src/styles/appStyles';
 // T1: settings state / refs / handlers / loader extracted from App.tsx into
 // a dedicated hook so the main component stays under control. The hook owns
 // the settingsUpdatingRef re-entrancy guard internally (not returned).
@@ -989,121 +989,5 @@ function App(): React.ReactElement {
     </SafeAreaView>
   );
 }
-
-
-const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: COLOR.bg },
-  scrollContent: {
-    paddingHorizontal: 24,
-    paddingTop: 16,
-    paddingBottom: 60,
-  },
-  // ---- Status row ----
-  // Green when recording (active = good, matches the GNSS pill colour scheme).
-  // Grey when idle. Amber when auto-paused. Red is reserved for the STOP
-  // button + signal-lost banner so the user doesn't read a red dot as
-  // "something is wrong" while a recording is happily in progress.
-  // Phase 3: amber dot shown while auto-pause is active.
-  // ---- Phase 3: auto-pause badge (shown below the TIME stat) ----
-  // ---- Phase 4: signal-lost banner ----
-  // ---- Big button ----
-  // U12: battery-optimization warning banner.
-  // ---- CODE_REVIEW_TODO Task 3: over-filter warning banner ----
-  // Shown directly below the three data-reduction filter settings when ALL
-  // three are enabled simultaneously. Uses the existing amber palette
-  // (COLOR.pauseBg / pauseBorder / pauseAccent — same as the battery-opt
-  // banner above) for visual consistency with the project's "warning"
-  // convention. The left-border accent + title/body layout mirrors the
-  // signal-lost banner (red variant) for a familiar look.
-  // ---- Post-processing toggle ----
-  // Variant for toggle rows that are the TOP half of a settingGroup (toggle
-  // + stepper card). Removes the bottom margin and rounds only the top
-  // corners so the stepper row below visually attaches to it.
-  // Visual "locked" state — used when recording is in progress so the toggles
-  // are visibly disabled. We deliberately keep the row's on/off color so the
-  // user can still tell which settings are active; we only dim the whole row
-  // (opacity) and override the background to a neutral grey so the row looks
-  // "frozen" rather than "off".
-  // NOTE: we intentionally do NOT override the switch color when locked.
-  // The row-level `opacity: 0.55` already conveys "disabled"; forcing the
-  // switch to grey made enabled-but-locked toggles look "off" mid-recording,
-  // which was one of the wonky-UI complaints.
-  // ---- Setting group (toggle + stepper card) ----
-  // Wraps a toggle row + stepper row so they read as one "card". The
-  // marginBottom here replaces the per-row marginBottom (which is removed
-  // by toggleRowGrouped on the top row, and absent on StepperRow).
-  // ---- Settings section header + locked badge ----
-  settingsHeader: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    marginBottom: 8,
-    marginTop: 4,
-    flexWrap: 'wrap',
-    gap: 8,
-  },
-  settingsHeaderText: {
-    fontSize: 11,
-    fontWeight: '700',
-    color: COLOR.secondary,
-    letterSpacing: 2,
-  },
-  settingsLockedBadge: {
-    fontSize: 10,
-    fontWeight: '600',
-    color: COLOR.accentStop,
-    backgroundColor: '#FEF2F2',
-    paddingHorizontal: 8,
-    paddingVertical: 3,
-    borderRadius: 8,
-    overflow: 'hidden',
-  },
-  // ---- Permission button ----
-  permissionButton: {
-    backgroundColor: '#F3F4F6', borderRadius: 12, paddingVertical: 14,
-    alignItems: 'center', marginBottom: 16, borderWidth: 1, borderColor: COLOR.divider,
-  },
-  permissionButtonText: { color: COLOR.primary, fontSize: 14, fontWeight: '600' },
-  // ---- Saved / error cards ----
-  // U19: shared row layout for the saved/error card title + dismiss button.
-  // U19: shared dismiss (✕) button used by both the saved card and the
-  // error card. Small, neutral-coloured, top-right of the card.
-  // Final distance + pace line shown on the saved card. Slightly larger and
-  // bolder than the path so the user notices it.
-  // U2: "Открыть настройки" button shown inside the error card when the user
-  // is missing permissions. Tapping it calls GpsRecorder.openAppSettings(),
-  // which opens the Android system app-details page (where the user can
-  // grant location / notification permissions manually).
-  // ---- Footer ----
-  footerNote: { marginTop: 8 },
-  footerText: {
-    color: '#9CA3AF', fontSize: 12, lineHeight: 18, textAlign: 'center',
-  },
-  // ---- U1: permission-wait overlay ----
-  // Full-screen semi-transparent overlay so the user can't tap anything else
-  // while waiting for the system permission dialog. Centers a card with a
-  // spinner, an explanatory line, and a Cancel button.
-  // O14: full-screen "native module not loaded" fallback.
-  nativeMissingContainer: {
-    flex: 1,
-    backgroundColor: COLOR.bg,
-    alignItems: 'center',
-    justifyContent: 'center',
-    paddingHorizontal: 32,
-  },
-  nativeMissingTitle: {
-    fontSize: 22,
-    fontWeight: '700',
-    color: COLOR.errorText,
-    marginBottom: 16,
-    textAlign: 'center',
-  },
-  nativeMissingBody: {
-    fontSize: 14,
-    color: COLOR.secondary,
-    textAlign: 'center',
-    lineHeight: 20,
-  },
-});
 
 export default App;
