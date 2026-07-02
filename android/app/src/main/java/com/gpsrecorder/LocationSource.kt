@@ -41,6 +41,15 @@ class LocationSource(
     private val onGnssStatusPersist: (satellitesUsed: Int, fixType: String) -> Unit,
 ) {
 
+    companion object {
+        // GPS request parameters
+        internal const val MIN_TIME_MS = 1000L          // 1 second
+        internal const val MIN_DISTANCE_M = 1.0f         // 1 meter
+
+        // If no GPS fix for this long, treat GNSS status as "no fix"
+        internal const val NO_FIX_TIMEOUT_MS = 10_000L
+    }
+
     private val tag: String get() = GpsRecorderService.TAG
 
     private var locationManager: LocationManager? = null
@@ -106,8 +115,8 @@ class LocationSource(
             try {
                 lm.requestLocationUpdates(
                     p,
-                    GpsRecorderService.MIN_TIME_MS,
-                    GpsRecorderService.MIN_DISTANCE_M,
+                    MIN_TIME_MS,
+                    MIN_DISTANCE_M,
                     listener,
                     Looper.getMainLooper(),
                 )
@@ -195,7 +204,7 @@ class LocationSource(
      */
     fun computeFixType(lastFixTimeMs: Long): String {
         val now = System.currentTimeMillis()
-        val recentFix = lastFixTimeMs > 0 && (now - lastFixTimeMs) < GpsRecorderService.NO_FIX_TIMEOUT_MS
+        val recentFix = lastFixTimeMs > 0 && (now - lastFixTimeMs) < NO_FIX_TIMEOUT_MS
         if (!recentFix) return "no fix"
         return when {
             satellitesUsed >= 4 -> "3D fix"

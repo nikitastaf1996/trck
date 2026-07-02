@@ -292,8 +292,8 @@ class SettingsBridge(private val reactContext: ReactApplicationContext) {
     // ("gps_recorder_settings") as the other toggles, so it survives the
     // per-recording state clear. When enabled (DEFAULT — preserves the
     // behaviour shipped in the previous APK), the gap watchdog in
-    // GpsRecorderService.flushTick declares signalLost after
-    // GAP_THRESHOLD_MS (15 s) without a fix, and the next arriving fix
+    // GpsRecorderService.durationTick declares signalLost after
+    // AutoPauseGapController.GAP_THRESHOLD_MS (15 s) without a fix, and the next arriving fix
     // triggers a segment split so the track has clean <trkseg> breaks at
     // signal outages. When disabled, gaps are NOT detected: the timer
     // keeps running across the outage, the next fix is appended to the

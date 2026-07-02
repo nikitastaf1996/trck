@@ -39,6 +39,11 @@ import java.util.Locale
  */
 class GpsRecorderNotification(private val service: GpsRecorderService) {
 
+    companion object {
+        internal const val NOTIFICATION_ID = 0xC0DE
+        internal const val CHANNEL_ID = "gps_recorder_channel"
+    }
+
     private val tag: String get() = GpsRecorderService.TAG
 
     /**
@@ -76,12 +81,12 @@ class GpsRecorderNotification(private val service: GpsRecorderService) {
                 // Android 14+ requires explicit foregroundServiceType and the
                 // FOREGROUND_SERVICE_LOCATION permission.
                 service.startForeground(
-                    GpsRecorderService.NOTIFICATION_ID,
+                    NOTIFICATION_ID,
                     notification,
                     ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION
                 )
             } else {
-                service.startForeground(GpsRecorderService.NOTIFICATION_ID, notification)
+                service.startForeground(NOTIFICATION_ID, notification)
             }
         } catch (e: ForegroundServiceStartNotAllowedException) {
             Log.e(
@@ -97,9 +102,9 @@ class GpsRecorderNotification(private val service: GpsRecorderService) {
     fun ensureNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val nm = service.getSystemService(GpsRecorderService.NOTIFICATION_SERVICE) as NotificationManager
-            if (nm.getNotificationChannel(GpsRecorderService.CHANNEL_ID) == null) {
+            if (nm.getNotificationChannel(CHANNEL_ID) == null) {
                 val channel = NotificationChannel(
-                    GpsRecorderService.CHANNEL_ID,
+                    CHANNEL_ID,
                     service.getString(R.string.notification_channel_name),
                     NotificationManager.IMPORTANCE_LOW
                 ).apply {
@@ -164,7 +169,7 @@ class GpsRecorderNotification(private val service: GpsRecorderService) {
             )
         }
 
-        return NotificationCompat.Builder(service, GpsRecorderService.CHANNEL_ID)
+        return NotificationCompat.Builder(service, CHANNEL_ID)
             .setContentTitle(service.getString(R.string.notification_title))
             .setContentText(text)
             .setSmallIcon(R.drawable.ic_gps_notification)
@@ -180,7 +185,7 @@ class GpsRecorderNotification(private val service: GpsRecorderService) {
 
     fun updateNotification(snapshot: NotificationSnapshot) {
         val nm = service.getSystemService(GpsRecorderService.NOTIFICATION_SERVICE) as NotificationManager
-        nm.notify(GpsRecorderService.NOTIFICATION_ID, buildNotification(snapshot))
+        nm.notify(NOTIFICATION_ID, buildNotification(snapshot))
     }
 
     // O24: This is duplicated in App.tsx (formatDuration). The two MUST stay

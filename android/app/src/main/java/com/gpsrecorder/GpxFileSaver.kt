@@ -189,8 +189,8 @@ class GpxFileSaver(
         // L13 fix: persist the MediaStore URI so recomputeDistanceFromSavedGpx
         // can open the file via ContentResolver.
         try {
-            service.getSharedPreferences(GpsRecorderService.PREFS_NAME, Context.MODE_PRIVATE).edit()
-                .putString(GpsRecorderService.KEY_LAST_SAVED_URI, uri.toString())
+            service.getSharedPreferences(StateRepository.PREFS_NAME, Context.MODE_PRIVATE).edit()
+                .putString(StateRepository.KEY_LAST_SAVED_URI, uri.toString())
                 .apply()
         } catch (e: Exception) {
             Log.w(tag, "Failed to persist last_saved_uri", e)
@@ -252,8 +252,8 @@ class GpxFileSaver(
      */
     fun recomputeDistanceFromSavedGpx(savedPath: String): Double {
         try {
-            val savedUriStr = service.getSharedPreferences(GpsRecorderService.PREFS_NAME, Context.MODE_PRIVATE)
-                .getString(GpsRecorderService.KEY_LAST_SAVED_URI, null)
+            val savedUriStr = service.getSharedPreferences(StateRepository.PREFS_NAME, Context.MODE_PRIVATE)
+                .getString(StateRepository.KEY_LAST_SAVED_URI, null)
             val parseResult: GpxIO.GpxParseResult = if (savedUriStr != null) {
                 try {
                     val uri = android.net.Uri.parse(savedUriStr)

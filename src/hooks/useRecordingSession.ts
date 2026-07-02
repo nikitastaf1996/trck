@@ -65,23 +65,19 @@ import React, { useCallback, useEffect, useReducer, useRef, useState } from 'rea
 import {
   GpsRecorder,
   subscribe,
-  type GpsLocationEvent,
-  type GpsStateEvent,
-  type GpsSavedEvent,
   type GpsFullState,
   type GpsFixType,
 } from '../NativeGpsRecorder';
 import type { RecordingState } from '../styles';
-
-// Sliding window of the most recent GPS speeds (m/s) seen during the current
-// recording. Used to compute a smoothed "current pace" instead of relying on
-// the raw instantaneous GPS speed, which jumps around a lot at 1 Hz. The
-// window is cleared on stop / save so a fresh recording starts with no
-// history.
-//
-// ~5 seconds at 1 Hz — short enough to be responsive, long enough to smooth
-// out single-fix outliers.
-const SPEED_WINDOW = 5;
+import {
+  SPEED_WINDOW,
+  createLocationHandler,
+  createDurationHandler,
+  createStateHandler,
+  createSavedHandler,
+  createErrorHandler,
+} from './useRecordingEventHandlers';
+import { startRecording, stopRecording } from './useRecordingControls';
 
 export type SavedSettingsSnapshot = {
   autoPauseEnabled: boolean;
@@ -311,162 +307,72 @@ export function useRecordingSession(
   // NOT torn down + recreated on every idle -> recording -> stopping -> idle
   // transition. This is critical: re-creating the subscriptions mid-
   // recording would cause missed 'state' / 'saved' events.
+  //
+  // The handler bodies live in ./useRecordingEventHandlers (extracted in T5
+  // to keep this file under 500 lines). Each factory closes over the same
+  // setters + refs that the original inline arrows did, so all behavioural
+  // invariants (U18, L24, L8, L10/U17, U3, U16, U10) are preserved verbatim.
   useEffect(() => {
     const subs = [
-      subscribe('location', (ev: GpsLocationEvent) => {
-        // Recording-time updates from the service.
-        if (typeof ev.distance === 'number') setDistance(ev.distance);
-        if (ev.fixType) setFixType(ev.fixType);
-        if (ev.accuracy != null) setAccuracy(ev.accuracy);
-        // U10: don't update currentSpeed while auto-paused — the service
-        // still emits location events (with the paused fix), but the
-        // underlying state shouldn't change. Read isAutoPaused from a ref
-        // to avoid stale-closure issues.
-        if (ev.speed != null && !isAutoPausedRef.current) {
-          setCurrentSpeed(ev.speed);
-          // Push into the smoothing window. We accept every fix here (even
-          // slow / zero ones) so the window correctly reflects "user is
-          // standing still" — the smoothed pace helper returns null when
-          // the window average is below the standing-still threshold.
-          const w = recentSpeedsRef.current;
-          w.push(ev.speed);
-          if (w.length > SPEED_WINDOW) w.shift();
-          // U4: force a re-render so the smoothed pace display updates
-          // immediately. The push above mutated the ref's array in-place,
-          // which React doesn't see — without this the rendered pace would
-          // be stale until the next setState.
-          forceRerender();
-        }
-        setHasFix(ev.fixType !== 'no fix');
-        // Phase 1/3/4: live auto-pause / signal-lost / moving-time.
-        if (typeof ev.isAutoPaused === 'boolean') setIsAutoPaused(ev.isAutoPaused);
-        if (typeof ev.signalLost === 'boolean') setSignalLost(ev.signalLost);
-        if (typeof ev.movingMs === 'number') setMovingMs(ev.movingMs);
-      }),
-      subscribe('duration', (ev) => {
-        // L24 fix: ignore out-of-order duration events using the
-        // monotonically increasing sequence number. The state poll
-        // (syncStateFromNative, every 2 s) also sets elapsedMs, and the
-        // two paths can deliver values out of order — causing the
-        // displayed timer to occasionally jump backwards by ~1 s.
-        //
-        // We track the last-processed seq in a ref; any event with a seq
-        // <= the last one is silently dropped. The getState() poll is
-        // also gated to not overwrite elapsedMs if its value is less than
-        // the current value (see syncStateFromNative).
-        if (typeof ev.seq === 'number' && ev.seq <= lastDurationSeqRef.current) {
-          return;
-        }
-        if (typeof ev.seq === 'number') {
-          lastDurationSeqRef.current = ev.seq;
-        }
-        setElapsedMs(ev.elapsedMs);
-        // L8 fix: prefer the duration event's movingMs over the (stale)
-        // location event's movingMs. The duration tick fires every second,
-        // so the displayed avg pace no longer oscillates between the live
-        // duration tick and the much-less-frequent location event.
-        if (typeof ev.movingMs === 'number') {
-          setMovingMs(ev.movingMs);
-        }
-      }),
-      subscribe('state', (ev: GpsStateEvent) => {
-        if (ev.isRecording) {
-          // U18: update ref synchronously.
-          recordingStateRef.current = 'recording';
-          setRecordingState('recording');
-          setElapsedMs(ev.elapsedMs);
-          // Phase 1/3/4: sync live pause / signal / moving-time on state
-          // transitions (e.g. when the watchdog fires or auto-pause toggles).
-          if (typeof ev.isAutoPaused === 'boolean') setIsAutoPaused(ev.isAutoPaused);
-          if (typeof ev.signalLost === 'boolean') setSignalLost(ev.signalLost);
-          if (typeof ev.movingMs === 'number') setMovingMs(ev.movingMs);
-        } else {
-          // U18: update ref synchronously.
-          recordingStateRef.current = 'idle';
-          setRecordingState('idle');
-          setElapsedMs(0);
-          setDistance(0);
-          setCurrentSpeed(null);
-          // resetGnss() clears fixType / hasFix / accuracy when recording
-          // stops.
-          resetGnss();
-          // Phase 1/3/4: reset live state when recording stops.
-          setIsAutoPaused(false);
-          setSignalLost(false);
-          setMovingMs(0);
-          // Clear the pace-smoothing window so a fresh recording starts
-          // with no stale speeds from the previous run.
-          recentSpeedsRef.current = [];
-        }
-      }),
-      subscribe('saved', (ev: GpsSavedEvent) => {
-        // U16: cancel the 1 s fallback syncStateFromNative() that handleStop
-        // scheduled — the 'saved' event has arrived, so we don't need the
-        // fallback and don't want it to fire after we've already transitioned
-        // to 'idle' (would cause a brief flicker back to 'stopping').
-        if (stopTimeoutRef.current != null) {
-          clearTimeout(stopTimeoutRef.current);
-          stopTimeoutRef.current = null;
-        }
-        // Snapshot the live timing values BEFORE we reset them, so the
-        // saved card can show the post-save average pace over the final
-        // distance / moving time. We read from refs because this closure
-        // is set up once at mount and would otherwise capture stale values.
-        setLastSavedMovingMs(movingMsRef.current);
-        setLastSavedElapsedMs(elapsedMsRef.current);
-        // U3: snapshot the toggle state at save time so the saved card's
-        // pace computation is stable — the user can flip auto-pause / gap
-        // detection / show-moving-time AFTER the save (in preparation for
-        // the next run) and the just-saved card must not recompute its
-        // pace under the new toggle state.
-        setLastSavedSettings({
-          autoPauseEnabled: autoPauseEnabledRef.current,
-          gapDetectionEnabled: gapDetectionEnabledRef.current,
-          showMovingTime: showMovingTimeRef.current,
-        });
-        setLastSavedPath(ev.filePath);
-        // The native side sends the post-save distance (recomputed from the
-        // saved GPX file, post-smoothing) so the UI shows the true track
-        // length. Negative means "not available" — keep the live distance.
-        const fd = ev.finalDistanceM;
-        setLastSavedDistance(typeof fd === 'number' && fd >= 0 ? fd : null);
-        setElapsedMs(0);
-        setDistance(0);
-        setCurrentSpeed(null);
-        setFixType('no fix');
-        setHasFix(false);
-        // U18: update ref synchronously.
-        recordingStateRef.current = 'idle';
-        setRecordingState('idle');
-        // Phase 1/3/4: clear live pause / signal / moving-time after save.
-        setIsAutoPaused(false);
-        setSignalLost(false);
-        setMovingMs(0);
-        // Clear the pace-smoothing window for the next recording.
-        recentSpeedsRef.current = [];
-      }),
-      subscribe('error', (ev) => {
-        // L10 fix / U17: only reset the UI to idle on FATAL errors.
-        // Non-fatal errors (e.g. distance recompute failed, or
-        // finalizeGpxFile threw after the GPX was already written) are
-        // informational — the recording may still be running OR may have
-        // already completed normally. Resetting to idle on a non-fatal
-        // error would either:
-        //   (a) let the user press START while a recording is in progress,
-        //       losing the in-progress track; or
-        //   (b) skip showing the saved card (because we'd jump from
-        //       'stopping' straight to 'idle' before the 'saved' event
-        //       arrives).
-        // If a non-fatal error occurs during finalize, the 'saved' event
-        // still arrives (with the file path) and the saved card is shown
-        // normally — the user sees the error message AND the saved card.
-        setErrorMsg(ev.message);
-        if (ev.fatal) {
-          // U18: update ref synchronously.
-          recordingStateRef.current = 'idle';
-          setRecordingState('idle');
-        }
-      }),
+      subscribe('location', createLocationHandler({
+        setDistance,
+        setCurrentSpeed,
+        setFixType,
+        setAccuracy,
+        setHasFix,
+        setIsAutoPaused,
+        setSignalLost,
+        setMovingMs,
+        isAutoPausedRef,
+        recentSpeedsRef,
+        forceRerender,
+      })),
+      subscribe('duration', createDurationHandler({
+        setElapsedMs,
+        setMovingMs,
+        lastDurationSeqRef,
+      })),
+      subscribe('state', createStateHandler({
+        setRecordingState,
+        setElapsedMs,
+        setDistance,
+        setCurrentSpeed,
+        setIsAutoPaused,
+        setSignalLost,
+        setMovingMs,
+        recordingStateRef,
+        recentSpeedsRef,
+        resetGnss,
+      })),
+      subscribe('saved', createSavedHandler({
+        setLastSavedMovingMs,
+        setLastSavedElapsedMs,
+        setLastSavedSettings,
+        setLastSavedPath,
+        setLastSavedDistance,
+        setElapsedMs,
+        setDistance,
+        setCurrentSpeed,
+        setFixType,
+        setHasFix,
+        setRecordingState,
+        setIsAutoPaused,
+        setSignalLost,
+        setMovingMs,
+        stopTimeoutRef,
+        movingMsRef,
+        elapsedMsRef,
+        autoPauseEnabledRef,
+        gapDetectionEnabledRef,
+        showMovingTimeRef,
+        recordingStateRef,
+        recentSpeedsRef,
+      })),
+      subscribe('error', createErrorHandler({
+        setErrorMsg,
+        setRecordingState,
+        recordingStateRef,
+      })),
     ];
 
     return () => {
@@ -504,84 +410,30 @@ export function useRecordingSession(
   }, [recordingState, syncStateFromNative]);
 
   // ---- handleStart ----
-  // Needs: setWaitingForPermissions, cancelPermissionWaitRef,
-  // hasAskedBatteryOptRef, setBatteryOptDenied, setErrorMsg, startMonitor,
-  // setHasPermissions, setRecordingState, recordingStateRef,
-  // syncStateFromNative. Calls GpsRecorder.start().
+  // Body lives in ./useRecordingControls (extracted in T5). The inline
+  // arrow calls startRecording() with the same setters + refs + stable
+  // callbacks that the original inline body closed over, so all invariants
+  // (U1, U3, U12, U18) are preserved. The useState setters + recentSpeedsRef
+  // are stable across renders and intentionally omitted from the deps array.
   const handleStart = useCallback(async () => {
-    setErrorMsg(null);
-    try {
-      let granted = await GpsRecorder.hasPermissions();
-      if (!granted) {
-        // U1: show a spinner overlay with a Cancel button while the system
-        // permission dialog is on screen. requestPermissions() resolves
-        // only after the user taps Allow or Deny (L9 fix), so we just await
-        // it — no 30-second polling loop, no JS thread blocking. The cancel
-        // button lets the user bail out without waiting for the dialog.
-        cancelPermissionWaitRef.current = false;
-        setWaitingForPermissions(true);
-        try {
-          granted = await GpsRecorder.requestPermissions();
-        } finally {
-          setWaitingForPermissions(false);
-        }
-        // If the user pressed "Отмена" while the dialog was up, bail out
-        // without proceeding to startRecording — return to idle silently.
-        if (cancelPermissionWaitRef.current) {
-          return;
-        }
-        setHasPermissions(granted);
-        if (granted) {
-          try { await startMonitor(); } catch { /* ignore */ }
-        }
-      }
-
-      if (!granted) {
-        setErrorMsg(
-          'Location and notification permissions are required. Please grant them in Android Settings.'
-        );
-        return;
-      }
-
-      // U12: only show the battery-optimization system dialog ONCE per app
-      // session. If the user denied it, a warning banner is shown above
-      // the START button (rendered in App.tsx) with a tap action that re-
-      // opens the dialog manually.
-      if (!hasAskedBatteryOptRef.current) {
-        hasAskedBatteryOptRef.current = true;
-        try {
-          const batteryGranted = await GpsRecorder.requestIgnoreBatteryOptimizations();
-          setBatteryOptDenied(!batteryGranted);
-        } catch {
-          setBatteryOptDenied(true);
-        }
-      }
-
-      setElapsedMs(0);
-      setDistance(0);
-      setCurrentSpeed(null);
-      setLastSavedPath(null);
-      // U3: clear the save-time settings snapshot so the next recording's
-      // saved card gets a fresh snapshot (not the previous run's toggles).
-      setLastSavedSettings(null);
-      // Clear the pace-smoothing window for the fresh recording.
-      recentSpeedsRef.current = [];
-
-      await GpsRecorder.start();
-      // U18: update recordingStateRef SYNCHRONOUSLY before setRecordingState
-      // so the 'gnss' event handler (which reads the ref) sees 'recording'
-      // immediately. Otherwise the ref would lag behind state by one render
-      // and a 'gnss' event arriving in that window could override
-      // currentSpeed despite us just having started recording.
-      recordingStateRef.current = 'recording';
-      setRecordingState('recording');
-      syncStateFromNative();
-    } catch (e: unknown) {
-      const msg = e instanceof Error ? e.message : String(e);
-      setErrorMsg(msg);
-      recordingStateRef.current = 'idle';
-      setRecordingState('idle');
-    }
+    await startRecording({
+      setErrorMsg,
+      setRecordingState,
+      setElapsedMs,
+      setDistance,
+      setCurrentSpeed,
+      setLastSavedPath,
+      setLastSavedSettings,
+      setWaitingForPermissions,
+      setHasPermissions,
+      setBatteryOptDenied,
+      cancelPermissionWaitRef,
+      hasAskedBatteryOptRef,
+      recordingStateRef,
+      recentSpeedsRef,
+      startMonitor,
+      syncStateFromNative,
+    });
   }, [
     syncStateFromNative,
     cancelPermissionWaitRef,
@@ -596,29 +448,16 @@ export function useRecordingSession(
   ]);
 
   // ---- handleStop ----
-  // Calls GpsRecorder.stop() and schedules a 1 s fallback
-  // syncStateFromNative() (U16). The 'saved' event cancels the fallback.
+  // Body lives in ./useRecordingControls (extracted in T5). Schedules a 1 s
+  // fallback syncStateFromNative() (U16); the 'saved' event cancels it.
   const handleStop = useCallback(async () => {
-    setErrorMsg(null);
-    // U18: update recordingStateRef SYNCHRONOUSLY before setRecordingState.
-    recordingStateRef.current = 'stopping';
-    setRecordingState('stopping');
-    try {
-      await GpsRecorder.stop();
-      // U16: track the timeout so the 'saved' event handler can cancel it.
-      // Without this, a delayed syncStateFromNative() can fire AFTER the
-      // 'saved' event has already transitioned the UI to 'idle' + shown
-      // the saved card — causing a brief flicker back to 'stopping'.
-      stopTimeoutRef.current = setTimeout(() => {
-        stopTimeoutRef.current = null;
-        syncStateFromNative();
-      }, 1000) as unknown as number;
-    } catch (e: unknown) {
-      setErrorMsg(e instanceof Error ? e.message : String(e));
-      // Revert to 'recording' so the user can try STOP again.
-      recordingStateRef.current = 'recording';
-      setRecordingState('recording');
-    }
+    await stopRecording({
+      setErrorMsg,
+      setRecordingState,
+      recordingStateRef,
+      stopTimeoutRef,
+      syncStateFromNative,
+    });
   }, [syncStateFromNative, setRecordingState, recordingStateRef, setErrorMsg]);
 
   // ---- helper for App.tsx 'gnss' handler (U4) ----

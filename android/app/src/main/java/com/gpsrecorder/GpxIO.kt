@@ -216,7 +216,7 @@ object GpxIO {
      * L21 fix: points whose `<time>` tag is missing or unparseable are dropped
      * from the returned segments and counted in [GpxParseResult.skippedPointCount].
      * Callers can decide whether to abort if the skip ratio is too high
-     * (see GpsRecorderService.RELOAD_BAD_TIMESTAMP_ABORT_FRACTION).
+     * (see TempFileBuffer.ABORT_FRACTION).
      *
      * Points with missing or unparseable lat/lon attributes are also dropped
      * (same accounting).

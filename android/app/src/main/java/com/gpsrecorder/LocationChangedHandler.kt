@@ -46,6 +46,48 @@ class LocationChangedHandler internal constructor(
     private val service: GpsRecorderService,
 ) : LocationListener {
 
+    companion object {
+        // Accuracy gate (on-the-fly + raw-recording distance accumulator):
+        // any fix whose reported horizontal accuracy is worse than this is dropped
+        // before it can touch the buffer or the distance accumulator. Tightened
+        // from 50 m to 25 m per the user's request — 25 m is still permissive
+        // enough for cold-start fixes but filters out the worst multipath noise.
+        internal const val ACCURACY_THRESHOLD_M = 25.0f
+
+        // Maximum acceptable age of a GPS fix (ms). Fixes older than this are dropped
+        // in onLocationChanged to prevent stale cached fixes from inflating the
+        // distance of a fresh recording. See "starts with 9 m / 69 m" bug fix.
+        internal const val MAX_FIX_AGE_MS = 3000L
+
+        // ---- Velocity-based filter (replaces the old 1 km static jump gate) ----
+        //
+        // Instead of a single "drop the step if it exceeds 1 km" threshold, we now
+        // compute the instantaneous velocity between the previous accepted fix and
+        // the candidate fix:
+        //
+        //     velocity = distance(prev, curr) / (t_curr - t_prev)
+        //
+        // and discard the candidate if that velocity exceeds a mode-of-transport
+        // ceiling. For walking / running the ceiling is 20 km/h = 5.5556 m/s — a
+        // generous upper bound that covers sprinting uphill with phone bounce but
+        // still rejects the classic GPS glitches (teleport 200 m in 1 s = 720 km/h)
+        // that a 1 km static gate would only catch when the glitch was already
+        // ridiculously large.
+        //
+        // Duplicate-timestamp fixes (dt == 0) are dropped because they would imply
+        // infinite velocity.
+        internal const val MAX_VELOCITY_MPS = 5.5556f   // 20 km/h walking/running ceiling
+
+        // ---- L22: minimum dt for velocity gate ----
+        // GPS receivers occasionally emit two fixes within 50–200 ms of
+        // each other. A normal 1.4 m/s walk over 100 ms yields 14 m/s,
+        // exceeding the 20 km/h ceiling and getting the fix dropped. The
+        // velocity gate is bypassed for dt < MIN_VELOCITY_GATE_DT_SEC
+        // — the displacement is too small to produce a reliable velocity.
+        // dt <= 0 (duplicate timestamp) is still dropped.
+        internal const val MIN_VELOCITY_GATE_DT_SEC = 0.5
+    }
+
     // ---- Time-sampling on-the-fly filter state ----
     // Monotonic counter incremented for EVERY fix that arrives (after the
     // stale-fix / gap / auto-pause checks). When `time_sampling_enabled` is
@@ -72,7 +114,7 @@ class LocationChangedHandler internal constructor(
         // the next fresh fix. This is the second half of the "starts with 9 m /
         // 69 m" fix (the first half is removing the getLastKnownLocation() seed).
         val fixAgeMs = System.currentTimeMillis() - pt.timeMs
-        if (fixAgeMs > GpsRecorderService.MAX_FIX_AGE_MS) {
+        if (fixAgeMs > MAX_FIX_AGE_MS) {
             // L33 fix: downgrade to SafeLog.d and strip lat/lon — this was
             // the only Log.w call in the service that leaked GPS coordinates
             // in release builds.
@@ -81,7 +123,7 @@ class LocationChangedHandler internal constructor(
         }
 
         // ---- Phase 4: Gap detection (signal loss) ----
-        // If this fix arrived more than GpsRecorderService.GAP_THRESHOLD_MS after the previous one,
+        // If this fix arrived more than AutoPauseGapController.GAP_THRESHOLD_MS after the previous one,
         // OR if the watchdog has already declared service.signalLost, treat this as gap
         // recovery: split the track into a new segment and reset the validation
         // cursor so the velocity gate doesn't compare across the gap. Distance
@@ -111,13 +153,13 @@ class LocationChangedHandler internal constructor(
         // exitAutoPause just refreshed to `pt.timeMs`, so the diff is 0)
         // — but on the NEXT fix, if the user stood still for ~25 s before
         // resuming, service.lastFixTimeMs may still point to a stale pre-pause
-        // value and the diff would exceed GpsRecorderService.GAP_THRESHOLD_MS, falsely
+        // value and the diff would exceed AutoPauseGapController.GAP_THRESHOLD_MS, falsely
         // triggering a segment split. The grace check makes the invariant
         // explicit.
         if (GpsRecorderSettings.isGapDetectionEnabled(service) && !service.isAutoPaused
             && pt.timeMs >= service.autoPauseResumeGraceUntilMs   // Task 1
         ) {
-            val gapDetected = service.lastFixTimeMs > 0L && (pt.timeMs - service.lastFixTimeMs) > GpsRecorderService.GAP_THRESHOLD_MS
+            val gapDetected = service.lastFixTimeMs > 0L && (pt.timeMs - service.lastFixTimeMs) > AutoPauseGapController.GAP_THRESHOLD_MS
             if (gapDetected || service.signalLost) {
                 Log.i(
                     GpsRecorderService.TAG,
@@ -147,16 +189,16 @@ class LocationChangedHandler internal constructor(
 
         // ---- Phase 3: Auto-pause (stop detection) ----
         // When enabled, we maintain a sliding window of the last
-        // GpsRecorderService.AUTO_PAUSE_RAW_WINDOW_MS of raw fixes and check two conditions:
-        //   1. Instantaneous speed < GpsRecorderService.AUTO_PAUSE_SPEED_THRESHOLD_MPS
-        //   2. Maximum pairwise displacement in the window < GpsRecorderService.AUTO_PAUSE_DISPLACEMENT_THRESHOLD_M
+        // AutoPauseGapController.RAW_WINDOW_MS of raw fixes and check two conditions:
+        //   1. Instantaneous speed < AutoPauseGapController.SPEED_THRESHOLD_MPS
+        //   2. Maximum pairwise displacement in the window < AutoPauseGapController.DISPLACEMENT_THRESHOLD_M
         // If both are true, the user is considered stationary; we enter (or
         // stay in) auto-pause and skip recording the point. When the user
         // starts moving again, we exit auto-pause and start a new segment.
         if (GpsRecorderSettings.isAutoPauseEnabled(service)) {
             // Push to sliding raw window and prune entries older than the window.
             service.rawWindow.add(pt)
-            val windowCutoff = pt.timeMs - GpsRecorderService.AUTO_PAUSE_RAW_WINDOW_MS
+            val windowCutoff = pt.timeMs - AutoPauseGapController.RAW_WINDOW_MS
             while (service.rawWindow.isNotEmpty() && service.rawWindow.peek().timeMs < windowCutoff) {
                 service.rawWindow.poll()
             }
@@ -169,9 +211,9 @@ class LocationChangedHandler internal constructor(
             // was moving. We now treat a null speed as 'not stationary' so
             // the displacement check (line below) is the sole backstop —
             // exactly what we want when the GPS can't tell us our speed.
-            val speedOk = pt.speed?.let { it < GpsRecorderService.AUTO_PAUSE_SPEED_THRESHOLD_MPS } ?: false
+            val speedOk = pt.speed?.let { it < AutoPauseGapController.SPEED_THRESHOLD_MPS } ?: false
             val disp = service.autoPauseGap.maxDisplacementInWindow()
-            val dispOk = disp < GpsRecorderService.AUTO_PAUSE_DISPLACEMENT_THRESHOLD_M
+            val dispOk = disp < AutoPauseGapController.DISPLACEMENT_THRESHOLD_M
             val stopped = speedOk && dispOk
 
             if (stopped) {
@@ -185,7 +227,7 @@ class LocationChangedHandler internal constructor(
                 }
                 // CODE_REVIEW_TODO Task 2: a stationary fix while paused
                 // resets the moving-confirmation counter (the user has to
-                // re-accumulate GpsRecorderService.MOVING_CONFIRMATION_THRESHOLD consecutive
+                // re-accumulate AutoPauseGapController.MOVING_CONFIRMATION_THRESHOLD consecutive
                 // fast fixes to resume). enterAutoPause() also resets it,
                 // but we reset here too so a slow fix during the
                 // confirmation window — without re-entering pause — also
@@ -207,7 +249,7 @@ class LocationChangedHandler internal constructor(
                 // User is moving.
                 if (service.isAutoPaused) {
                     // CODE_REVIEW_TODO Task 2: hysteresis — require
-                    // GpsRecorderService.MOVING_CONFIRMATION_THRESHOLD consecutive "clearly
+                    // AutoPauseGapController.MOVING_CONFIRMATION_THRESHOLD consecutive "clearly
                     // moving" fixes before resuming. This prevents the
                     // amber "АВТОПАУЗА" banner from flickering on rapid
                     // pause/resume oscillation (e.g. very slow walking
@@ -217,19 +259,19 @@ class LocationChangedHandler internal constructor(
                     // correct but feels glitchy.
                     //
                     // A fix counts as "clearly moving" if EITHER:
-                    //   - pt.speed >= GpsRecorderService.HYSTERESIS_SPEED_MS (primary), OR
+                    //   - pt.speed >= AutoPauseGapController.HYSTERESIS_SPEED_MS (primary), OR
                     //   - pt.speed is null/0 AND haversine displacement
                     //     from the last kept fix implies velocity >=
-                    //     GpsRecorderService.HYSTERESIS_DISPLACEMENT_MPS (fallback for
+                    //     AutoPauseGapController.HYSTERESIS_DISPLACEMENT_MPS (fallback for
                     //     receivers that don't populate Location.speed).
                     //
-                    // The first (GpsRecorderService.MOVING_CONFIRMATION_THRESHOLD - 1)
+                    // The first (AutoPauseGapController.MOVING_CONFIRMATION_THRESHOLD - 1)
                     // confirmation fixes are dropped (same pattern as the
                     // stopped branch above) so the post-pause segment
                     // starts cleanly at the moment resume is confirmed.
                     // This loses ~2 s of track data at each resume —
                     // acceptable per Task 2.
-                    val speedBased = pt.speed != null && pt.speed >= GpsRecorderService.HYSTERESIS_SPEED_MS
+                    val speedBased = pt.speed != null && pt.speed >= AutoPauseGapController.HYSTERESIS_SPEED_MS
                     val dispBased = (!speedBased && (pt.speed == null || pt.speed == 0f)) && run {
                         val pLat = service.prevLat
                         val pLon = service.prevLon
@@ -238,13 +280,13 @@ class LocationChangedHandler internal constructor(
                             val dtSec = (pt.timeMs - pTime) / 1000.0
                             if (dtSec > 0) {
                                 val d = TrackMath.haversineMeters(pLat, pLon, pt.lat, pt.lon)
-                                (d / dtSec) >= GpsRecorderService.HYSTERESIS_DISPLACEMENT_MPS
+                                (d / dtSec) >= AutoPauseGapController.HYSTERESIS_DISPLACEMENT_MPS
                             } else false
                         } else false
                     }
                     if (speedBased || dispBased) {
                         service.consecutiveMovingFixes++
-                        if (service.consecutiveMovingFixes >= GpsRecorderService.MOVING_CONFIRMATION_THRESHOLD) {
+                        if (service.consecutiveMovingFixes >= AutoPauseGapController.MOVING_CONFIRMATION_THRESHOLD) {
                             Log.i(
                                 GpsRecorderService.TAG,
                                 "Auto-pause resuming after ${service.consecutiveMovingFixes} confirmation fixes:" +
@@ -263,7 +305,7 @@ class LocationChangedHandler internal constructor(
                             // current position update.
                             Log.i(
                                 GpsRecorderService.TAG,
-                                "Auto-pause confirmation ${service.consecutiveMovingFixes}/${GpsRecorderService.MOVING_CONFIRMATION_THRESHOLD}:" +
+                                "Auto-pause confirmation ${service.consecutiveMovingFixes}/${AutoPauseGapController.MOVING_CONFIRMATION_THRESHOLD}:" +
                                     " speed=${pt.speed} disp=${disp}m — staying paused"
                             )
                             service.lastFixTimeMs = pt.timeMs
@@ -358,7 +400,7 @@ class LocationChangedHandler internal constructor(
             // must not become the reference for the next fix's velocity /
             // distance computation.
             val acc = pt.accuracy
-            if (acc != null && acc > GpsRecorderService.ACCURACY_THRESHOLD_M) {
+            if (acc != null && acc > ACCURACY_THRESHOLD_M) {
                 SafeLog.d(GpsRecorderService.TAG, "On-the-fly filter: dropping low-accuracy fix (acc=${acc}m)")
                 service.lastFixTimeMs = pt.timeMs
                 service.stateRepository.saveLiveState(pt)
@@ -431,9 +473,9 @@ class LocationChangedHandler internal constructor(
                     return
                 }
                 val d = TrackMath.haversineMeters(pLat, pLon, pt.lat, pt.lon)
-                if (dtSec >= GpsRecorderService.MIN_VELOCITY_GATE_DT_SEC) {
+                if (dtSec >= MIN_VELOCITY_GATE_DT_SEC) {
                     val velocityMps = d / dtSec
-                    if (velocityMps > GpsRecorderService.MAX_VELOCITY_MPS) {
+                    if (velocityMps > MAX_VELOCITY_MPS) {
                         SafeLog.d(GpsRecorderService.TAG, "On-the-fly filter: dropping velocity outlier (v=${velocityMps}m/s d=${d}m dt=${dtSec}s)")
                         service.lastFixTimeMs = pt.timeMs
                         service.stateRepository.saveLiveState(pt)
@@ -586,7 +628,7 @@ class LocationChangedHandler internal constructor(
 
     private fun accumulateDistance(pt: GpsPoint, precomputedDistanceM: Double? = null) {
         val acc = pt.accuracy
-        if (acc != null && acc > GpsRecorderService.ACCURACY_THRESHOLD_M) {
+        if (acc != null && acc > ACCURACY_THRESHOLD_M) {
             // Fix too inaccurate to trust for distance — skip but don't advance
             // prev. The next fix is compared against the last good point.
             return
@@ -606,12 +648,12 @@ class LocationChangedHandler internal constructor(
             val d = precomputedDistanceM ?: TrackMath.haversineMeters(pLat, pLon, pt.lat, pt.lon)
             // L22 fix: bypass velocity gate for sub-half-second dt — the
             // displacement is too small to produce a reliable velocity.
-            if (dtSec >= GpsRecorderService.MIN_VELOCITY_GATE_DT_SEC) {
+            if (dtSec >= MIN_VELOCITY_GATE_DT_SEC) {
                 val velocityMps = d / dtSec
                 // Drop the contribution if the implied velocity exceeds the walk/
                 // run ceiling. These are usually GPS glitches after a cold start
                 // or tunnel exit; they would otherwise inflate service.totalDistanceM.
-                if (velocityMps > GpsRecorderService.MAX_VELOCITY_MPS) {
+                if (velocityMps > MAX_VELOCITY_MPS) {
                     SafeLog.d(GpsRecorderService.TAG, "accumulateDistance: dropping velocity outlier (v=${velocityMps}m/s d=${d}m dt=${dtSec}s)")
                     // Do NOT advance prev — keep the last good fix as the
                     // reference so the next fix's distance is computed from it,

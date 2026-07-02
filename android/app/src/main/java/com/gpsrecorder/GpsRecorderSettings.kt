@@ -63,9 +63,9 @@ object GpsRecorderSettings {
      * Reads the post-process setting (on-the-fly accuracy/velocity gate).
      * When enabled, `onLocationChanged` applies both an accuracy gate
      * (drop fixes with horizontal accuracy worse than
-     * `GpsRecorderService.ACCURACY_THRESHOLD_M`) and a velocity gate
+     * `LocationChangedHandler.ACCURACY_THRESHOLD_M`) and a velocity gate
      * (drop fixes implying instantaneous velocity >
-     * `GpsRecorderService.MAX_VELOCITY_MPS`) BEFORE appending the point
+     * `LocationChangedHandler.MAX_VELOCITY_MPS`) BEFORE appending the point
      * to the buffer. When disabled, every fix is appended raw and the
      * distance accumulator alone applies the same gates.
      */
@@ -135,7 +135,7 @@ object GpsRecorderSettings {
 
     /**
      * Reads the gap-detection setting. When enabled (default), the gap
-     * watchdog declares `signalLost` after `GAP_THRESHOLD_MS` without a
+     * watchdog declares `signalLost` after `AutoPauseGapController.GAP_THRESHOLD_MS` without a
      * fix, and the next arriving fix triggers a segment split so the track
      * has clean `<trkseg>` breaks at signal outages. When disabled, gaps
      * are NOT detected: the timer keeps running across the outage, the next

@@ -45,6 +45,15 @@ class TempFileBuffer(
     private val setAppendState: (initialized: Boolean, flushedSegments: Int, flushedCurrentSize: Int) -> Unit,
 ) {
 
+    companion object {
+        // ---- L21: reloadPointsFromTempFile abort threshold ----
+        // If more than this fraction of points have unparseable
+        // timestamps, the reload is aborted entirely (buffer left empty)
+        // — better to start a fresh segment than to mix garbage into the
+        // timeline.
+        internal const val ABORT_FRACTION = 0.1
+    }
+
     private val tag: String get() = GpsRecorderService.TAG
 
     @Volatile var tempFileName: String? = null
@@ -230,12 +239,12 @@ class TempFileBuffer(
             // L21: abort if too many points had bad timestamps.
             if (parseResult.totalPointCount > 0 &&
                 parseResult.skippedPointCount.toDouble() / parseResult.totalPointCount >
-                GpsRecorderService.RELOAD_BAD_TIMESTAMP_ABORT_FRACTION
+                ABORT_FRACTION
             ) {
                 Log.e(
                     tag,
                     "reloadPointsIntoBuffer: aborting — ${parseResult.skippedPointCount}/${parseResult.totalPointCount} " +
-                        "points had unparseable timestamps (> ${GpsRecorderService.RELOAD_BAD_TIMESTAMP_ABORT_FRACTION * 100}%). " +
+                        "points had unparseable timestamps (> ${ABORT_FRACTION * 100}%). " +
                         "Buffer left empty; recording will start a fresh segment."
                 )
                 setBuffer(emptyList(), 0)

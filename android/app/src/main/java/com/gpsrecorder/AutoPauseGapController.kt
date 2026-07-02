@@ -68,6 +68,65 @@ import android.util.Log
  */
 class AutoPauseGapController(private val service: GpsRecorderService) {
 
+    companion object {
+        // ---- Auto-pause (stop detection) (Phase 3) ----
+        // Sliding window of recent raw fixes used to detect stops. We keep
+        // the last RAW_WINDOW_MS of fixes (regardless of whether they passed
+        // the on-the-fly filter) and look at the maximum pairwise
+        // displacement inside that window.
+        internal const val RAW_WINDOW_MS = 10_000L
+        // Instantaneous speed below which the user is considered stationary.
+        // 0.35 m/s ~ 1.26 km/h — a slow shuffle; anything below this is
+        // effectively standing still.
+        internal const val SPEED_THRESHOLD_MPS = 0.35f
+        // Maximum pairwise displacement within the sliding window below
+        // which the user is considered stationary (i.e. not just bouncing
+        // in place due to GPS noise). 3.5 m ~ the diameter of a typical
+        // urban GPS noise bubble when standing still.
+        internal const val DISPLACEMENT_THRESHOLD_M = 3.5
+
+        // ---- Auto-pause exit hysteresis (CODE_REVIEW_TODO Task 2) ----
+        // To prevent the amber "АВТОПАУЗА" banner from flickering on rapid
+        // pause/resume oscillation, we require N consecutive "clearly
+        // moving" fixes before calling exitAutoPause().
+        internal const val MOVING_CONFIRMATION_THRESHOLD = 3   // consecutive fixes
+        internal const val HYSTERESIS_SPEED_MS = 0.5f          // 0.5 m/s ≈ slow walk
+        internal const val HYSTERESIS_DISPLACEMENT_MPS = 1.5   // fallback when speed is null/0
+        internal const val KEY_CONSECUTIVE_MOVING_FIXES = "consecutive_moving_fixes"
+
+        // ---- Gap detection (signal loss) (Phase 4) ----
+        // If no GPS fix arrives for this many ms, declare a signal gap and
+        // split the track into a new <trkseg> when the next fix does arrive.
+        internal const val GAP_THRESHOLD_MS = 15_000L
+
+        // ---- Auto-pause resume grace window (CODE_REVIEW_TODO Task 1) ----
+        // After exitAutoPause(), `lastFixTimeMs` may be stale (last updated
+        // while the user was stationary under auto-pause, so it points to a
+        // fix that is up to RAW_WINDOW_MS old). The gap watchdog
+        // (durationTick, 1 Hz) and the gap-recovery branch in onLocationChanged
+        // both compare `now - lastFixTimeMs` against GAP_THRESHOLD_MS — if we
+        // let them run immediately after resume, they could falsely declare
+        // signalLost or trigger a spurious segment split.
+        //
+        // The grace window suppresses both checks for GAP_THRESHOLD_MS after
+        // every exitAutoPause(). exitAutoPause() also refreshes lastFixTimeMs
+        // to the resume fix so the watchdog's next tick sees a recent fix
+        // even if no further fix arrives.
+        //
+        // Persisted in the live-state bundle (KEY_RESUME_GRACE_UNTIL_MS) so
+        // it survives service restart. On recovery, if the grace has already
+        // expired (grace < now), it is reset to 0L.
+        internal const val KEY_RESUME_GRACE_UNTIL_MS = "auto_pause_resume_grace_until_ms"
+
+        // ---- L20: raw-window persistence across service restarts ----
+        // Number of trailing raw fixes (from `rawWindow`) to serialize to
+        // SharedPreferences so auto-pause detection can make a correct
+        // decision on the first fix after a START_STICKY restart. The window
+        // is also bounded by RAW_WINDOW_MS (10 s); this size cap is the
+        // upper bound on how many we'll persist (10 s at 1 Hz = ~10 fixes).
+        internal const val RAW_WINDOW_SIZE = 10
+    }
+
     // ------------------------------------------------------------------
     // Validation cursor (Phase 3 helper)
     // ------------------------------------------------------------------
@@ -127,17 +186,17 @@ class AutoPauseGapController(private val service: GpsRecorderService) {
      */
     fun persistAutoPauseState() {
         try {
-            service.getSharedPreferences(GpsRecorderService.PREFS_NAME, Context.MODE_PRIVATE).edit()
-                .putBoolean(GpsRecorderService.KEY_IS_AUTO_PAUSED, service.isAutoPaused)
-                .putBoolean(GpsRecorderService.KEY_SIGNAL_LOST, service.signalLost)
-                .putLong(GpsRecorderService.KEY_MOVING_MS, service.movingMs)
+            service.getSharedPreferences(StateRepository.PREFS_NAME, Context.MODE_PRIVATE).edit()
+                .putBoolean(StateRepository.KEY_IS_AUTO_PAUSED, service.isAutoPaused)
+                .putBoolean(StateRepository.KEY_SIGNAL_LOST, service.signalLost)
+                .putLong(StateRepository.KEY_MOVING_MS, service.movingMs)
                 // CODE_REVIEW_TODO Task 1: persist the grace window here too
                 // so a service restart mid-grace still honors it.
-                .putLong(GpsRecorderService.KEY_AUTO_PAUSE_RESUME_GRACE_UNTIL_MS, service.autoPauseResumeGraceUntilMs)
+                .putLong(KEY_RESUME_GRACE_UNTIL_MS, service.autoPauseResumeGraceUntilMs)
                 // CODE_REVIEW_TODO Task 2: persist the moving-confirmation
                 // counter so a service restart mid-confirmation doesn't
                 // lose progress.
-                .putInt(GpsRecorderService.KEY_CONSECUTIVE_MOVING_FIXES, service.consecutiveMovingFixes)
+                .putInt(KEY_CONSECUTIVE_MOVING_FIXES, service.consecutiveMovingFixes)
                 .apply()
         } catch (e: Exception) {
             Log.w(GpsRecorderService.TAG, "persistAutoPauseState failed", e)
@@ -209,7 +268,7 @@ class AutoPauseGapController(private val service: GpsRecorderService) {
         service.segmentedBuffer.createNewSegment()  // no-op if currentSegment is empty (typical case)
         service.lastResumeMs = now
         // CODE_REVIEW_TODO Task 1: grace window + lastFixTimeMs refresh.
-        service.autoPauseResumeGraceUntilMs = now + GpsRecorderService.GAP_THRESHOLD_MS
+        service.autoPauseResumeGraceUntilMs = now + GAP_THRESHOLD_MS
         service.lastFixTimeMs = now
         // CODE_REVIEW_TODO Task 2: reset the moving-confirmation counter so
         // the next auto-pause cycle starts fresh.
@@ -268,6 +327,63 @@ class AutoPauseGapController(private val service: GpsRecorderService) {
             )
         )
         Log.i(GpsRecorderService.TAG, "Gap recovered at $now — new segment started, movingMs accumulation resumed")
+    }
+
+    // ------------------------------------------------------------------
+    // Gap watchdog (Phase 4, L15-moved)
+    // ------------------------------------------------------------------
+
+    /**
+     * Gap-detection watchdog: called once per second from the service's
+     * `durationTick` Runnable. Declares `signalLost` if no fix has arrived
+     * in [GAP_THRESHOLD_MS], freezing the moving-time accumulator at the
+     * moment of the last fix (not "now" — the gap time is NOT moving time).
+     *
+     * Returns `true` if `signalLost` was just set this call (the caller
+     * refreshes the notification + emits a state event); `false` otherwise.
+     *
+     * Invariants preserved verbatim from the inline `durationTick`
+     * implementation:
+     *   - Gated on `gapDetectionEnabled` (caller passes the value).
+     *   - Suppressed while already `signalLost` or `isAutoPaused` —
+     *     stationary users legitimately have no incoming fixes, so showing
+     *     the signal-lost banner on top of the auto-pause banner would be
+     *     contradictory.
+     *   - Suppressed during the auto-pause resume grace window (Task 1):
+     *     `exitAutoPause()` sets `autoPauseResumeGraceUntilMs = now +
+     *     GAP_THRESHOLD_MS` and refreshes `lastFixTimeMs`, but if no further
+     *     fix arrives in the next 15 s the watchdog could falsely fire.
+     *   - Skipped if `lastFixTimeMs == 0` (no fix yet — can't measure gap).
+     *   - `movingMs` is committed to `lastFixTimeMs` (the gap time after
+     *     that is NOT moving time).
+     *   - `lastResumeMs` is nulled so `liveMovingMs` reports the frozen
+     *     value until the next fix arrives.
+     *   - `persistAutoPauseState()` is called so the freeze survives a
+     *     service restart.
+     */
+    fun checkGapWatchdog(now: Long, gapDetectionEnabled: Boolean): Boolean {
+        if (!gapDetectionEnabled) return false
+        if (service.signalLost) return false
+        if (service.isAutoPaused) return false
+        if (now < service.autoPauseResumeGraceUntilMs) return false  // Task 1
+        if (service.lastFixTimeMs <= 0L) return false
+        val sinceLast = now - service.lastFixTimeMs
+        if (sinceLast <= GAP_THRESHOLD_MS) return false
+        service.signalLost = true
+        // Freeze the moving-time accumulator at the time of the LAST FIX
+        // (not "now"), because that's when movement actually stopped. The
+        // GAP_THRESHOLD_MS window between the last fix and "now" is signal-
+        // loss time and must NOT count as moving time.
+        service.lastResumeMs?.let { r ->
+            if (service.lastFixTimeMs > r) service.movingMs += (service.lastFixTimeMs - r)
+        }
+        service.lastResumeMs = null
+        Log.w(
+            GpsRecorderService.TAG,
+            "Signal lost: no fix for ${sinceLast}ms (movingMs frozen at ${service.movingMs})"
+        )
+        persistAutoPauseState()
+        return true
     }
 
     // ------------------------------------------------------------------
@@ -336,5 +452,24 @@ class AutoPauseGapController(private val service: GpsRecorderService) {
         // CODE_REVIEW_TODO Task 2: reset the moving-confirmation counter
         // so a fresh recording starts the hysteresis window from 0.
         service.consecutiveMovingFixes = 0
+    }
+
+    /**
+     * K9: Finalize the moving-time accumulator at stop time. Adds the
+     * segment from the last resume up to the LAST FIX (capped, not "now")
+     * to `movingMs` so any standing-still time between the last fix and
+     * pressing STOP is NOT counted as moving time. This keeps `movingMs`
+     * consistent with the `liveMovingMs` value the UI was showing right
+     * before STOP. After this call `lastResumeMs` is nulled.
+     *
+     * Extracted verbatim from `GpsRecorderService.stopRecording` so that
+     * method could be shortened.
+     */
+    fun finalizeMovingTimeAtStop() {
+        service.lastResumeMs?.let { r ->
+            val cap = if (service.lastFixTimeMs > 0L) service.lastFixTimeMs else System.currentTimeMillis()
+            if (cap > r) service.movingMs += (cap - r)
+        }
+        service.lastResumeMs = null
     }
 }
