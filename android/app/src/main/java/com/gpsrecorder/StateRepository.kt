@@ -111,7 +111,7 @@ class StateRepository(private val service: GpsRecorderService) {
             // in memory as the "committed baseline" and is what we restart
             // from after a service restart (see recoverStateIfAny).
             val liveNow = lastFix?.timeMs ?: now
-            prefs.putLong(GpsRecorderService.KEY_MOVING_MS, service.liveMovingMs(liveNow))
+            prefs.putLong(GpsRecorderService.KEY_MOVING_MS, service.autoPauseGap.liveMovingMs(liveNow))
             // CODE_REVIEW_TODO Task 1: persist the auto-pause resume grace
             // window so it survives service restart. If the grace has
             // already expired by the time we recover, recoverStateIfAny
@@ -122,7 +122,7 @@ class StateRepository(private val service: GpsRecorderService) {
             // (If the service restarts mid-confirmation, the user has to
             // re-confirm 3 fixes — acceptable per Task 2.)
             prefs.putInt(GpsRecorderService.KEY_CONSECUTIVE_MOVING_FIXES, service.consecutiveMovingFixes)
-            val fix = lastFix ?: synchronized(service.pointBufferLock) { service.currentSegment.lastOrNull() }
+            val fix = lastFix ?: synchronized(service.segmentedBuffer.pointBufferLock) { service.segmentedBuffer.currentSegment.lastOrNull() }
             if (fix != null) {
                 prefs.putString(GpsRecorderService.KEY_LAST_LAT, fix.lat.toString())
                 prefs.putString(GpsRecorderService.KEY_LAST_LON, fix.lon.toString())
@@ -234,7 +234,7 @@ class StateRepository(private val service: GpsRecorderService) {
         // post-recovery liveMovingMs starts ticking from this persisted
         // baseline (the period between the last save and recovery is NOT
         // counted, because we don't know whether the user was moving).
-        prefs.putLong(GpsRecorderService.KEY_MOVING_MS, service.liveMovingMs())
+        prefs.putLong(GpsRecorderService.KEY_MOVING_MS, service.autoPauseGap.liveMovingMs())
         prefs.apply()
     }
 
@@ -330,9 +330,9 @@ class StateRepository(private val service: GpsRecorderService) {
             // prevLat should stay null and the velocity gate will naturally
             // bypass the first post-restart fix.
             if (!service.isAutoPaused) {
-                synchronized(service.pointBufferLock) {
-                    val last = service.currentSegment.lastOrNull()
-                        ?: service.trackSegments.lastOrNull()?.lastOrNull()
+                synchronized(service.segmentedBuffer.pointBufferLock) {
+                    val last = service.segmentedBuffer.currentSegment.lastOrNull()
+                        ?: service.segmentedBuffer.trackSegments.lastOrNull()?.lastOrNull()
                     if (last != null) {
                         service.prevLat = last.lat
                         service.prevLon = last.lon
@@ -344,9 +344,9 @@ class StateRepository(private val service: GpsRecorderService) {
                 // Paused: don't restore prev cursor — the next fix that
                 // resumes movement will go through resetValidationCursor()
                 // via exitAutoPause() anyway, so starting with null is safer.
-                synchronized(service.pointBufferLock) {
-                    val last = service.currentSegment.lastOrNull()
-                        ?: service.trackSegments.lastOrNull()?.lastOrNull()
+                synchronized(service.segmentedBuffer.pointBufferLock) {
+                    val last = service.segmentedBuffer.currentSegment.lastOrNull()
+                        ?: service.segmentedBuffer.trackSegments.lastOrNull()?.lastOrNull()
                     if (last != null) service.lastFixTimeMs = last.timeMs
                 }
             }
