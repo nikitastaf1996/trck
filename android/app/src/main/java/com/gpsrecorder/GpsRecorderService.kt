@@ -56,6 +56,51 @@ class GpsRecorderService : Service(), LocationListener {
     // O7/O24: extracted helpers
     private val notifier = GpsRecorderNotification(this)
 
+    // O7/O24 round 2: further extracted helpers
+    private val locationSource = LocationSource(
+        service = this,
+        listener = this,
+        onFatalError = { msg ->
+            GpsRecorderModule.emitError(msg, fatal = true)
+            stopRecording()
+        },
+        onGnssStatusPersist = { sats, fixType ->
+            try {
+                getSharedPreferences(PREFS_NAME, android.content.Context.MODE_PRIVATE)
+                    .edit()
+                    .putInt(KEY_SATELLITES_USED, sats)
+                    .putString(KEY_FIX_TYPE, fixType)
+                    .apply()
+            } catch (e: Exception) {
+                android.util.Log.w(TAG, "Failed to persist GNSS status", e)
+            }
+        },
+    )
+    private val wakeLockManager = WakeLockManager(this)
+    private val tempFileBuffer = TempFileBuffer(
+        service = this,
+        segmentsSnapshot = { segmentsSnapshot() },
+        setBuffer = { segments, totalPoints ->
+            synchronized(pointBufferLock) {
+                trackSegments.clear()
+                currentSegment = if (segments.isEmpty()) ArrayList() else ArrayList(segments.last())
+                if (segments.size > 1) {
+                    for (i in 0 until segments.size - 1) {
+                        trackSegments.add(ArrayList(segments[i]))
+                    }
+                }
+                pointCount = totalPoints
+            }
+        },
+        setAppendState = { init, segs, size -> },
+    )
+    private val gpxFileSaver = GpxFileSaver(
+        service = this,
+        segmentsSnapshot = { segmentsSnapshot() },
+        startTimeMs = { startTimeMs },
+        deleteTempFile = { tempFileBuffer.deleteTempFile() },
+    )
+
     companion object {
         private const val TAG = "GpsRecorderService"
 
@@ -96,7 +141,7 @@ class GpsRecorderService : Service(), LocationListener {
 
         // L13 fix: MediaStore URI of the most recently saved GPX file (as a
         // string). Populated by saveViaMediaStore() on API 29+ so that
-        // recomputeDistanceFromSavedGpx() can open the file via ContentResolver
+        // gpxFileSaver.recomputeDistanceFromSavedGpx() can open the file via ContentResolver
         // instead of trying to resolve the MediaStore-relative path through
         // Environment.getExternalStoragePublicDirectory() (which on scoped
         // storage points to a different directory than the MediaStore-scoped
@@ -280,9 +325,7 @@ class GpsRecorderService : Service(), LocationListener {
         // truncate these closing tags via RandomAccessFile.setLength.
     }
 
-    private var locationManager: LocationManager? = null
-    private var wakeLock: PowerManager.WakeLock? = null
-    private var handler: Handler = Handler(Looper.getMainLooper())
+            private var handler: Handler = Handler(Looper.getMainLooper())
 
     // Recording state (persisted to SharedPreferences for recovery)
     @Volatile private var isRecording = false
@@ -294,10 +337,8 @@ class GpsRecorderService : Service(), LocationListener {
     @Volatile private var totalDistanceM: Double = 0.0
 
     // GNSS status tracking (satellites used in current fix).
-    @Volatile private var satellitesUsed: Int = 0
-    @Volatile private var lastFixTimeMs: Long = 0L
-    private var gnssStatusCallback: GnssStatus.Callback? = null
-
+        @Volatile private var lastFixTimeMs: Long = 0L
+    
     // Previous point used for distance accumulation + velocity-based filtering
     // (Haversine distance and dt between consecutive accepted fixes).
     // Nullified by resetValidationCursor() on auto-pause transitions and
@@ -386,10 +427,7 @@ class GpsRecorderService : Service(), LocationListener {
     // `tempFileFlushedCurrentSize` is the number of points of the current
     // segment we've already written. Points beyond this index are
     // appended on the next flush.
-    @Volatile private var tempFileInitialized: Boolean = false
-    @Volatile private var tempFileFlushedSegments: Int = 0
-    @Volatile private var tempFileFlushedCurrentSize: Int = 0
-
+            
     // Duration tick runnable (1 Hz).
     //
     // L8 fix: emit movingMs alongside elapsedMs on every 1 Hz tick. The JS
@@ -491,7 +529,7 @@ class GpsRecorderService : Service(), LocationListener {
     private val flushTick = object : Runnable {
         override fun run() {
             if (isRecording) {
-                flushToTempFile()
+                tempFileBuffer.flush()
                 handler.postDelayed(this, FLUSH_INTERVAL_MS)
             }
         }
@@ -550,7 +588,7 @@ class GpsRecorderService : Service(), LocationListener {
             // L25 fix: force a final live-state save before destroy so the
             // throttled saveLiveState doesn't drop the most recent fixes.
             saveLiveState(force = true)
-            flushToTempFile()
+            tempFileBuffer.flush()
         }
         cleanupGpsAndWakeLock()
         super.onDestroy()
@@ -592,7 +630,7 @@ class GpsRecorderService : Service(), LocationListener {
             prevLat = null
             prevLon = null
             prevTimeMs = null
-            satellitesUsed = 0
+            locationSource.resetSatellites()
             lastFixTimeMs = 0L
             // Phase 2: reset segmented buffer.
             synchronized(pointBufferLock) {
@@ -620,15 +658,14 @@ class GpsRecorderService : Service(), LocationListener {
             // kept regardless of N).
             timeSamplingCounter = 0
             tempFileName = "gps_temp_${startTimeMs}.gpx"
+            tempFileBuffer.tempFileName = tempFileName
             // L25 fix: reset the saveLiveState throttle so the first fix of
             // the new recording is persisted immediately (not skipped by the
             // 5 s throttle).
             lastSaveLiveStateMs = 0L
             // L26 fix: reset the append-only temp-file state. The temp file
-            // itself is overwritten in writeGpxHeaderToTempFile() below.
-            tempFileInitialized = false
-            tempFileFlushedSegments = 0
-            tempFileFlushedCurrentSize = 0
+            // itself is overwritten in tempFileBuffer.writeGpxHeader() below.
+            tempFileBuffer.resetState()  // L26 reset
         }
         isRecording = true
 
@@ -636,7 +673,7 @@ class GpsRecorderService : Service(), LocationListener {
         persistState()
 
         // Acquire wakelock so CPU stays awake while screen is off
-        acquireWakeLock()
+        wakeLockManager.acquire()
 
         // Start the foreground notification FIRST (Android requires this within 5s of
         // startForegroundService()).
@@ -648,14 +685,14 @@ class GpsRecorderService : Service(), LocationListener {
                 signalLost = signalLost
             )
         ) {
-            releaseWakeLock()
+            wakeLockManager.release()
             GpsRecorderModule.emitError("Не удалось запустить foreground service", fatal = true)
             stopSelf()
         }
 
         // Start GPS + GNSS status tracking.
         //
-        // L1 fix: startLocationUpdates() now returns Boolean. If it returns
+        // L1 fix: locationSource.startLocationUpdates() now returns Boolean. If it returns
         // false it has ALREADY called stopRecording() (which finalized state,
         // released the wakelock, emitted state=false, and called stopSelf()).
         // We MUST bail out here without registering the GNSS callback, posting
@@ -664,10 +701,10 @@ class GpsRecorderService : Service(), LocationListener {
         // service that has already been torn down, and an orphan temp file
         // would be left in externalCacheDir. L5/L6/L7 are all consequences
         // of NOT having this early-return.
-        if (!startLocationUpdates()) {
+        if (!locationSource.startLocationUpdates()) {
             return  // startLocationUpdates already cleaned up via stopRecording()
         }
-        startGnssStatusTracking()
+        locationSource.startGnssStatusTracking()
 
         // Start duration tick + periodic flush
         handler.post(durationTick)
@@ -675,7 +712,7 @@ class GpsRecorderService : Service(), LocationListener {
 
         // Reset temp file content with GPX header (overwrites any stale temp)
         if (!resume) {
-            writeGpxHeaderToTempFile()
+            tempFileBuffer.writeGpxHeader()
         }
 
         GpsRecorderModule.emitState(
@@ -697,8 +734,8 @@ class GpsRecorderService : Service(), LocationListener {
         isRecording = false
         handler.removeCallbacks(durationTick)
         handler.removeCallbacks(flushTick)
-        stopLocationUpdates()
-        stopGnssStatusTracking()
+        locationSource.stopLocationUpdates()
+        locationSource.stopGnssStatusTracking()
 
         // Finalize the moving-time accumulator (add the segment from the
         // last resume up to the LAST FIX to movingMs).
@@ -722,10 +759,10 @@ class GpsRecorderService : Service(), LocationListener {
         // Final flush + finalize the GPX file.
         //
         // L5 fix: when the buffer is empty (or no segment has ≥ 2 points),
-        // finalizeGpxFile() returns "" — the empty sentinel. In that case we
+        // gpxFileSaver.finalizeGpxFile() returns "" — the empty sentinel. In that case we
         // do NOT recompute distance, do NOT emit 'saved' (no 'GPX СОХРАНЁН'
         // toast, no file in Downloads/trck/), and just emit the stopped state.
-        val savedFilePath = finalizeGpxFile()
+        val savedFilePath = gpxFileSaver.finalizeGpxFile()
         val savedOk = savedFilePath.isNotEmpty()
 
         // Recompute the final distance from the SAVED GPX file so the value
@@ -742,20 +779,20 @@ class GpsRecorderService : Service(), LocationListener {
         // memory segments) so we capture whatever smoothing / filtering was
         // applied at finalize time. On failure we fall back to -1.0, which
         // the JS side interprets as "keep the live-accumulated distance".
-        val finalDistanceM = if (savedOk) recomputeDistanceFromSavedGpx(savedFilePath) else -1.0
+        val finalDistanceM = if (savedOk) gpxFileSaver.recomputeDistanceFromSavedGpx(savedFilePath) else -1.0
 
         // Clear persisted state
         clearPersistedState()
 
         // Release wakelock
-        releaseWakeLock()
+        wakeLockManager.release()
 
         // Tell JS (if alive) that we saved a file. Include the final distance
         // so the UI can show the post-save, post-smoothing track length
         // instead of the live-accumulated value.
         //
         // L5 fix: only emit 'saved' when we actually wrote a file. The empty
-        // sentinel means finalizeGpxFile() bailed out early because the buffer
+        // sentinel means gpxFileSaver.finalizeGpxFile() bailed out early because the buffer
         // was empty — emitting a 'saved' event in that case would make the UI
         // flash a 'GPX СОХРАНЁН' card with no real file behind it.
         if (savedOk) {
@@ -793,140 +830,13 @@ class GpsRecorderService : Service(), LocationListener {
      * the service down, leaving the UI showing "recording" on a stopped
      * service and an orphan temp file in `externalCacheDir`.
      */
-    private fun startLocationUpdates(): Boolean {
-        if (locationManager == null) {
-            locationManager = getSystemService(LOCATION_SERVICE) as LocationManager
-        }
-        val lm = locationManager ?: run {
-            Log.e(TAG, "No LocationManager")
-            GpsRecorderModule.emitError("Location service unavailable", fatal = true)
-            stopRecording()
-            return false
-        }
 
-        // Check permissions
-        if (ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION)
-            != PackageManager.PERMISSION_GRANTED
-        ) {
-            Log.e(TAG, "No FINE_LOCATION permission")
-            GpsRecorderModule.emitError("Location permission not granted", fatal = true)
-            stopRecording()
-            return false
-        }
-
-        // Prefer GPS provider, fall back to network if needed
-        val providers = mutableListOf<String>()
-        if (lm.isProviderEnabled(LocationManager.GPS_PROVIDER)) {
-            providers.add(LocationManager.GPS_PROVIDER)
-        }
-        if (lm.isProviderEnabled(LocationManager.NETWORK_PROVIDER)) {
-            providers.add(LocationManager.NETWORK_PROVIDER)
-        }
-        if (providers.isEmpty()) {
-            Log.e(TAG, "No location provider enabled")
-            GpsRecorderModule.emitError(
-                "No location provider enabled. Please enable location in settings.",
-                fatal = true
-            )
-            stopRecording()
-            return false
-        }
-
-        for (p in providers) {
-            try {
-                lm.requestLocationUpdates(p, MIN_TIME_MS, MIN_DISTANCE_M, this, Looper.getMainLooper())
-                Log.i(TAG, "Requested location updates from $p")
-            } catch (e: SecurityException) {
-                Log.e(TAG, "SecurityException requesting updates from $p", e)
-            } catch (e: IllegalArgumentException) {
-                Log.e(TAG, "IllegalArg requesting updates from $p", e)
-            }
-        }
-
-        // NOTE: We deliberately do NOT seed from lm.getLastKnownLocation() here.
-        //
-        // The previous version did:
-        //     val last = lm.getLastKnownLocation(GPS_PROVIDER) ?: getLastKnownLocation(NETWORK_PROVIDER)
-        //     if (last != null) onLocationChanged(last)
-        //
-        // That call returns whatever fix the OS happens to have cached, which is
-        // frequently STALE — e.g. a fix from 30+ seconds ago when the user was a
-        // few meters away from where they are now. That stale fix would be added
-        // to pointBuffer and become prevLat/prevLon with no distance added (prev
-        // was null). When the first FRESH fix arrived a moment later, the
-        // Haversine distance from the stale prev to the fresh fix would be added
-        // to totalDistanceM — producing the "starts with 9 m / 69 m" bug the user
-        // reported.
-        //
-        // The always-on GNSS monitor in GpsRecorderModule already seeds the UI
-        // with fix status as soon as the app opens, so removing this seed does
-        // not degrade UX. The service simply waits for the first real fix from
-        // requestLocationUpdates() above, which is guaranteed to be fresh.
-        return true
-    }
-
-    private fun stopLocationUpdates() {
-        locationManager?.removeUpdates(this)
-    }
 
     // ------------------------------------------------------------------
     // GNSS status (satellite count for fix-type display)
     // ------------------------------------------------------------------
 
-    /**
-     * Registers a GnssStatus callback to track how many satellites are used in
-     * the current fix. Used by [computeFixType] to distinguish 2D vs 3D fixes.
-     */
-    private fun startGnssStatusTracking() {
-        val lm = locationManager ?: return
-        if (gnssStatusCallback != null) return  // already registered
-        val cb = object : GnssStatus.Callback() {
-            override fun onSatelliteStatusChanged(status: GnssStatus) {
-                var used = 0
-                for (i in 0 until status.satelliteCount) {
-                    if (status.usedInFix(i)) used++
-                }
-                satellitesUsed = used
-                // Persist so JS can poll via getState() even without a new location event.
-                try {
-                    getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-                        .edit()
-                        .putInt(KEY_SATELLITES_USED, used)
-                        .putString(KEY_FIX_TYPE, computeFixType())
-                        .apply()
-                } catch (e: Exception) {
-                    Log.w(TAG, "Failed to persist GNSS status", e)
-                }
-            }
 
-            override fun onStarted() {
-                Log.i(TAG, "GNSS engine started")
-            }
-
-            override fun onStopped() {
-                Log.i(TAG, "GNSS engine stopped")
-                satellitesUsed = 0
-            }
-        }
-        try {
-            lm.registerGnssStatusCallback(cb, Handler(Looper.getMainLooper()))
-            gnssStatusCallback = cb
-            Log.i(TAG, "Registered GNSS status callback")
-        } catch (e: Exception) {
-            Log.w(TAG, "registerGnssStatusCallback failed", e)
-        }
-    }
-
-    private fun stopGnssStatusTracking() {
-        val cb = gnssStatusCallback ?: return
-        try {
-            locationManager?.unregisterGnssStatusCallback(cb)
-        } catch (e: Exception) {
-            Log.w(TAG, "unregisterGnssStatusCallback failed", e)
-        }
-        gnssStatusCallback = null
-        satellitesUsed = 0
-    }
 
     // ------------------------------------------------------------------
     // Phase 2/3/4: segmented buffer, auto-pause, gap-detection helpers
@@ -1361,7 +1271,7 @@ class GpsRecorderService : Service(), LocationListener {
                 saveLiveState(pt)
                 GpsRecorderModule.emitLocation(
                     pt.lat, pt.lon, pt.alt, pt.speed, pt.accuracy,
-                    computeFixType(), totalDistanceM, pt.timeMs, pointCount,
+                    locationSource.computeFixType(lastFixTimeMs), totalDistanceM, pt.timeMs, pointCount,
                     isAutoPaused, signalLost, liveMovingMs(pt.timeMs)
                 )
                 return
@@ -1432,7 +1342,7 @@ class GpsRecorderService : Service(), LocationListener {
                             saveLiveState(pt)
                             GpsRecorderModule.emitLocation(
                                 pt.lat, pt.lon, pt.alt, pt.speed, pt.accuracy,
-                                computeFixType(), totalDistanceM, pt.timeMs, pointCount,
+                                locationSource.computeFixType(lastFixTimeMs), totalDistanceM, pt.timeMs, pointCount,
                                 isAutoPaused, signalLost, liveMovingMs(pt.timeMs)
                             )
                             return
@@ -1453,7 +1363,7 @@ class GpsRecorderService : Service(), LocationListener {
                         saveLiveState(pt)
                         GpsRecorderModule.emitLocation(
                             pt.lat, pt.lon, pt.alt, pt.speed, pt.accuracy,
-                            computeFixType(), totalDistanceM, pt.timeMs, pointCount,
+                            locationSource.computeFixType(lastFixTimeMs), totalDistanceM, pt.timeMs, pointCount,
                             isAutoPaused, signalLost, liveMovingMs(pt.timeMs)
                         )
                         return
@@ -1490,7 +1400,7 @@ class GpsRecorderService : Service(), LocationListener {
                 saveLiveState(pt)
                 GpsRecorderModule.emitLocation(
                     pt.lat, pt.lon, pt.alt, pt.speed, pt.accuracy,
-                    computeFixType(), totalDistanceM, pt.timeMs, pointCount,
+                    locationSource.computeFixType(lastFixTimeMs), totalDistanceM, pt.timeMs, pointCount,
                     isAutoPaused, signalLost, liveMovingMs(pt.timeMs)
                 )
                 notifier.updateNotification(
@@ -1526,7 +1436,7 @@ class GpsRecorderService : Service(), LocationListener {
                 saveLiveState(pt)
                 GpsRecorderModule.emitLocation(
                     pt.lat, pt.lon, pt.alt, pt.speed, pt.accuracy,
-                    computeFixType(), totalDistanceM, pt.timeMs, pointCount,
+                    locationSource.computeFixType(lastFixTimeMs), totalDistanceM, pt.timeMs, pointCount,
                     isAutoPaused, signalLost, liveMovingMs(pt.timeMs)
                 )
                 notifier.updateNotification(
@@ -1579,7 +1489,7 @@ class GpsRecorderService : Service(), LocationListener {
                     saveLiveState(pt)
                     GpsRecorderModule.emitLocation(
                         pt.lat, pt.lon, pt.alt, pt.speed, pt.accuracy,
-                        computeFixType(), totalDistanceM, pt.timeMs, pointCount,
+                        locationSource.computeFixType(lastFixTimeMs), totalDistanceM, pt.timeMs, pointCount,
                         isAutoPaused, signalLost, liveMovingMs(pt.timeMs)
                     )
                     notifier.updateNotification(
@@ -1601,7 +1511,7 @@ class GpsRecorderService : Service(), LocationListener {
                         saveLiveState(pt)
                         GpsRecorderModule.emitLocation(
                             pt.lat, pt.lon, pt.alt, pt.speed, pt.accuracy,
-                            computeFixType(), totalDistanceM, pt.timeMs, pointCount,
+                            locationSource.computeFixType(lastFixTimeMs), totalDistanceM, pt.timeMs, pointCount,
                             isAutoPaused, signalLost, liveMovingMs(pt.timeMs)
                         )
                         notifier.updateNotification(
@@ -1646,7 +1556,7 @@ class GpsRecorderService : Service(), LocationListener {
                         saveLiveState(pt)
                         GpsRecorderModule.emitLocation(
                             pt.lat, pt.lon, pt.alt, pt.speed, pt.accuracy,
-                            computeFixType(), totalDistanceM, pt.timeMs, pointCount,
+                            locationSource.computeFixType(lastFixTimeMs), totalDistanceM, pt.timeMs, pointCount,
                             isAutoPaused, signalLost, liveMovingMs(pt.timeMs)
                         )
                         notifier.updateNotification(
@@ -1698,7 +1608,7 @@ class GpsRecorderService : Service(), LocationListener {
                         saveLiveState(pt)
                         GpsRecorderModule.emitLocation(
                             pt.lat, pt.lon, pt.alt, pt.speed, pt.accuracy,
-                            computeFixType(), totalDistanceM, pt.timeMs, pointCount,
+                            locationSource.computeFixType(lastFixTimeMs), totalDistanceM, pt.timeMs, pointCount,
                             isAutoPaused, signalLost, liveMovingMs(pt.timeMs)
                         )
                         notifier.updateNotification(
@@ -1733,7 +1643,7 @@ class GpsRecorderService : Service(), LocationListener {
         // second-by-second. See CHANGELOG.md.
         GpsRecorderModule.emitLocation(
             pt.lat, pt.lon, pt.alt, pt.speed, pt.accuracy,
-            computeFixType(), totalDistanceM, pt.timeMs, pointCount,
+            locationSource.computeFixType(lastFixTimeMs), totalDistanceM, pt.timeMs, pointCount,
             isAutoPaused, signalLost, liveMovingMs(pt.timeMs)
         )
         notifier.updateNotification(
@@ -1821,138 +1731,7 @@ class GpsRecorderService : Service(), LocationListener {
         prevTimeMs = pt.timeMs
     }
 
-    /**
-     * Recomputes the total track length (meters) by parsing the SAVED GPX
-     * file and summing haversine distances between consecutive <trkpt> within
-     * each <trkseg>. Points are NOT filtered here — whatever made it into the
-     * file is what we sum, so the result matches what an external importer
-     * (Strava, etc.) would compute.
-     *
-     * Used by [stopRecording] to give the JS UI a post-save distance that
-     * reflects Gaussian smoothing (which shortens the track slightly) and /
-     * or on-the-fly filtering. Falls back to -1.0 on any error so the caller
-     * can signal "use the live-accumulated distance instead".
-     *
-     * The `savedPath` argument is the string returned by [finalizeGpxFile]:
-     * either a MediaStore-relative path like "Downloads/trck/foo.gpx", a
-     * legacy absolute path, or a "Cache fallback: ..." / "Save failed: ..."
-     * message. We only attempt to open it as a real file when it looks like
-     * a path; otherwise we return -1.0.
-     *
-     * L13 fix: on API 29+ (scoped storage), the MediaStore-relative path
-     * CANNOT be resolved via Environment.getExternalStoragePublicDirectory()
-     * — the public Downloads directory accessed via Environment is not the
-     * same as the MediaStore-scoped Downloads. The file.exists() check used
-     * to return false even though the file was just written, causing
-     * finalDistanceM to fall back to -1.0 and the UI to show the live-
-     * accumulated distance instead of the post-smoothing true length.
-     *
-     * We now read the MediaStore URI (persisted by [saveViaMediaStore] under
-     * KEY_LAST_SAVED_URI) and open the file via contentResolver.openInputStream.
-     * The legacy File fallback is kept for API < 29.
-     */
-    private fun recomputeDistanceFromSavedGpx(savedPath: String): Double {
-        try {
-            // L13 fix: prefer the persisted MediaStore URI on API 29+.
-            val savedUriStr = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-                .getString(KEY_LAST_SAVED_URI, null)
-            // L30 fix: use the shared XmlPullParser helper instead of regex.
-            // The helper accepts an InputStream, so we open the appropriate
-            // stream (ContentResolver for MediaStore URI, FileInputStream for
-            // legacy File paths) and pass it in.
-            val parseResult: GpxIO.GpxParseResult = if (savedUriStr != null) {
-                try {
-                    val uri = android.net.Uri.parse(savedUriStr)
-                    val parsed = contentResolver.openInputStream(uri)?.use { GpxIO.parseGpxSegments(it) }
-                        ?: run {
-                            Log.w(TAG, "recomputeDistanceFromSavedGpx: openInputStream returned null for $savedUriStr")
-                            return -1.0
-                        }
-                    parsed
-                } catch (e: Exception) {
-                    Log.w(TAG, "recomputeDistanceFromSavedGpx: failed to open URI $savedUriStr", e)
-                    return -1.0
-                }
-            } else {
-                // Legacy File fallback (API < 29) or path-based resolution.
-                val file: File? = when {
-                    savedPath.startsWith("Downloads/trck/") -> {
-                        val downloads = Environment.getExternalStoragePublicDirectory(
-                            Environment.DIRECTORY_DOWNLOADS
-                        )
-                        File(downloads, "trck/${savedPath.removePrefix("Downloads/trck/")}")
-                    }
-                    savedPath.startsWith("/") -> File(savedPath)
-                    savedPath.startsWith("Cache fallback: ") ->
-                        File(savedPath.removePrefix("Cache fallback: "))
-                    else -> null
-                }
-                if (file == null || !file.exists()) {
-                    Log.w(TAG, "recomputeDistanceFromSavedGpx: cannot resolve path '$savedPath'")
-                    return -1.0
-                }
-                file.inputStream().use { GpxIO.parseGpxSegments(it) }
-            }
-            // Parse each <trkseg> independently and sum intra-segment
-            // distances. Inter-segment jumps (across pauses / gaps) are NOT
-            // counted — they're not real movement.
-            var total = 0.0
-            var parsed = 0
-            for (seg in parseResult.segments) {
-                var prevLat: Double? = null
-                var prevLon: Double? = null
-                for (p in seg.points) {
-                    parsed++
-                    val pLat = prevLat
-                    val pLon = prevLon
-                    if (pLat != null && pLon != null) {
-                        total += TrackMath.haversineMeters(pLat, pLon, p.lat, p.lon)
-                    }
-                    prevLat = p.lat
-                    prevLon = p.lon
-                }
-            }
-            Log.i(TAG, "recomputeDistanceFromSavedGpx: parsed=$parsed total=${total}m from $savedPath (uri=${savedUriStr != null})")
-            return total
-        } catch (e: Exception) {
-            // L10 fix: non-fatal error. The recording has already been saved
-            // successfully (this function is called AFTER the GPX file is
-            // written). The UI falls back to the live-accumulated distance
-            // (finalDistanceM = -1.0). Do NOT reset the UI to idle — the
-            // user's recording is intact.
-            Log.w(TAG, "recomputeDistanceFromSavedGpx failed for '$savedPath'", e)
-            GpsRecorderModule.emitError(
-                "Could not recompute distance from saved GPX file; showing live distance instead.",
-                fatal = false
-            )
-            return -1.0
-        }
-    }
 
-    /**
-     * Determines the GNSS fix type from the satellite count and fix recency:
-     *  - "no fix" — no recent fix, or fewer than 3 satellites used in fix
-     *    (a real 2D fix requires ≥3 satellites; 1–2 sats cannot produce a
-     *    position solution)
-     *  - "2D fix" — exactly 3 satellites used (lat/lon only)
-     *  - "3D fix" — 4+ satellites used (lat/lon + altitude)
-     *
-     * L16 fix: previously 1–3 satellites were reported as "2D fix", but a
-     * real 2D fix requires ≥3 satellites — with 1–2 sats no position
-     * solution exists, so the UI should say "no fix".
-     *
-     * Falls back to using Location.hasAltitude() if satellite info isn't available.
-     */
-    private fun computeFixType(): String {
-        val now = System.currentTimeMillis()
-        val recentFix = lastFixTimeMs > 0 && (now - lastFixTimeMs) < NO_FIX_TIMEOUT_MS
-        if (!recentFix) return "no fix"
-        return when {
-            satellitesUsed >= 4 -> "3D fix"
-            satellitesUsed == 3 -> "2D fix"
-            else -> "no fix"
-        }
-    }
 
     /**
      * Writes the current recording state + last fix to SharedPreferences.
@@ -1979,8 +1758,8 @@ class GpsRecorderService : Service(), LocationListener {
             prefs.putLong(KEY_START_TIME, startTimeMs)
             prefs.putInt(KEY_POINT_COUNT, pointCount)
             prefs.putString(KEY_TOTAL_DISTANCE, totalDistanceM.toString())
-            prefs.putString(KEY_FIX_TYPE, computeFixType())
-            prefs.putInt(KEY_SATELLITES_USED, satellitesUsed)
+            prefs.putString(KEY_FIX_TYPE, locationSource.computeFixType(lastFixTimeMs))
+            prefs.putInt(KEY_SATELLITES_USED, locationSource.satellitesUsed)
             // Phase 1/3/4: persist auto-pause / signal-lost / moving-time so
             // JS can poll via getState() and survive service restarts.
             prefs.putBoolean(KEY_IS_AUTO_PAUSED, isAutoPaused)
@@ -2097,41 +1876,12 @@ class GpsRecorderService : Service(), LocationListener {
     // Wakelock
     // ------------------------------------------------------------------
 
-    private fun acquireWakeLock() {
-        if (wakeLock?.isHeld == true) return
-        val pm = getSystemService(POWER_SERVICE) as PowerManager
-        wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "trck:Recording")
-        wakeLock?.setReferenceCounted(false)
-        try {
-            // L34 fix: NO timeout. The previous 6-hour timeout meant that
-            // for hikes longer than 6 hours (ultra-marathons, multi-day
-            // backpacking), the wakelock was released mid-recording and the
-            // CPU could sleep, causing GPS fixes to stop. We rely on
-            // releaseWakeLock() in stopRecording / onDestroy to free the
-            // wakelock when the recording actually ends.
-            wakeLock?.acquire()
-            Log.i(TAG, "Wakelock acquired (no timeout — relies on stopRecording / onDestroy to release)")
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to acquire wakelock", e)
-        }
-    }
 
-    private fun releaseWakeLock() {
-        try {
-            if (wakeLock?.isHeld == true) {
-                wakeLock?.release()
-                Log.i(TAG, "Wakelock released")
-            }
-        } catch (e: Exception) {
-            Log.w(TAG, "releaseWakeLock", e)
-        }
-        wakeLock = null
-    }
 
     private fun cleanupGpsAndWakeLock() {
-        stopLocationUpdates()
-        stopGnssStatusTracking()
-        releaseWakeLock()
+        locationSource.stopLocationUpdates()
+        locationSource.stopGnssStatusTracking()
+        wakeLockManager.release()
         handler.removeCallbacks(durationTick)
         handler.removeCallbacks(flushTick)
     }
@@ -2140,11 +1890,6 @@ class GpsRecorderService : Service(), LocationListener {
     // GPX file writing
     // ------------------------------------------------------------------
 
-    private fun getTempFile(): File {
-        val name = tempFileName ?: "gps_temp_unknown.gpx"
-        // Use app's external cache dir for temp file (no permission needed)
-        return File(externalCacheDir ?: cacheDir, name)
-    }
 
     /**
      * Reads the post-process setting from the SEPARATE settings prefs file.
@@ -2155,7 +1900,7 @@ class GpsRecorderService : Service(), LocationListener {
 
     /**
      * Reads the Gaussian-smoothing setting from the SEPARATE settings prefs file.
-     * When enabled, finalizeGpxFile() will (after writing the raw / on-the-fly-
+     * When enabled, gpxFileSaver.finalizeGpxFile() will (after writing the raw / on-the-fly-
      * filtered GPX file) read it back, apply a Gaussian kernel smoother to the
      * lat/lon coordinates, and overwrite the file with the smoothed track.
      *
@@ -2187,7 +1932,7 @@ class GpsRecorderService : Service(), LocationListener {
 
     /**
      * Reads the Douglas-Peucker post-processing setting. When enabled,
-     * finalizeGpxFile() — AFTER writing the raw / on-the-fly-filtered GPX
+     * gpxFileSaver.finalizeGpxFile() — AFTER writing the raw / on-the-fly-filtered GPX
      * file AND after Gaussian smoothing (if that is also enabled) — reads
      * the file back, applies Douglas-Peucker to each <trkseg> independently,
      * and overwrites the file with the simplified track.
@@ -2196,463 +1941,21 @@ class GpsRecorderService : Service(), LocationListener {
 
     private fun getDouglasPeuckerEpsilonM(): Double = GpsRecorderSettings.getDouglasPeuckerEpsilonM(this)
 
-    /**
-     * Writes the GPX header + opening <trk> + <name> + first opening <trkseg>
-     * to the temp file, replacing any previous content. The temp file lives
-     * in the app's cache dir so it survives the JS app being killed but is
-     * private to the app.
-     *
-     * L26 fix: this is now the FIRST write of the append-only strategy. We
-     * open the first <trkseg> here so subsequent flushes can just append
-     * <trkpt> elements. Segment boundaries (</trkseg><trkseg>) are appended
-     * on the fly as new segments appear in memory. Closing tags
-     * (</trkseg></trk></gpx>) are written at the end of every flush so the
-     * temp file is always a complete, parseable GPX document (recoverable
-     * on crash).
-     */
-    private fun writeGpxHeaderToTempFile() {
-        try {
-            val f = getTempFile()
-            FileOutputStream(f).use { out ->
-                out.write(GpxIO.gpxHeader().toByteArray(Charsets.UTF_8))
-                out.write("  <trk>\n    <name>GPS Recording</name>\n".toByteArray(Charsets.UTF_8))
-                // L26 fix: open the first <trkseg> here. flushToTempFile()
-                // appends points + segment boundaries, then re-appends the
-                // closing tags.
-                out.write("    <trkseg>\n".toByteArray(Charsets.UTF_8))
-                out.write(GpxIO.TEMP_FILE_CLOSING_TAGS_BYTES)
-            }
-            tempFileInitialized = true
-            tempFileFlushedSegments = 1  // one <trkseg> opened
-            tempFileFlushedCurrentSize = 0
-        } catch (e: Exception) {
-            Log.e(TAG, "writeGpxHeaderToTempFile failed", e)
-            tempFileInitialized = false
-        }
-    }
-
-    /**
-     * L26 helper: truncates the trailing closing tags (</trkseg></trk></gpx>)
-     * from the temp file so we can append new points / segment breaks.
-     * Uses RandomAccessFile.setLength for O(1) truncate. If the file is
-     * shorter than the closing tags (shouldn't happen, but be defensive),
-     * we fall back to a full rewrite via serializeSegmentsToGpx.
-     */
-    private fun truncateTempFileClosingTags(f: File): Boolean {
-        return try {
-            val len = f.length()
-            if (len < GpxIO.TEMP_FILE_CLOSING_TAGS_BYTES.size) {
-                // File is too short — fall back to full rewrite.
-                Log.w(TAG, "truncateTempFileClosingTags: file too short ($len bytes) — falling back to full rewrite")
-                return false
-            }
-            RandomAccessFile(f, "rw").use { raf ->
-                raf.setLength(len - GpxIO.TEMP_FILE_CLOSING_TAGS_BYTES.size)
-            }
-            true
-        } catch (e: Exception) {
-            Log.w(TAG, "truncateTempFileClosingTags failed — falling back to full rewrite", e)
-            false
-        }
-    }
-
-    /**
-     * L26 fallback: if the append-only strategy fails for any reason
-     * (file deleted externally, IO error, state corruption), fall back to
-     * the original full-rewrite strategy. This is slower (O(n²) over the
-     * recording) but always produces a correct temp file.
-     */
-    private fun fullRewriteTempFile() {
-        try {
-            val content = GpxIO.serializeSegmentsToGpx("GPS Recording", segmentsSnapshot())
-            val f = getTempFile()
-            FileOutputStream(f).use { out ->
-                out.write(content.toByteArray(Charsets.UTF_8))
-            }
-            // Reset the append-only state so the next flush starts fresh.
-            // The full-rewrite content already has all closing tags, so the
-            // next flush will need to truncate them before appending.
-            val segments = segmentsSnapshot()
-            tempFileInitialized = true
-            tempFileFlushedSegments = segments.size  // all segments are in the file
-            tempFileFlushedCurrentSize = segments.lastOrNull()?.size ?: 0
-        } catch (e: Exception) {
-            Log.e(TAG, "fullRewriteTempFile failed", e)
-        }
-    }
-
-
-    /**
-     * Flushes the current in-memory points to the temp file.
-     *
-     * L26 fix: APPEND-ONLY strategy. The previous version rewrote the entire
-     * temp file (header + all points + footer) on every flush — O(n²) over
-     * the recording. For a 3-hour walk at 1 Hz (~10 800 points), that meant
-     * rewriting a multi-MB file ~2 160 times.
-     *
-     * The new strategy:
-     *   1. On startRecording: write header + <trk> + <name> + first <trkseg> + closing tags.
-     *   2. On each flush: truncate closing tags, append new <trkpt> elements,
-     *      append closing tags. If new segments have appeared since the last
-     *      flush, append </trkseg><trkseg> boundaries between them.
-     *   3. The temp file is ALWAYS a complete, parseable GPX document
-     *      (closing tags are re-written at the end of every flush) so
-     *      reloadPointsFromTempFile() can parse it on crash recovery.
-     *
-     * If anything goes wrong (file deleted externally, IO error, state
-     * corruption), we fall back to the original full-rewrite via
-     * [fullRewriteTempFile].
-     */
-    private fun flushToTempFile() {
-        try {
-            val f = getTempFile()
-            // If the file doesn't exist or hasn't been initialized, do a
-            // full rewrite to (re)establish the header.
-            if (!tempFileInitialized || !f.exists()) {
-                fullRewriteTempFile()
-                return
-            }
-
-            val snapshot = segmentsSnapshot()  // [seg0, ..., segN-1, currentSeg]
-            val totalSegments = snapshot.size
-
-            // If we have more segments than we've flushed, we need to open
-            // new <trkseg> blocks for each one. The first new segment closes
-            // the previously-open <trkseg> (which held the now-finalized
-            // segment's points). Each subsequent new segment just opens
-            // another <trkseg>.
-            val sb = StringBuilder()
-            var openedNewSegments = false
-            if (totalSegments > tempFileFlushedSegments) {
-                // Close the previous open <trkseg> and open new ones for
-                // each new segment. The first close corresponds to the
-                // (previously-current) segment at index tempFileFlushedSegments-1;
-                // each subsequent open corresponds to a new segment.
-                for (i in tempFileFlushedSegments until totalSegments) {
-                    sb.append("    </trkseg>\n")  // close previous
-                    sb.append("    <trkseg>\n")    // open new
-                }
-                openedNewSegments = true
-                tempFileFlushedSegments = totalSegments
-                tempFileFlushedCurrentSize = 0  // new currentSegment, no points flushed yet
-            }
-
-            // Append new points from the current segment (the last in snapshot).
-            val currentPoints = snapshot.lastOrNull() ?: emptyList()
-            if (currentPoints.size > tempFileFlushedCurrentSize) {
-                for (i in tempFileFlushedCurrentSize until currentPoints.size) {
-                    sb.append(GpxIO.formatGpxPoint(currentPoints[i]))
-                }
-                tempFileFlushedCurrentSize = currentPoints.size
-            }
-
-            // If we have nothing to append, skip the truncate+write cycle.
-            if (!openedNewSegments && sb.isEmpty()) return
-
-            // Truncate closing tags, append new content, re-append closing tags.
-            if (!truncateTempFileClosingTags(f)) {
-                fullRewriteTempFile()
-                return
-            }
-            sb.append(GpxIO.TEMP_FILE_CLOSING_TAGS)
-            // "true" = append mode (don't overwrite).
-            FileOutputStream(f, /* append = */ true).use { out ->
-                out.write(sb.toString().toByteArray(Charsets.UTF_8))
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "flushToTempFile failed (append-only) — falling back to full rewrite", e)
-            fullRewriteTempFile()
-        }
-    }
-
-    /**
-     * Finalizes the GPX file: writes a complete GPX file (header + all buffered
-     * points + footer) and saves it to the public Downloads folder.
-     *
-     * Track filtering now happens ON-THE-FLY inside [onLocationChanged]: when the
-     * setting is enabled the buffer only ever holds clean, validated points, so
-     * there is nothing left to post-process here and the heavy offline parser is
-     * bypassed (we always pass postProcess = false to the save routines). When the
-     * setting is disabled the buffer holds the raw fixes, which is exactly what we
-     * want to persist as the fallback.
-     *
-     * On API >= 29 we use MediaStore.Downloads so the file is visible to other apps.
-     * On older APIs we write directly to Environment.DIRECTORY_DOWNLOADS.
-     *
-     * Returns the human-readable path/URI of the saved file.
-     */
-    private fun finalizeGpxFile(): String {
-        val segments = segmentsSnapshot()
-        val totalPoints = segments.sumOf { it.size }
-
-        // L5 fix: do NOT write an empty GPX file to Downloads/trck/. This
-        // can happen if startLocationUpdates() failed and stopRecording()
-        // was called before any fix arrived (defensive — L1 should already
-        // prevent this, but a separate guard here means a future code path
-        // that calls finalizeGpxFile on an empty buffer can't introduce the
-        // bug back). We also require at least one segment with ≥ 2 points —
-        // a single 1-point segment can't form a line and is useless to GPX
-        // consumers (Strava, OSM, etc.). The temp file IS deleted so no
-        // orphan is left behind.
-        //
-        // Return early WITHOUT emitting a 'saved' event — the caller
-        // (stopRecording) checks for the empty-path sentinel and skips
-        // emitSaved(...) so the UI does not show a 'GPX СОХРАНЁН' toast.
-        val hasUsableSegment = segments.any { it.size >= 2 }
-        if (totalPoints == 0 || !hasUsableSegment) {
-            Log.i(TAG, "Skipping finalize: empty buffer (totalPoints=$totalPoints)")
-            try { getTempFile().delete() } catch (_: Exception) {}
-            return ""
-        }
-
-        val timestamp = GpxIO.FILENAME_SDF.format(Date(startTimeMs))
-        val fileName = "trck_$timestamp.gpx"
-
-        // Phase 5: serialize with one <trkseg> per segment so pauses / gaps
-        // appear as clean segment breaks in the final file.
-        val rawGpxContent = GpxIO.serializeSegmentsToGpx("GPS Recording $timestamp", segmentsSnapshot())
-
-        val rawBytes = rawGpxContent.toByteArray(Charsets.UTF_8)
-        // On-the-fly filtering (if enabled) was already applied in onLocationChanged,
-        // so the buffer is clean by this point. The optional finalize-time steps are:
-        //   1. Gaussian kernel smoothing (controlled by its own setting).
-        //   2. Douglas-Peucker simplification (controlled by its own setting).
-        // They chain in that order: Gaussian first (to suppress single-fix
-        // glitches), then DP (to decimate the smoothed track). Either can be
-        // enabled on its own.
-        val doGaussian = isGaussianSmoothingEnabled()
-        val doDouglasPeucker = isDouglasPeuckerEnabled()
-        val dpEpsilon = getDouglasPeuckerEpsilonM()
-        Log.i(
-            TAG,
-            "finalizeGpxFile: segments=${segments.size} points=$totalPoints" +
-                " onTheFlyFilter=${isPostProcessEnabled()} gaussianSmoothing=$doGaussian" +
-                " douglasPeucker=$doDouglasPeucker dpEpsilon=${dpEpsilon}m" +
-                " radialFilter=${isRadialDistanceFilterEnabled()}" +
-                " timeSampling=${isTimeSamplingEnabled()}" +
-                " autoPause=${isAutoPauseEnabled()}"
-        )
-
-        return try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                saveViaMediaStore(
-                    fileName, rawBytes,
-                    gaussianSmooth = doGaussian,
-                    douglasPeucker = doDouglasPeucker,
-                    douglasPeuckerEpsilon = dpEpsilon
-                )
-            } else {
-                saveViaLegacyFile(
-                    fileName, rawBytes,
-                    gaussianSmooth = doGaussian,
-                    douglasPeucker = doDouglasPeucker,
-                    douglasPeuckerEpsilon = dpEpsilon
-                )
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "finalizeGpxFile failed; falling back to cache", e)
-            // Last resort: write to cache and return its path (raw only, no smoothing)
-            try {
-                val f = File(externalCacheDir ?: cacheDir, fileName)
-                FileOutputStream(f).use { it.write(rawBytes) }
-                "Cache fallback: ${f.absolutePath}"
-            } catch (e2: Exception) {
-                Log.e(TAG, "Even cache fallback failed", e2)
-                "Save failed: ${e2.message}"
-            }
-        } finally {
-            // Clean up the temp file
-            try { getTempFile().delete() } catch (_: Exception) {}
-        }
-    }
-
-    private fun saveViaMediaStore(
-        fileName: String,
-        rawBytes: ByteArray,
-        gaussianSmooth: Boolean = false,
-        douglasPeucker: Boolean = false,
-        douglasPeuckerEpsilon: Double = 5.0
-    ): String {
-        val resolver = contentResolver
-        val values = android.content.ContentValues().apply {
-            put(MediaStore.MediaColumns.DISPLAY_NAME, fileName)
-            put(MediaStore.MediaColumns.MIME_TYPE, "application/gpx+xml")
-            // Put it under Downloads/trck/ so it's easy to find.
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/trck")
-                put(MediaStore.MediaColumns.IS_PENDING, 1)
-            }
-        }
-        val collection = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            MediaStore.Downloads.EXTERNAL_CONTENT_URI
-        } else {
-            MediaStore.Files.getContentUri("external")
-        }
-        val uri = resolver.insert(collection, values)
-            ?: throw java.io.IOException("MediaStore insert returned null")
-        try {
-            // Step 1: write the RAW data to the file.
-            resolver.openOutputStream(uri)?.use { out: OutputStream ->
-                out.write(rawBytes)
-                out.flush()
-            } ?: throw java.io.IOException("Cannot open output stream for $uri")
-
-            // Step 2: if any finalize-time post-processor is enabled, read the
-            // raw file back, run the post-processing pipeline (Gaussian then
-            // Douglas-Peucker, in that order), and OVERWRITE the file with the
-            // processed track.
-            if (gaussianSmooth || douglasPeucker) {
-                val rawText = resolver.openInputStream(uri)?.use { it.readBytes() }
-                    ?.toString(Charsets.UTF_8) ?: ""
-                var processed = rawText
-                if (gaussianSmooth) {
-                    processed = try {
-                        GpxPostProcessors.gaussianSmoothGpx(processed)
-                    } catch (e: Exception) {
-                        Log.e(TAG, "gaussianSmoothGpx failed; keeping pre-smoothing content", e)
-                        processed
-                    }
-                }
-                if (douglasPeucker) {
-                    val before = GpxIO.countTrkpt(processed)
-                    processed = try {
-                        GpxPostProcessors.douglasPeuckerGpx(processed, douglasPeuckerEpsilon)
-                    } catch (e: Exception) {
-                        Log.e(TAG, "douglasPeuckerGpx failed; keeping pre-DP content", e)
-                        processed
-                    }
-                    val after = GpxIO.countTrkpt(processed)
-                    Log.i(TAG, "Douglas-Peucker applied (epsilon=${douglasPeuckerEpsilon}m): $before -> $after points")
-                }
-                val processedBytes = processed.toByteArray(Charsets.UTF_8)
-                // "wt" = write-truncate: replaces the file's contents.
-                resolver.openOutputStream(uri, "wt")?.use { out: OutputStream ->
-                    out.write(processedBytes)
-                    out.flush()
-                } ?: throw java.io.IOException("Cannot reopen output stream for $uri (post-process)")
-                Log.i(TAG, "Post-processed GPX written via MediaStore (${processedBytes.size} bytes)")
-            }
-        } finally {
-            // Mark as not pending so it becomes visible, regardless of whether
-            // smoothing succeeded (we always want the file accessible).
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                val done = android.content.ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) }
-                resolver.update(uri, done, null, null)
-            }
-        }
-        // L13 fix: persist the MediaStore URI to SharedPreferences so
-        // recomputeDistanceFromSavedGpx() can open the file via ContentResolver
-        // instead of trying to resolve the MediaStore-relative path through
-        // Environment.getExternalStoragePublicDirectory() (which on scoped
-        // storage points to a different directory than the MediaStore-scoped
-        // Downloads — file.exists() returns false even though we just wrote
-        // the file).
-        try {
-            getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit()
-                .putString(KEY_LAST_SAVED_URI, uri.toString())
-                .apply()
-        } catch (e: Exception) {
-            Log.w(TAG, "Failed to persist last_saved_uri", e)
-        }
-        return "Downloads/trck/$fileName"
-    }
-
-    private fun saveViaLegacyFile(
-        fileName: String,
-        rawBytes: ByteArray,
-        gaussianSmooth: Boolean = false,
-        douglasPeucker: Boolean = false,
-        douglasPeuckerEpsilon: Double = 5.0
-    ): String {
-        @Suppress("DEPRECATION")
-        val downloadsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
-        val targetDir = File(downloadsDir, "trck").apply { if (!exists()) mkdirs() }
-        val f = File(targetDir, fileName)
-        // Step 1: write raw bytes.
-        FileOutputStream(f).use { it.write(rawBytes) }
-        // Step 2: if any finalize-time post-processor is enabled, read back,
-        // run the post-processing pipeline (Gaussian then Douglas-Peucker),
-        // overwrite.
-        if (gaussianSmooth || douglasPeucker) {
-            var processed = f.readText(Charsets.UTF_8)
-            if (gaussianSmooth) {
-                processed = try {
-                    GpxPostProcessors.gaussianSmoothGpx(processed)
-                } catch (e: Exception) {
-                    Log.e(TAG, "gaussianSmoothGpx failed; keeping pre-smoothing content", e)
-                    processed
-                }
-            }
-            if (douglasPeucker) {
-                val before = GpxIO.countTrkpt(processed)
-                processed = try {
-                    GpxPostProcessors.douglasPeuckerGpx(processed, douglasPeuckerEpsilon)
-                } catch (e: Exception) {
-                    Log.e(TAG, "douglasPeuckerGpx failed; keeping pre-DP content", e)
-                    processed
-                }
-                val after = GpxIO.countTrkpt(processed)
-                Log.i(TAG, "Douglas-Peucker applied (epsilon=${douglasPeuckerEpsilon}m): $before -> $after points")
-            }
-            FileOutputStream(f).use { it.write(processed.toByteArray(Charsets.UTF_8)) }
-            Log.i(TAG, "Post-processed GPX written to ${f.absolutePath}")
-        }
-        return f.absolutePath
-    }
-
-    // ------------------------------------------------------------------
 
 
 
 
-
-
-    /**
-     * Lightweight trkpt representation used by the post-processing pipeline.
-     * Carries an [interpolated] flag so synthetic points can be tagged in the
-     * output GPX.
-     */
-    private data class GpxIO.GpxTrkPt(
-        val lat: Double,
-        val lon: Double,
-        val ele: Double?,
-        val speed: Float?,
-        val accuracy: Float?,
-        val timeMs: Long,
-        val interpolated: Boolean = false
-    )
-
-    /**
-     * L30 fix: a parsed GPX segment, used by the new XmlPullParser-based
-     * helper. Each segment is a list of [GpxIO.GpxTrkPt]. Points whose timestamp
-     * could not be parsed (L21) are dropped from this list and counted in
-     * [GpxIO.GpxParseResult.skippedPointCount] so callers can decide whether to
-     * abort.
-     */
-    private data class GpxIO.GpxSegment(val points: List<GpxIO.GpxTrkPt>)
-
-    /**
-     * L30 / L21: result of parsing a GPX document. [segments] holds the
-     * successfully-parsed points grouped by <trkseg>. [skippedPointCount]
-     * is the number of <trkpt> elements that were dropped because their
-     * timestamp (or lat/lon) couldn't be parsed. [totalPointCount] is the
-     * total number of <trkpt> elements seen (parsed + skipped), used by
-     * callers to compute the skip ratio.
-     */
-    private data class GpxIO.GpxParseResult(
-        val segments: List<GpxIO.GpxSegment>,
-        val skippedPointCount: Int,
-        val totalPointCount: Int
-
-
-    // ------------------------------------------------------------------
-    // GPX formatting helpers
-    // ------------------------------------------------------------------
 
 
 
 
     // ------------------------------------------------------------------
+
+
+
+
+
+
     // State persistence (for crash/restart recovery)
     // ------------------------------------------------------------------
 
@@ -2692,6 +1995,7 @@ class GpsRecorderService : Service(), LocationListener {
             startTimeMs = prefs.getLong(KEY_START_TIME, System.currentTimeMillis())
             pointCount = prefs.getInt(KEY_POINT_COUNT, 0)
             tempFileName = prefs.getString(KEY_TEMP_FILE_NAME, null)
+            tempFileBuffer.tempFileName = tempFileName
             totalDistanceM = prefs.getString(KEY_TOTAL_DISTANCE, "0")?.toDoubleOrNull() ?: 0.0
             // Phase 1/3/4: recover auto-pause / signal-lost / moving-time.
             isAutoPaused = prefs.getBoolean(KEY_IS_AUTO_PAUSED, false)
@@ -2729,7 +2033,7 @@ class GpsRecorderService : Service(), LocationListener {
                     " consecutiveMovingFixes=$consecutiveMovingFixes"
             )
             // Try to reload buffered points from the temp file (multi-segment aware).
-            reloadPointsFromTempFile()
+            tempFileBuffer.reloadPointsIntoBuffer()
             // L20 fix: restore rawWindow from the persisted JSON so auto-pause
             // detection can make a correct decision on the first fix after
             // restart (instead of waiting ~10 s for the window to fill).
@@ -2778,109 +2082,13 @@ class GpsRecorderService : Service(), LocationListener {
                 signalLost = signalLost
             )
         ) {
-            releaseWakeLock()
+            wakeLockManager.release()
             GpsRecorderModule.emitError("Не удалось запустить foreground service", fatal = true)
             stopSelf()
         }
         }
     }
 
-    /**
-     * Phase 5: reloads points from the temp file into the segmented buffer.
-     * Each <trkseg> block becomes one segment. The last <trkseg> becomes
-     * `currentSegment` (so newly-recorded points are appended to it); all
-     * earlier <trkseg> blocks become finalized segments in `trackSegments`.
-     *
-     * Legacy temp files with a single <trkseg> are handled correctly (they
-     * become a single currentSegment). Temp files with no <trkseg> at all
-     * (shouldn't happen, but be safe) leave the segments empty.
-     *
-     * L30 fix: uses XmlPullParser instead of regex for robustness against
-     * CDATA, comments, and attribute-order variations.
-     *
-     * L21 fix: points with missing or unparseable timestamps are SKIPPED
-     * (instead of being stamped "now" and corrupting the timeline). If
-     * more than 10% of points have bad timestamps, the reload is aborted
-     * entirely (buffer left empty) — better to start a fresh segment than
-     * to mix garbage into the timeline.
-     */
-    private fun reloadPointsFromTempFile() {
-        try {
-            val f = getTempFile()
-            if (!f.exists()) return
-            val parseResult = f.inputStream().use { GpxIO.parseGpxSegments(it) }
-            // L21 fix: abort if too many points had bad timestamps.
-            if (parseResult.totalPointCount > 0 &&
-                parseResult.skippedPointCount.toDouble() / parseResult.totalPointCount > RELOAD_BAD_TIMESTAMP_ABORT_FRACTION
-            ) {
-                Log.e(
-                    TAG,
-                    "reloadPointsFromTempFile: aborting — ${parseResult.skippedPointCount}/${parseResult.totalPointCount} " +
-                        "points had unparseable timestamps (> ${RELOAD_BAD_TIMESTAMP_ABORT_FRACTION * 100}%). " +
-                        "Buffer left empty; recording will start a fresh segment."
-                )
-                synchronized(pointBufferLock) {
-                    trackSegments.clear()
-                    currentSegment = ArrayList()
-                    pointCount = 0
-                }
-                // L26 fix: reset the append-only state since the buffer is now empty.
-                tempFileInitialized = false
-                tempFileFlushedSegments = 0
-                tempFileFlushedCurrentSize = 0
-                return
-            }
-            if (parseResult.skippedPointCount > 0) {
-                Log.w(
-                    TAG,
-                    "reloadPointsFromTempFile: skipped ${parseResult.skippedPointCount}/${parseResult.totalPointCount} " +
-                        "points with unparseable timestamps — continuing with the rest."
-                )
-            }
-            val parsedSegments = parseResult.segments
-            synchronized(pointBufferLock) {
-                trackSegments.clear()
-                currentSegment = ArrayList()
-                if (parsedSegments.isEmpty()) {
-                    Log.w(TAG, "reloadPointsFromTempFile: no <trkseg> blocks in temp file")
-                    pointCount = 0
-                    // L26 fix: reset the append-only state since the buffer is empty.
-                    tempFileInitialized = false
-                    tempFileFlushedSegments = 0
-                    tempFileFlushedCurrentSize = 0
-                    return
-                }
-                for ((idx, seg) in parsedSegments.withIndex()) {
-                    // Convert GpxIO.GpxTrkPt (post-process representation) back to
-                    // GpsPoint (recording buffer representation) — same fields.
-                    val asGpsPoints = ArrayList<GpsPoint>(seg.points.size)
-                    for (p in seg.points) {
-                        asGpsPoints.add(GpsPoint(p.lat, p.lon, p.ele, p.speed, p.accuracy, p.timeMs))
-                    }
-                    if (idx == parsedSegments.size - 1) {
-                        currentSegment = asGpsPoints
-                    } else {
-                        trackSegments.add(asGpsPoints)
-                    }
-                }
-                pointCount = totalPointCount()
-            }
-            // L26 fix: sync the append-only state with what's now in the file.
-            // The temp file already contains all segments + closing tags (it was
-            // written by the previous process before the kill). Future flushes
-            // will truncate closing tags and append new points.
-            tempFileInitialized = true
-            tempFileFlushedSegments = parsedSegments.size
-            tempFileFlushedCurrentSize = parsedSegments.lastOrNull()?.points?.size ?: 0
-            Log.i(
-                TAG,
-                "Reloaded $pointCount points in ${parsedSegments.size} segments from temp file " +
-                    "(skipped ${parseResult.skippedPointCount} bad-timestamp points)"
-            )
-        } catch (e: Exception) {
-            Log.e(TAG, "reloadPointsFromTempFile failed", e)
-        }
-    }
 
 
     // ------------------------------------------------------------------
