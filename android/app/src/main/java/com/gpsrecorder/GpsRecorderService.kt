@@ -54,10 +54,10 @@ import java.util.LinkedList
 class GpsRecorderService : Service(), LocationListener {
 
     // O7/O24: extracted helpers
-    private val notifier = GpsRecorderNotification(this)
+    internal val notifier = GpsRecorderNotification(this)
 
     // O7/O24 round 2: further extracted helpers
-    private val locationSource = LocationSource(
+    internal val locationSource = LocationSource(
         service = this,
         listener = this,
         onFatalError = { msg ->
@@ -76,8 +76,8 @@ class GpsRecorderService : Service(), LocationListener {
             }
         },
     )
-    private val wakeLockManager = WakeLockManager(this)
-    private val tempFileBuffer = TempFileBuffer(
+    internal val wakeLockManager = WakeLockManager(this)
+    internal val tempFileBuffer = TempFileBuffer(
         service = this,
         segmentsSnapshot = { segmentsSnapshot() },
         setBuffer = { segments, totalPoints ->
@@ -94,15 +94,18 @@ class GpsRecorderService : Service(), LocationListener {
         },
         setAppendState = { init, segs, size -> },
     )
-    private val gpxFileSaver = GpxFileSaver(
+    internal val gpxFileSaver = GpxFileSaver(
         service = this,
         segmentsSnapshot = { segmentsSnapshot() },
         startTimeMs = { startTimeMs },
         deleteTempFile = { tempFileBuffer.deleteTempFile() },
     )
 
+    // K5: state persistence / recovery helper.
+    private val stateRepository = StateRepository(this)
+
     companion object {
-        private const val TAG = "GpsRecorderService"
+        internal const val TAG = "GpsRecorderService"
 
         const val ACTION_START = "com.gpsrecorder.action.START"
         const val ACTION_STOP = "com.gpsrecorder.action.STOP"
@@ -112,14 +115,14 @@ class GpsRecorderService : Service(), LocationListener {
         const val CHANNEL_ID = "gps_recorder_channel"
 
         // SharedPreferences keys for crash/restart recovery + live state queries
-        private const val PREFS_NAME = "gps_recorder_state"
-        private const val KEY_IS_RECORDING = "is_recording"
-        private const val KEY_START_TIME = "start_time_ms"
-        private const val KEY_POINT_COUNT = "point_count"
-        private const val KEY_TEMP_FILE_NAME = "temp_file_name"
-        private const val KEY_TOTAL_DISTANCE = "total_distance_m"
-        private const val KEY_FIX_TYPE = "fix_type"
-        private const val KEY_SATELLITES_USED = "satellites_used"
+        internal const val PREFS_NAME = "gps_recorder_state"
+        internal const val KEY_IS_RECORDING = "is_recording"
+        internal const val KEY_START_TIME = "start_time_ms"
+        internal const val KEY_POINT_COUNT = "point_count"
+        internal const val KEY_TEMP_FILE_NAME = "temp_file_name"
+        internal const val KEY_TOTAL_DISTANCE = "total_distance_m"
+        internal const val KEY_FIX_TYPE = "fix_type"
+        internal const val KEY_SATELLITES_USED = "satellites_used"
 
         // ---- Auto-pause / gap-detection prefs (Phase 1) ----
         // KEY_AUTO_PAUSE_ENABLED / KEY_GAP_DETECTION_ENABLED live in the
@@ -128,16 +131,16 @@ class GpsRecorderService : Service(), LocationListener {
         // KEY_IS_AUTO_PAUSED / KEY_SIGNAL_LOST / KEY_MOVING_MS live in
         // PREFS_NAME because they are per-recording live state, just like
         // KEY_IS_RECORDING.
-        private const val KEY_IS_AUTO_PAUSED = "is_auto_paused"
-        private const val KEY_SIGNAL_LOST = "signal_lost"
-        private const val KEY_MOVING_MS = "moving_ms"
+        internal const val KEY_IS_AUTO_PAUSED = "is_auto_paused"
+        internal const val KEY_SIGNAL_LOST = "signal_lost"
+        internal const val KEY_MOVING_MS = "moving_ms"
         // Last fix (updated on every GPS callback so JS can poll via getState())
-        private const val KEY_LAST_LAT = "last_lat"
-        private const val KEY_LAST_LON = "last_lon"
-        private const val KEY_LAST_ALT = "last_alt"
-        private const val KEY_LAST_SPEED = "last_speed"
-        private const val KEY_LAST_ACCURACY = "last_accuracy"
-        private const val KEY_LAST_TIME_MS = "last_time_ms"
+        internal const val KEY_LAST_LAT = "last_lat"
+        internal const val KEY_LAST_LON = "last_lon"
+        internal const val KEY_LAST_ALT = "last_alt"
+        internal const val KEY_LAST_SPEED = "last_speed"
+        internal const val KEY_LAST_ACCURACY = "last_accuracy"
+        internal const val KEY_LAST_TIME_MS = "last_time_ms"
 
         // L13 fix: MediaStore URI of the most recently saved GPX file (as a
         // string). Populated by saveViaMediaStore() on API 29+ so that
@@ -241,7 +244,7 @@ class GpsRecorderService : Service(), LocationListener {
         private const val MOVING_CONFIRMATION_THRESHOLD = 3   // consecutive fixes
         private const val HYSTERESIS_SPEED_MS = 0.5f          // 0.5 m/s ≈ slow walk
         private const val HYSTERESIS_DISPLACEMENT_MPS = 1.5   // fallback when speed is null/0
-        private const val KEY_CONSECUTIVE_MOVING_FIXES = "consecutive_moving_fixes"
+        internal const val KEY_CONSECUTIVE_MOVING_FIXES = "consecutive_moving_fixes"
 
         // ---- Gap detection (signal loss) (Phase 4) ----
         // If no GPS fix arrives for this many ms, declare a signal gap and
@@ -265,7 +268,7 @@ class GpsRecorderService : Service(), LocationListener {
         // Persisted in the live-state bundle (KEY_AUTO_PAUSE_RESUME_GRACE_UNTIL_MS)
         // so it survives service restart. On recovery, if the grace has
         // already expired (grace < now), it is reset to 0L.
-        private const val KEY_AUTO_PAUSE_RESUME_GRACE_UNTIL_MS = "auto_pause_resume_grace_until_ms"
+        internal const val KEY_AUTO_PAUSE_RESUME_GRACE_UNTIL_MS = "auto_pause_resume_grace_until_ms"
 
         // ---- Radial-distance on-the-fly filter (defaults; user-tunable) ----
         // Prefs keys + defaults are owned by GpsRecorderModule, but the
@@ -284,16 +287,8 @@ class GpsRecorderService : Service(), LocationListener {
         // window is also bounded by AUTO_PAUSE_RAW_WINDOW_MS (10 s); this
         // size cap is the upper bound on how many we'll persist (10 s at
         // 1 Hz = ~10 fixes, which matches).
-        private const val AUTO_PAUSE_RAW_WINDOW_SIZE = 10
-        private const val KEY_RAW_WINDOW = "raw_window"
-
-        // ---- L25: throttle saveLiveState ----
-        // Don't write SharedPreferences on every 1 Hz fix — that's ~60
-        // disk writes per minute, each touching ~10 keys. Throttle to
-        // once per 5 s. The final call before finalize / stop is always
-        // made regardless of the throttle.
-        private const val SAVE_LIVE_STATE_THROTTLE_MS = 5_000L
-        private const val KEY_LAST_SAVE_LIVE_STATE_MS = "last_save_live_state_ms"
+        internal const val AUTO_PAUSE_RAW_WINDOW_SIZE = 10
+        internal const val KEY_RAW_WINDOW = "raw_window"
 
         // ---- L22: minimum dt for velocity gate ----
         // GPS receivers occasionally emit two fixes within 50–200 ms of
@@ -328,25 +323,25 @@ class GpsRecorderService : Service(), LocationListener {
             private var handler: Handler = Handler(Looper.getMainLooper())
 
     // Recording state (persisted to SharedPreferences for recovery)
-    @Volatile private var isRecording = false
-    private var startTimeMs: Long = 0L
-    @Volatile private var pointCount: Int = 0
-    private var tempFileName: String? = null
+    @Volatile internal var isRecording = false
+    internal var startTimeMs: Long = 0L
+    @Volatile internal var pointCount: Int = 0
+    internal var tempFileName: String? = null
 
     // Distance accumulator (meters). Persisted so it survives service restarts.
-    @Volatile private var totalDistanceM: Double = 0.0
+    @Volatile internal var totalDistanceM: Double = 0.0
 
     // GNSS status tracking (satellites used in current fix).
-        @Volatile private var lastFixTimeMs: Long = 0L
+        @Volatile internal var lastFixTimeMs: Long = 0L
     
     // Previous point used for distance accumulation + velocity-based filtering
     // (Haversine distance and dt between consecutive accepted fixes).
     // Nullified by resetValidationCursor() on auto-pause transitions and
     // gap-recovery events so the next accepted fix isn't validated against
     // a stale previous point.
-    @Volatile private var prevLat: Double? = null
-    @Volatile private var prevLon: Double? = null
-    @Volatile private var prevTimeMs: Long? = null
+    @Volatile internal var prevLat: Double? = null
+    @Volatile internal var prevLon: Double? = null
+    @Volatile internal var prevTimeMs: Long? = null
 
     // ---- Segmented track buffer (Phase 2) ----
     // Replaces the flat pointBuffer. Each segment corresponds to one
@@ -355,30 +350,30 @@ class GpsRecorderService : Service(), LocationListener {
     // breaks at those points (no straight-line "stitches" across pauses /
     // gaps). The currently-active segment is `currentSegment`; finalized
     // segments live in `trackSegments`.
-    private val trackSegments = ArrayList<ArrayList<GpsPoint>>()
-    @Volatile private var currentSegment = ArrayList<GpsPoint>()
-    private val pointBufferLock = Any()
+    internal val trackSegments = ArrayList<ArrayList<GpsPoint>>()
+    @Volatile internal var currentSegment = ArrayList<GpsPoint>()
+    internal val pointBufferLock = Any()
 
     // ---- Auto-pause state (Phase 3) ----
-    @Volatile private var isAutoPaused: Boolean = false
+    @Volatile internal var isAutoPaused: Boolean = false
     // Sliding window of the last AUTO_PAUSE_RAW_WINDOW_MS of raw fixes,
     // used to compute displacement for stop detection. Raw = fixes that
     // arrive from onLocationChanged, regardless of whether they passed
     // the on-the-fly filter.
-    private val rawWindow: LinkedList<GpsPoint> = LinkedList()
+    internal val rawWindow: LinkedList<GpsPoint> = LinkedList()
 
     // ---- Gap detection state (Phase 4) ----
     // True when the watchdog has declared a signal gap (no fix in
     // GAP_THRESHOLD_MS). Cleared on gap recovery inside onLocationChanged.
-    @Volatile private var signalLost: Boolean = false
+    @Volatile internal var signalLost: Boolean = false
 
     // ---- Moving time accumulator (Phase 6 helper) ----
     // When auto-pause is enabled, this accumulates ONLY the time spent
     // actually moving (i.e. not in isAutoPaused). Used by JS to compute
     // pace based on active moving time instead of wall-clock elapsed time.
     // When auto-pause is disabled, this stays equal to elapsedMs.
-    @Volatile private var movingMs: Long = 0L
-    @Volatile private var lastResumeMs: Long? = null
+    @Volatile internal var movingMs: Long = 0L
+    @Volatile internal var lastResumeMs: Long? = null
 
     // ---- Auto-pause resume grace window (CODE_REVIEW_TODO Task 1) ----
     // While System.currentTimeMillis() < autoPauseResumeGraceUntilMs, the gap
@@ -387,7 +382,7 @@ class GpsRecorderService : Service(), LocationListener {
     // stale lastFixTimeMs (left over from when the user was stationary) can't
     // trigger a false signalLost declaration or a spurious segment split in
     // the GAP_THRESHOLD_MS window immediately after resume.
-    @Volatile private var autoPauseResumeGraceUntilMs: Long = 0L
+    @Volatile internal var autoPauseResumeGraceUntilMs: Long = 0L
 
     // ---- Auto-pause exit hysteresis (CODE_REVIEW_TODO Task 2) ----
     // Counts consecutive "clearly moving" fixes while isAutoPaused. When it
@@ -396,7 +391,7 @@ class GpsRecorderService : Service(), LocationListener {
     // Persisted in the live-state bundle so a service restart mid-confirmation
     // doesn't lose progress (the user just has to re-confirm 3 fixes —
     // acceptable per Task 2).
-    @Volatile private var consecutiveMovingFixes: Int = 0
+    @Volatile internal var consecutiveMovingFixes: Int = 0
 
     // ---- Time-sampling on-the-fly filter state ----
     // Monotonic counter incremented for EVERY fix that arrives (after the
@@ -406,13 +401,6 @@ class GpsRecorderService : Service(), LocationListener {
     // so each recording starts a fresh sampling window. Not persisted across
     // service restarts — a restart simply begins a new window.
     @Volatile private var timeSamplingCounter: Int = 0
-
-    // ---- L25: saveLiveState throttle ----
-    // Last wall-clock time (ms) we called saveLiveState(). The next call
-    // is skipped if `now - lastSaveLiveStateMs < SAVE_LIVE_STATE_THROTTLE_MS`.
-    // Forced saves (before finalize / stopSelf) bypass the throttle by
-    // calling saveLiveState(force = true).
-    @Volatile private var lastSaveLiveStateMs: Long = 0L
 
     // ---- L26: append-only temp-file state ----
     // `tempFileInitialized` becomes true after the first flush writes the
@@ -545,7 +533,7 @@ class GpsRecorderService : Service(), LocationListener {
         super.onCreate()
         Log.i(TAG, "Service onCreate")
         // Try to recover state in case the service was restarted by the system
-        recoverStateIfAny()
+        stateRepository.recoverStateIfAny()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -587,7 +575,7 @@ class GpsRecorderService : Service(), LocationListener {
         if (isRecording) {
             // L25 fix: force a final live-state save before destroy so the
             // throttled saveLiveState doesn't drop the most recent fixes.
-            saveLiveState(force = true)
+            stateRepository.saveLiveState(force = true)
             tempFileBuffer.flush()
         }
         cleanupGpsAndWakeLock()
@@ -662,7 +650,7 @@ class GpsRecorderService : Service(), LocationListener {
             // L25 fix: reset the saveLiveState throttle so the first fix of
             // the new recording is persisted immediately (not skipped by the
             // 5 s throttle).
-            lastSaveLiveStateMs = 0L
+            stateRepository.resetThrottle()
             // L26 fix: reset the append-only temp-file state. The temp file
             // itself is overwritten in tempFileBuffer.writeGpxHeader() below.
             tempFileBuffer.resetState()  // L26 reset
@@ -670,7 +658,7 @@ class GpsRecorderService : Service(), LocationListener {
         isRecording = true
 
         // Persist state so we can recover after a crash/restart
-        persistState()
+        stateRepository.persistState()
 
         // Acquire wakelock so CPU stays awake while screen is off
         wakeLockManager.acquire()
@@ -754,7 +742,7 @@ class GpsRecorderService : Service(), LocationListener {
         // the throttled saveLiveState doesn't drop the most recent fixes / state.
         // The getState() poll and 'saved' event both read from prefs, so this
         // ensures consistency.
-        saveLiveState(force = true)
+        stateRepository.saveLiveState(force = true)
 
         // Final flush + finalize the GPX file.
         //
@@ -782,7 +770,7 @@ class GpsRecorderService : Service(), LocationListener {
         val finalDistanceM = if (savedOk) gpxFileSaver.recomputeDistanceFromSavedGpx(savedFilePath) else -1.0
 
         // Clear persisted state
-        clearPersistedState()
+        stateRepository.clearPersistedState()
 
         // Release wakelock
         wakeLockManager.release()
@@ -878,7 +866,7 @@ class GpsRecorderService : Service(), LocationListener {
      * the currently-active segment. This is the value reported to JS as
      * `pointCount`.
      */
-    private fun totalPointCount(): Int = synchronized(pointBufferLock) {
+    internal fun totalPointCount(): Int = synchronized(pointBufferLock) {
         var n = currentSegment.size
         for (seg in trackSegments) n += seg.size
         n
@@ -888,7 +876,7 @@ class GpsRecorderService : Service(), LocationListener {
      * Returns a snapshot of all segments (finalized + current) for serialization.
      * Each inner list is one <trkseg>.
      */
-    private fun segmentsSnapshot(): List<List<GpsPoint>> = synchronized(pointBufferLock) {
+    internal fun segmentsSnapshot(): List<List<GpsPoint>> = synchronized(pointBufferLock) {
         val out = ArrayList<List<GpsPoint>>(trackSegments.size + 1)
         for (seg in trackSegments) out.add(ArrayList(seg))
         out.add(ArrayList(currentSegment))
@@ -1037,7 +1025,7 @@ class GpsRecorderService : Service(), LocationListener {
      * true up-to-the-second moving time, so the displayed avg pace tracks
      * the actual walk in real time.
      */
-    private fun liveMovingMs(now: Long = System.currentTimeMillis()): Long {
+    internal fun liveMovingMs(now: Long = System.currentTimeMillis()): Long {
         if (isAutoPaused || signalLost) return movingMs
         val r = lastResumeMs ?: return movingMs
         val delta = now - r
@@ -1268,7 +1256,7 @@ class GpsRecorderService : Service(), LocationListener {
                 // state so the UI knows we still have a fix (and isn't fooled
                 // into thinking we lost signal).
                 lastFixTimeMs = pt.timeMs
-                saveLiveState(pt)
+                stateRepository.saveLiveState(pt)
                 GpsRecorderModule.emitLocation(
                     pt.lat, pt.lon, pt.alt, pt.speed, pt.accuracy,
                     locationSource.computeFixType(lastFixTimeMs), totalDistanceM, pt.timeMs, pointCount,
@@ -1339,7 +1327,7 @@ class GpsRecorderService : Service(), LocationListener {
                                     " speed=${pt.speed} disp=${disp}m — staying paused"
                             )
                             lastFixTimeMs = pt.timeMs
-                            saveLiveState(pt)
+                            stateRepository.saveLiveState(pt)
                             GpsRecorderModule.emitLocation(
                                 pt.lat, pt.lon, pt.alt, pt.speed, pt.accuracy,
                                 locationSource.computeFixType(lastFixTimeMs), totalDistanceM, pt.timeMs, pointCount,
@@ -1360,7 +1348,7 @@ class GpsRecorderService : Service(), LocationListener {
                         }
                         consecutiveMovingFixes = 0
                         lastFixTimeMs = pt.timeMs
-                        saveLiveState(pt)
+                        stateRepository.saveLiveState(pt)
                         GpsRecorderModule.emitLocation(
                             pt.lat, pt.lon, pt.alt, pt.speed, pt.accuracy,
                             locationSource.computeFixType(lastFixTimeMs), totalDistanceM, pt.timeMs, pointCount,
@@ -1397,7 +1385,7 @@ class GpsRecorderService : Service(), LocationListener {
             if (!keep) {
                 SafeLog.d(TAG, "Time sampling: dropping fix #${timeSamplingCounter} (n=$n)")
                 lastFixTimeMs = pt.timeMs
-                saveLiveState(pt)
+                stateRepository.saveLiveState(pt)
                 GpsRecorderModule.emitLocation(
                     pt.lat, pt.lon, pt.alt, pt.speed, pt.accuracy,
                     locationSource.computeFixType(lastFixTimeMs), totalDistanceM, pt.timeMs, pointCount,
@@ -1433,7 +1421,7 @@ class GpsRecorderService : Service(), LocationListener {
             if (acc != null && acc > ACCURACY_THRESHOLD_M) {
                 SafeLog.d(TAG, "On-the-fly filter: dropping low-accuracy fix (acc=${acc}m)")
                 lastFixTimeMs = pt.timeMs
-                saveLiveState(pt)
+                stateRepository.saveLiveState(pt)
                 GpsRecorderModule.emitLocation(
                     pt.lat, pt.lon, pt.alt, pt.speed, pt.accuracy,
                     locationSource.computeFixType(lastFixTimeMs), totalDistanceM, pt.timeMs, pointCount,
@@ -1486,7 +1474,7 @@ class GpsRecorderService : Service(), LocationListener {
                 if (dtSec <= 0.0) {
                     SafeLog.d(TAG, "On-the-fly filter: dropping zero-dt fix (dt=${dtSec}s)")
                     lastFixTimeMs = pt.timeMs
-                    saveLiveState(pt)
+                    stateRepository.saveLiveState(pt)
                     GpsRecorderModule.emitLocation(
                         pt.lat, pt.lon, pt.alt, pt.speed, pt.accuracy,
                         locationSource.computeFixType(lastFixTimeMs), totalDistanceM, pt.timeMs, pointCount,
@@ -1508,7 +1496,7 @@ class GpsRecorderService : Service(), LocationListener {
                     if (velocityMps > MAX_VELOCITY_MPS) {
                         SafeLog.d(TAG, "On-the-fly filter: dropping velocity outlier (v=${velocityMps}m/s d=${d}m dt=${dtSec}s)")
                         lastFixTimeMs = pt.timeMs
-                        saveLiveState(pt)
+                        stateRepository.saveLiveState(pt)
                         GpsRecorderModule.emitLocation(
                             pt.lat, pt.lon, pt.alt, pt.speed, pt.accuracy,
                             locationSource.computeFixType(lastFixTimeMs), totalDistanceM, pt.timeMs, pointCount,
@@ -1553,7 +1541,7 @@ class GpsRecorderService : Service(), LocationListener {
                     if (d < threshold) {
                         SafeLog.d(TAG, "Radial filter: dropping too-close fix (d=${d}m < ${threshold}m)")
                         lastFixTimeMs = pt.timeMs
-                        saveLiveState(pt)
+                        stateRepository.saveLiveState(pt)
                         GpsRecorderModule.emitLocation(
                             pt.lat, pt.lon, pt.alt, pt.speed, pt.accuracy,
                             locationSource.computeFixType(lastFixTimeMs), totalDistanceM, pt.timeMs, pointCount,
@@ -1605,7 +1593,7 @@ class GpsRecorderService : Service(), LocationListener {
                     if (d < threshold) {
                         SafeLog.d(TAG, "Radial filter (raw): dropping too-close fix (d=${d}m < ${threshold}m)")
                         lastFixTimeMs = pt.timeMs
-                        saveLiveState(pt)
+                        stateRepository.saveLiveState(pt)
                         GpsRecorderModule.emitLocation(
                             pt.lat, pt.lon, pt.alt, pt.speed, pt.accuracy,
                             locationSource.computeFixType(lastFixTimeMs), totalDistanceM, pt.timeMs, pointCount,
@@ -1632,7 +1620,7 @@ class GpsRecorderService : Service(), LocationListener {
         }
         // Save current state to SharedPreferences so JS can poll via getState()
         // even if the event emitter is not delivering events reliably.
-        saveLiveState(pt)
+        stateRepository.saveLiveState(pt)
         // Emit the event with pointCount + auto-pause / signal state so the JS
         // UI can reflect pause / gap status in real time.
         //
@@ -1731,138 +1719,8 @@ class GpsRecorderService : Service(), LocationListener {
         prevTimeMs = pt.timeMs
     }
 
-
-
-    /**
-     * Writes the current recording state + last fix to SharedPreferences.
-     * Called on every GPS fix so that [GpsRecorderModule.getState] can return fresh data.
-     *
-     * Persists the LIVE moving time (liveMovingMs) so JS's 2-second
-     * getState() polling fallback sees a fresh value, not the stale frozen
-     * one. See CHANGELOG.md.
-     */
-    private fun saveLiveState(lastFix: GpsPoint? = null, force: Boolean = false) {
-        // L25 fix: throttle to once per SAVE_LIVE_STATE_THROTTLE_MS unless
-        // the caller explicitly forces a save (e.g. before finalize / stop).
-        // The previous version wrote SharedPreferences on every 1 Hz fix,
-        // which is ~60 disk writes per minute — each touching ~10 keys —
-        // for no good reason (JS polls getState() every 2 s anyway).
-        val now = System.currentTimeMillis()
-        if (!force && lastSaveLiveStateMs > 0L && (now - lastSaveLiveStateMs) < SAVE_LIVE_STATE_THROTTLE_MS) {
-            return
-        }
-        lastSaveLiveStateMs = now
-        try {
-            val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit()
-            prefs.putBoolean(KEY_IS_RECORDING, isRecording)
-            prefs.putLong(KEY_START_TIME, startTimeMs)
-            prefs.putInt(KEY_POINT_COUNT, pointCount)
-            prefs.putString(KEY_TOTAL_DISTANCE, totalDistanceM.toString())
-            prefs.putString(KEY_FIX_TYPE, locationSource.computeFixType(lastFixTimeMs))
-            prefs.putInt(KEY_SATELLITES_USED, locationSource.satellitesUsed)
-            // Phase 1/3/4: persist auto-pause / signal-lost / moving-time so
-            // JS can poll via getState() and survive service restarts.
-            prefs.putBoolean(KEY_IS_AUTO_PAUSED, isAutoPaused)
-            prefs.putBoolean(KEY_SIGNAL_LOST, signalLost)
-            // Persist the LIVE value so polling sees the same value event
-            // delivery would have shown. The frozen `movingMs` field stays
-            // in memory as the "committed baseline" and is what we restart
-            // from after a service restart (see recoverStateIfAny).
-            val liveNow = lastFix?.timeMs ?: now
-            prefs.putLong(KEY_MOVING_MS, liveMovingMs(liveNow))
-            // CODE_REVIEW_TODO Task 1: persist the auto-pause resume grace
-            // window so it survives service restart. If the grace has
-            // already expired by the time we recover, recoverStateIfAny
-            // resets it to 0L.
-            prefs.putLong(KEY_AUTO_PAUSE_RESUME_GRACE_UNTIL_MS, autoPauseResumeGraceUntilMs)
-            // CODE_REVIEW_TODO Task 2: persist the moving-confirmation counter
-            // so a service restart mid-confirmation doesn't lose progress.
-            // (If the service restarts mid-confirmation, the user has to
-            // re-confirm 3 fixes — acceptable per Task 2.)
-            prefs.putInt(KEY_CONSECUTIVE_MOVING_FIXES, consecutiveMovingFixes)
-            val fix = lastFix ?: synchronized(pointBufferLock) { currentSegment.lastOrNull() }
-            if (fix != null) {
-                prefs.putString(KEY_LAST_LAT, fix.lat.toString())
-                prefs.putString(KEY_LAST_LON, fix.lon.toString())
-                prefs.putString(KEY_LAST_ALT, fix.alt?.toString() ?: "")
-                prefs.putString(KEY_LAST_SPEED, fix.speed?.toString() ?: "")
-                prefs.putString(KEY_LAST_ACCURACY, fix.accuracy?.toString() ?: "")
-                prefs.putLong(KEY_LAST_TIME_MS, fix.timeMs)
-            }
-            // L20 fix: persist the last AUTO_PAUSE_RAW_WINDOW_SIZE raw fixes
-            // so auto-pause detection can make a correct decision on the
-            // first fix after a START_STICKY restart. Without this the
-            // window is empty and the user could be stationary but not yet
-            // auto-paused, accumulating junk points, for ~10 s after restart.
-            persistRawWindow(prefs)
-            prefs.apply()
-        } catch (e: Exception) {
-            Log.w(TAG, "saveLiveState failed", e)
-        }
-    }
-
-    /**
-     * L20 helper: serialize the last AUTO_PAUSE_RAW_WINDOW_SIZE entries of
-     * `rawWindow` to a JSON array under KEY_RAW_WINDOW. Each entry is a
-     * JSONObject with lat / lon / alt / speed / accuracy / timeMs so it can
-     * be reconstructed losslessly on the other side.
-     */
-    private fun persistRawWindow(prefs: android.content.SharedPreferences.Editor) {
-        try {
-            val arr = JSONArray()
-            // Snapshot under no lock — rawWindow is only touched on the
-            // main thread by onLocationChanged, so this is safe.
-            val snapshot = ArrayList(rawWindow)
-            val start = snapshot.size.coerceAtLeast(0).let { (it - AUTO_PAUSE_RAW_WINDOW_SIZE).coerceAtLeast(0) }
-            for (i in start until snapshot.size) {
-                val p = snapshot[i]
-                val o = JSONObject()
-                o.put("lat", p.lat)
-                o.put("lon", p.lon)
-                p.alt?.let { o.put("alt", it) }
-                p.speed?.let { o.put("speed", it.toDouble()) }
-                p.accuracy?.let { o.put("accuracy", it.toDouble()) }
-                o.put("timeMs", p.timeMs)
-                arr.put(o)
-            }
-            prefs.putString(KEY_RAW_WINDOW, arr.toString())
-        } catch (e: Exception) {
-            Log.w(TAG, "persistRawWindow failed", e)
-        }
-    }
-
-    /**
-     * L20 helper: deserialize the raw_window JSON array from prefs back into
-     * `rawWindow`. Called from recoverStateIfAny() on service restart. If
-     * deserialization fails for any reason, log and continue with an empty
-     * window (graceful degradation — the auto-pause logic will just take
-     * ~10 s to re-fill the window before making a stop decision).
-     */
-    private fun restoreRawWindow(prefs: android.content.SharedPreferences) {
-        val json = prefs.getString(KEY_RAW_WINDOW, null) ?: return
-        try {
-            val arr = JSONArray(json)
-            rawWindow.clear()
-            for (i in 0 until arr.length()) {
-                val o = arr.getJSONObject(i)
-                val alt = if (o.has("alt") && !o.isNull("alt")) o.getDouble("alt") else null
-                val speed = if (o.has("speed") && !o.isNull("speed")) o.getDouble("speed").toFloat() else null
-                val accuracy = if (o.has("accuracy") && !o.isNull("accuracy")) o.getDouble("accuracy").toFloat() else null
-                rawWindow.add(GpsPoint(
-                    lat = o.getDouble("lat"),
-                    lon = o.getDouble("lon"),
-                    alt = alt,
-                    speed = speed,
-                    accuracy = accuracy,
-                    timeMs = o.getLong("timeMs")
-                ))
-            }
-            Log.i(TAG, "restoreRawWindow: restored ${rawWindow.size} raw fixes")
-        } catch (e: Exception) {
-            Log.w(TAG, "restoreRawWindow failed — continuing with empty window", e)
-            rawWindow.clear()
-        }
-    }
+    // K5: saveLiveState / persistRawWindow / restoreRawWindow extracted to
+    // StateRepository. Call sites go through `stateRepository.xxx(...)`.
 
     // Required overrides for older Android API levels
     override fun onProviderEnabled(provider: String) {}
@@ -1941,153 +1799,8 @@ class GpsRecorderService : Service(), LocationListener {
 
     private fun getDouglasPeuckerEpsilonM(): Double = GpsRecorderSettings.getDouglasPeuckerEpsilonM(this)
 
-
-
-
-
-
-
-
-
-    // ------------------------------------------------------------------
-
-
-
-
-
-
-    // State persistence (for crash/restart recovery)
-    // ------------------------------------------------------------------
-
-    private fun persistState() {
-        val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit()
-        prefs.putBoolean(KEY_IS_RECORDING, isRecording)
-        prefs.putLong(KEY_START_TIME, startTimeMs)
-        prefs.putInt(KEY_POINT_COUNT, pointCount)
-        prefs.putString(KEY_TEMP_FILE_NAME, tempFileName)
-        prefs.putString(KEY_TOTAL_DISTANCE, totalDistanceM.toString())
-        // Phase 1/3/4: persist auto-pause / signal-lost / moving-time so
-        // they survive service restarts. (saveLiveState also writes these on
-        // every fix, but persistState is called at start / stop boundaries.)
-        prefs.putBoolean(KEY_IS_AUTO_PAUSED, isAutoPaused)
-        prefs.putBoolean(KEY_SIGNAL_LOST, signalLost)
-        // Persist the LIVE movingMs (committed baseline + uncommitted delta
-        // since last resume) so that on service restart the recovered value
-        // matches what the UI was showing right before the kill. After
-        // recovery, lastResumeMs is set to the recovery instant, so the
-        // post-recovery liveMovingMs starts ticking from this persisted
-        // baseline (the period between the last save and recovery is NOT
-        // counted, because we don't know whether the user was moving).
-        prefs.putLong(KEY_MOVING_MS, liveMovingMs())
-        prefs.apply()
-    }
-
-    private fun clearPersistedState() {
-        val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit()
-        prefs.clear()
-        prefs.apply()
-    }
-
-    private fun recoverStateIfAny() {
-        val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        if (prefs.getBoolean(KEY_IS_RECORDING, false)) {
-            isRecording = true
-            startTimeMs = prefs.getLong(KEY_START_TIME, System.currentTimeMillis())
-            pointCount = prefs.getInt(KEY_POINT_COUNT, 0)
-            tempFileName = prefs.getString(KEY_TEMP_FILE_NAME, null)
-            tempFileBuffer.tempFileName = tempFileName
-            totalDistanceM = prefs.getString(KEY_TOTAL_DISTANCE, "0")?.toDoubleOrNull() ?: 0.0
-            // Phase 1/3/4: recover auto-pause / signal-lost / moving-time.
-            isAutoPaused = prefs.getBoolean(KEY_IS_AUTO_PAUSED, false)
-            signalLost = prefs.getBoolean(KEY_SIGNAL_LOST, false)
-            movingMs = prefs.getLong(KEY_MOVING_MS, 0L)
-            // CODE_REVIEW_TODO Task 1: recover the auto-pause resume grace
-            // window. If the grace has already expired by the time we
-            // recover, reset it to 0L so the gap watchdog / gap-recovery
-            // branch can fire normally again. (A service restart that
-            // happens mid-grace will still honor the remaining window —
-            // this is the safe choice because the race the grace protects
-            // against is most acute in the first few seconds after resume.)
-            val recoveredGrace = prefs.getLong(KEY_AUTO_PAUSE_RESUME_GRACE_UNTIL_MS, 0L)
-            autoPauseResumeGraceUntilMs =
-                if (recoveredGrace > 0L && recoveredGrace > System.currentTimeMillis()) recoveredGrace else 0L
-            // CODE_REVIEW_TODO Task 2: recover the moving-confirmation counter.
-            // If we were auto-paused when the service was killed, the
-            // counter is whatever it was at the last persistAutoPauseState()
-            // call. We keep it so the user doesn't have to start over (but
-            // they still need to reach MOVING_CONFIRMATION_THRESHOLD
-            // consecutive fast fixes to resume).
-            consecutiveMovingFixes = prefs.getInt(KEY_CONSECUTIVE_MOVING_FIXES, 0)
-            // If we were not auto-paused when the service was killed, treat
-            // the resume instant as the start of a new moving segment so
-            // movingMs accumulates correctly going forward. (If we were
-            // auto-paused, lastResumeMs stays null — it will be set when
-            // the user resumes.)
-            lastResumeMs = if (!isAutoPaused) System.currentTimeMillis() else null
-            Log.i(
-                TAG,
-                "Recovered recording state: start=$startTimeMs count=$pointCount" +
-                    " temp=$tempFileName dist=$totalDistanceM" +
-                    " autoPaused=$isAutoPaused signalLost=$signalLost movingMs=$movingMs" +
-                    " graceUntil=$autoPauseResumeGraceUntilMs" +
-                    " consecutiveMovingFixes=$consecutiveMovingFixes"
-            )
-            // Try to reload buffered points from the temp file (multi-segment aware).
-            tempFileBuffer.reloadPointsIntoBuffer()
-            // L20 fix: restore rawWindow from the persisted JSON so auto-pause
-            // detection can make a correct decision on the first fix after
-            // restart (instead of waiting ~10 s for the window to fill).
-            restoreRawWindow(prefs)
-            // Restore prevLat/prevLon/lastFixTimeMs from the last point in the
-            // last segment so distance accumulation continues smoothly after
-            // a service restart. If the last segment is empty (e.g. we were
-            // auto-paused when killed), use the last point of any non-empty
-            // earlier segment — but in that case the user was paused, so
-            // prevLat should stay null and the velocity gate will naturally
-            // bypass the first post-restart fix.
-            if (!isAutoPaused) {
-                synchronized(pointBufferLock) {
-                    val last = currentSegment.lastOrNull()
-                        ?: trackSegments.lastOrNull()?.lastOrNull()
-                    if (last != null) {
-                        prevLat = last.lat
-                        prevLon = last.lon
-                        prevTimeMs = last.timeMs
-                        lastFixTimeMs = last.timeMs
-                    }
-                }
-            } else {
-                // Paused: don't restore prev cursor — the next fix that
-                // resumes movement will go through resetValidationCursor()
-                // via exitAutoPause() anyway, so starting with null is safer.
-                synchronized(pointBufferLock) {
-                    val last = currentSegment.lastOrNull()
-                        ?: trackSegments.lastOrNull()?.lastOrNull()
-                    if (last != null) lastFixTimeMs = last.timeMs
-                }
-            }
-            // L19 fix: re-register the foreground notification BEFORE
-            // returning so Android sees the service as foreground within
-            // 100 ms of onCreate() returning. Previously the notification
-            // was only started later in onStartCommand — between onCreate
-            // and onStartCommand, `isRecording` was true but no foreground
-            // state was held, so Android could kill the service again.
-            // Safe because onCreate runs on the main thread before
-            // onStartCommand.
-            notifier.startForegroundIfNeeded(
-            GpsRecorderNotification.NotificationSnapshot(
-                points = pointCount,
-                elapsedMs = getElapsedMs(),
-                isAutoPaused = isAutoPaused,
-                signalLost = signalLost
-            )
-        ) {
-            wakeLockManager.release()
-            GpsRecorderModule.emitError("Не удалось запустить foreground service", fatal = true)
-            stopSelf()
-        }
-        }
-    }
+    // K5: persistState / clearPersistedState / recoverStateIfAny extracted
+    // to StateRepository. Call sites go through `stateRepository.xxx(...)`.
 
 
 
@@ -2095,6 +1808,6 @@ class GpsRecorderService : Service(), LocationListener {
     // Helpers
     // ------------------------------------------------------------------
 
-    private fun getElapsedMs(): Long =
+    internal fun getElapsedMs(): Long =
         if (isRecording) System.currentTimeMillis() - startTimeMs else 0L
 }
