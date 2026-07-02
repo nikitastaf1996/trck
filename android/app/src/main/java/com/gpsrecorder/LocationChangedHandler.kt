@@ -9,10 +9,16 @@ import android.util.Log
  * LocationChangedHandler
  *
  * K7: extracted from `GpsRecorderService.kt` so the service file stays under
- * 1000 lines. Owns the 470-line `onLocationChanged` callback (8 filter stages:
+ * 1000 lines. Owns the `onLocationChanged` callback (8 filter stages:
  * stale-fix, gap-detection / recovery, auto-pause enter / exit hysteresis,
  * time-sampling, accuracy, velocity, radial-distance, raw-mode distance
- * accumulator) and the `accumulateDistance` helper.
+ * accumulator).
+ *
+ * K10: split further to get this file under 500 lines. The auto-pause phase
+ * (Phase 3) moved to [AutoPauseHandler] and the raw-mode `accumulateDistance`
+ * helper moved to [DistanceAccumulator]. This file now owns the remaining
+ * 7 stages plus the shared emit-on-drop helpers (`emitFix`,
+ * `updateNotificationSnapshot`, `emitDroppedFix`).
  *
  * Implements [LocationListener] so the service can delegate its four
  * LocationListener overrides here (`onLocationChanged`,
@@ -31,16 +37,25 @@ import android.util.Log
  * `MIN_VELOCITY_GATE_DT_SEC`, `GAP_THRESHOLD_MS`, `AUTO_PAUSE_*`,
  * `MOVING_CONFIRMATION_THRESHOLD`, `HYSTERESIS_*`, `TAG`) stay on the service
  * companion object; the handler accesses them via `GpsRecorderService.X`.
- * Settings reads go through [GpsRecorderSettings] directly (passing the
- * service as the `Context`). Threshold getters
- * (`getRadialDistanceThresholdM`, `getTimeSamplingN`) remain on the service
- * (made `internal` for K7) and are called via `service.X()`.
+ * [DistanceAccumulator] accesses the four filter constants via
+ * `LocationChangedHandler.X` (they're shared between the on-the-fly filter
+ * here and the raw-mode accumulator there). Settings reads go through
+ * [GpsRecorderSettings] directly (passing the service as the `Context`).
+ * Threshold getters (`getRadialDistanceThresholdM`, `getTimeSamplingN`)
+ * remain on the service (made `internal` for K7) and are called via
+ * `service.X()`.
  *
- * Behavior is byte-for-byte identical to the pre-K7 in-service implementation
- * — every filter stage, every emit-on-drop pattern, every accuracy / velocity
- * / radial / time-sampling gate is preserved verbatim. Only the references
- * are rewired to go through `service.` / `GpsRecorderService.` /
- * `GpsRecorderSettings.`.
+ * Behavior is byte-for-byte identical to the pre-K7 in-service
+ * implementation — every filter stage, every emit-on-drop pattern, every
+ * accuracy / velocity / radial / time-sampling gate is preserved verbatim.
+ * The K10 extraction (auto-pause → [AutoPauseHandler], distance accumulator
+ * → [DistanceAccumulator], 9× emit-on-drop pattern → `emitFix` /
+ * `emitDroppedFix` / `updateNotificationSnapshot`) preserves the exact
+ * sequence of `service.lastFixTimeMs` / `service.stateRepository.saveLiveState`
+ * / `GpsEventEmitter.emitLocation` / `service.notifier.updateNotification`
+ * calls at every site. Only the references are rewired to go through
+ * `service.` / `GpsRecorderService.` / `GpsRecorderSettings.` /
+ * `LocationChangedHandler.`.
  */
 class LocationChangedHandler internal constructor(
     private val service: GpsRecorderService,
@@ -97,6 +112,11 @@ class LocationChangedHandler internal constructor(
     // recording starts a fresh sampling window. Not persisted across service
     // restarts — a restart simply begins a new window.
     @Volatile internal var timeSamplingCounter: Int = 0
+
+    // K10: extracted to DistanceAccumulator / AutoPauseHandler so this file
+    // stays under 500 lines.
+    private val distanceAccumulator = DistanceAccumulator(service)
+    private val autoPauseHandler = AutoPauseHandler(service)
 
     override fun onLocationChanged(location: Location) {
         if (!service.isRecording) return
@@ -176,171 +196,17 @@ class LocationChangedHandler internal constructor(
             // its current segment structure.
             service.signalLost = false
             service.autoPauseGap.persistAutoPauseState()
-            service.notifier.updateNotification(
-            GpsRecorderNotification.NotificationSnapshot(
-                points = service.pointCount,
-                elapsedMs = service.getElapsedMs(),
-                isAutoPaused = service.isAutoPaused,
-                signalLost = service.signalLost
-            )
-        )
+            updateNotificationSnapshot()
             Log.i(GpsRecorderService.TAG, "Gap detection disabled or auto-paused — clearing service.signalLost flag")
         }
 
         // ---- Phase 3: Auto-pause (stop detection) ----
-        // When enabled, we maintain a sliding window of the last
-        // AutoPauseGapController.RAW_WINDOW_MS of raw fixes and check two conditions:
-        //   1. Instantaneous speed < AutoPauseGapController.SPEED_THRESHOLD_MPS
-        //   2. Maximum pairwise displacement in the window < AutoPauseGapController.DISPLACEMENT_THRESHOLD_M
-        // If both are true, the user is considered stationary; we enter (or
-        // stay in) auto-pause and skip recording the point. When the user
-        // starts moving again, we exit auto-pause and start a new segment.
-        if (GpsRecorderSettings.isAutoPauseEnabled(service)) {
-            // Push to sliding raw window and prune entries older than the window.
-            service.rawWindow.add(pt)
-            val windowCutoff = pt.timeMs - AutoPauseGapController.RAW_WINDOW_MS
-            while (service.rawWindow.isNotEmpty() && service.rawWindow.peek().timeMs < windowCutoff) {
-                service.rawWindow.poll()
-            }
-
-            // L11 fix: do NOT treat a missing speed as 'stationary'. When
-            // Location.hasSpeed() is false (cold start, poor signal, some
-            // devices / emulators), pt.speed is null. The previous code
-            // coerced it to 0f, which made speedOk = true (stationary) and
-            // contributed to false auto-pause triggers even while the user
-            // was moving. We now treat a null speed as 'not stationary' so
-            // the displacement check (line below) is the sole backstop —
-            // exactly what we want when the GPS can't tell us our speed.
-            val speedOk = pt.speed?.let { it < AutoPauseGapController.SPEED_THRESHOLD_MPS } ?: false
-            val disp = service.autoPauseGap.maxDisplacementInWindow()
-            val dispOk = disp < AutoPauseGapController.DISPLACEMENT_THRESHOLD_M
-            val stopped = speedOk && dispOk
-
-            if (stopped) {
-                // User is stationary.
-                if (!service.isAutoPaused) {
-                    Log.i(
-                        GpsRecorderService.TAG,
-                        "Auto-pause entering: speed=${pt.speed} disp=${disp}m window=${service.rawWindow.size}"
-                    )
-                    service.autoPauseGap.enterAutoPause(pt.timeMs)
-                }
-                // CODE_REVIEW_TODO Task 2: a stationary fix while paused
-                // resets the moving-confirmation counter (the user has to
-                // re-accumulate AutoPauseGapController.MOVING_CONFIRMATION_THRESHOLD consecutive
-                // fast fixes to resume). enterAutoPause() also resets it,
-                // but we reset here too so a slow fix during the
-                // confirmation window — without re-entering pause — also
-                // resets the counter.
-                if (service.isAutoPaused) service.consecutiveMovingFixes = 0
-                // While paused: do NOT add the point to the buffer and do NOT
-                // accumulate distance. But DO update service.lastFixTimeMs and live
-                // state so the UI knows we still have a fix (and isn't fooled
-                // into thinking we lost signal).
-                service.lastFixTimeMs = pt.timeMs
-                service.stateRepository.saveLiveState(pt)
-                GpsEventEmitter.emitLocation(
-                    pt.lat, pt.lon, pt.alt, pt.speed, pt.accuracy,
-                    service.locationSource.computeFixType(service.lastFixTimeMs), service.totalDistanceM, pt.timeMs, service.pointCount,
-                    service.isAutoPaused, service.signalLost, service.autoPauseGap.liveMovingMs(pt.timeMs)
-                )
-                return
-            } else {
-                // User is moving.
-                if (service.isAutoPaused) {
-                    // CODE_REVIEW_TODO Task 2: hysteresis — require
-                    // AutoPauseGapController.MOVING_CONFIRMATION_THRESHOLD consecutive "clearly
-                    // moving" fixes before resuming. This prevents the
-                    // amber "АВТОПАУЗА" banner from flickering on rapid
-                    // pause/resume oscillation (e.g. very slow walking
-                    // ~0.3 m/s with GPS drift can oscillate at the 10 s
-                    // window boundary). Each flicker creates a new <trkseg>
-                    // and toggles the notification / banner — technically
-                    // correct but feels glitchy.
-                    //
-                    // A fix counts as "clearly moving" if EITHER:
-                    //   - pt.speed >= AutoPauseGapController.HYSTERESIS_SPEED_MS (primary), OR
-                    //   - pt.speed is null/0 AND haversine displacement
-                    //     from the last kept fix implies velocity >=
-                    //     AutoPauseGapController.HYSTERESIS_DISPLACEMENT_MPS (fallback for
-                    //     receivers that don't populate Location.speed).
-                    //
-                    // The first (AutoPauseGapController.MOVING_CONFIRMATION_THRESHOLD - 1)
-                    // confirmation fixes are dropped (same pattern as the
-                    // stopped branch above) so the post-pause segment
-                    // starts cleanly at the moment resume is confirmed.
-                    // This loses ~2 s of track data at each resume —
-                    // acceptable per Task 2.
-                    val speedBased = pt.speed != null && pt.speed >= AutoPauseGapController.HYSTERESIS_SPEED_MS
-                    val dispBased = (!speedBased && (pt.speed == null || pt.speed == 0f)) && run {
-                        val pLat = service.prevLat
-                        val pLon = service.prevLon
-                        val pTime = service.prevTimeMs
-                        if (pLat != null && pLon != null && pTime != null) {
-                            val dtSec = (pt.timeMs - pTime) / 1000.0
-                            if (dtSec > 0) {
-                                val d = TrackMath.haversineMeters(pLat, pLon, pt.lat, pt.lon)
-                                (d / dtSec) >= AutoPauseGapController.HYSTERESIS_DISPLACEMENT_MPS
-                            } else false
-                        } else false
-                    }
-                    if (speedBased || dispBased) {
-                        service.consecutiveMovingFixes++
-                        if (service.consecutiveMovingFixes >= AutoPauseGapController.MOVING_CONFIRMATION_THRESHOLD) {
-                            Log.i(
-                                GpsRecorderService.TAG,
-                                "Auto-pause resuming after ${service.consecutiveMovingFixes} confirmation fixes:" +
-                                    " speed=${pt.speed} disp=${disp}m window=${service.rawWindow.size}"
-                            )
-                            service.autoPauseGap.exitAutoPause(pt.timeMs)
-                            // ← fall through; this fix is added to the new
-                            // post-resume segment (exitAutoPause called
-                            // createNewSegment above).
-                        } else {
-                            // Confirmation in progress — still auto-paused.
-                            // Drop the fix (same pattern as the stopped
-                            // branch) so the buffer stays clean until the
-                            // resume is confirmed. The UI still gets the
-                            // location event so the user sees their
-                            // current position update.
-                            Log.i(
-                                GpsRecorderService.TAG,
-                                "Auto-pause confirmation ${service.consecutiveMovingFixes}/${AutoPauseGapController.MOVING_CONFIRMATION_THRESHOLD}:" +
-                                    " speed=${pt.speed} disp=${disp}m — staying paused"
-                            )
-                            service.lastFixTimeMs = pt.timeMs
-                            service.stateRepository.saveLiveState(pt)
-                            GpsEventEmitter.emitLocation(
-                                pt.lat, pt.lon, pt.alt, pt.speed, pt.accuracy,
-                                service.locationSource.computeFixType(service.lastFixTimeMs), service.totalDistanceM, pt.timeMs, service.pointCount,
-                                service.isAutoPaused, service.signalLost, service.autoPauseGap.liveMovingMs(pt.timeMs)
-                            )
-                            return
-                        }
-                    } else {
-                        // User moved a little but not clearly enough to
-                        // count toward resume confirmation. Reset the
-                        // counter and stay paused. Drop the fix.
-                        if (service.consecutiveMovingFixes > 0) {
-                            Log.i(
-                                GpsRecorderService.TAG,
-                                "Auto-pause confirmation reset (was ${service.consecutiveMovingFixes}):" +
-                                    " speed=${pt.speed} disp=${disp}m — staying paused"
-                            )
-                        }
-                        service.consecutiveMovingFixes = 0
-                        service.lastFixTimeMs = pt.timeMs
-                        service.stateRepository.saveLiveState(pt)
-                        GpsEventEmitter.emitLocation(
-                            pt.lat, pt.lon, pt.alt, pt.speed, pt.accuracy,
-                            service.locationSource.computeFixType(service.lastFixTimeMs), service.totalDistanceM, pt.timeMs, service.pointCount,
-                            service.isAutoPaused, service.signalLost, service.autoPauseGap.liveMovingMs(pt.timeMs)
-                        )
-                        return
-                    }
-                }
-            }
-        }
+        // K10: delegated to AutoPauseHandler. Returns true if the fix was
+        // dropped (stationary / confirmation-in-progress / confirmation-reset
+        // branches); false to continue with the time-sampling / accuracy /
+        // velocity / radial gates (auto-pause disabled, user moving while not
+        // paused, or resume just confirmed).
+        if (autoPauseHandler.handle(pt)) return
 
         // The "post_process_enabled" setting is now interpreted as ON-THE-FLY track
         // filtering: when it is on, noisy / wild points are dropped at write time
@@ -366,21 +232,7 @@ class LocationChangedHandler internal constructor(
             val keep = (n == 1) || (timeSamplingCounter == 1) || (timeSamplingCounter % n == 0)
             if (!keep) {
                 SafeLog.d(GpsRecorderService.TAG, "Time sampling: dropping fix #${timeSamplingCounter} (n=$n)")
-                service.lastFixTimeMs = pt.timeMs
-                service.stateRepository.saveLiveState(pt)
-                GpsEventEmitter.emitLocation(
-                    pt.lat, pt.lon, pt.alt, pt.speed, pt.accuracy,
-                    service.locationSource.computeFixType(service.lastFixTimeMs), service.totalDistanceM, pt.timeMs, service.pointCount,
-                    service.isAutoPaused, service.signalLost, service.autoPauseGap.liveMovingMs(pt.timeMs)
-                )
-                service.notifier.updateNotification(
-            GpsRecorderNotification.NotificationSnapshot(
-                points = service.pointCount,
-                elapsedMs = service.getElapsedMs(),
-                isAutoPaused = service.isAutoPaused,
-                signalLost = service.signalLost
-            )
-        )
+                emitDroppedFix(pt)
                 return
             }
         }
@@ -402,21 +254,7 @@ class LocationChangedHandler internal constructor(
             val acc = pt.accuracy
             if (acc != null && acc > ACCURACY_THRESHOLD_M) {
                 SafeLog.d(GpsRecorderService.TAG, "On-the-fly filter: dropping low-accuracy fix (acc=${acc}m)")
-                service.lastFixTimeMs = pt.timeMs
-                service.stateRepository.saveLiveState(pt)
-                GpsEventEmitter.emitLocation(
-                    pt.lat, pt.lon, pt.alt, pt.speed, pt.accuracy,
-                    service.locationSource.computeFixType(service.lastFixTimeMs), service.totalDistanceM, pt.timeMs, service.pointCount,
-                    service.isAutoPaused, service.signalLost, service.autoPauseGap.liveMovingMs(pt.timeMs)
-                )
-                service.notifier.updateNotification(
-            GpsRecorderNotification.NotificationSnapshot(
-                points = service.pointCount,
-                elapsedMs = service.getElapsedMs(),
-                isAutoPaused = service.isAutoPaused,
-                signalLost = service.signalLost
-            )
-        )
+                emitDroppedFix(pt)
                 return
             }
             // C. Velocity-based plausibility gate: compute the instantaneous
@@ -455,21 +293,7 @@ class LocationChangedHandler internal constructor(
                 val dtSec = (pt.timeMs - pTime) / 1000.0
                 if (dtSec <= 0.0) {
                     SafeLog.d(GpsRecorderService.TAG, "On-the-fly filter: dropping zero-dt fix (dt=${dtSec}s)")
-                    service.lastFixTimeMs = pt.timeMs
-                    service.stateRepository.saveLiveState(pt)
-                    GpsEventEmitter.emitLocation(
-                        pt.lat, pt.lon, pt.alt, pt.speed, pt.accuracy,
-                        service.locationSource.computeFixType(service.lastFixTimeMs), service.totalDistanceM, pt.timeMs, service.pointCount,
-                        service.isAutoPaused, service.signalLost, service.autoPauseGap.liveMovingMs(pt.timeMs)
-                    )
-                    service.notifier.updateNotification(
-            GpsRecorderNotification.NotificationSnapshot(
-                points = service.pointCount,
-                elapsedMs = service.getElapsedMs(),
-                isAutoPaused = service.isAutoPaused,
-                signalLost = service.signalLost
-            )
-        )
+                    emitDroppedFix(pt)
                     return
                 }
                 val d = TrackMath.haversineMeters(pLat, pLon, pt.lat, pt.lon)
@@ -477,21 +301,7 @@ class LocationChangedHandler internal constructor(
                     val velocityMps = d / dtSec
                     if (velocityMps > MAX_VELOCITY_MPS) {
                         SafeLog.d(GpsRecorderService.TAG, "On-the-fly filter: dropping velocity outlier (v=${velocityMps}m/s d=${d}m dt=${dtSec}s)")
-                        service.lastFixTimeMs = pt.timeMs
-                        service.stateRepository.saveLiveState(pt)
-                        GpsEventEmitter.emitLocation(
-                            pt.lat, pt.lon, pt.alt, pt.speed, pt.accuracy,
-                            service.locationSource.computeFixType(service.lastFixTimeMs), service.totalDistanceM, pt.timeMs, service.pointCount,
-                            service.isAutoPaused, service.signalLost, service.autoPauseGap.liveMovingMs(pt.timeMs)
-                        )
-                        service.notifier.updateNotification(
-            GpsRecorderNotification.NotificationSnapshot(
-                points = service.pointCount,
-                elapsedMs = service.getElapsedMs(),
-                isAutoPaused = service.isAutoPaused,
-                signalLost = service.signalLost
-            )
-        )
+                        emitDroppedFix(pt)
                         return
                     }
                 }
@@ -522,21 +332,7 @@ class LocationChangedHandler internal constructor(
                     val threshold = service.getRadialDistanceThresholdM().toDouble()
                     if (d < threshold) {
                         SafeLog.d(GpsRecorderService.TAG, "Radial filter: dropping too-close fix (d=${d}m < ${threshold}m)")
-                        service.lastFixTimeMs = pt.timeMs
-                        service.stateRepository.saveLiveState(pt)
-                        GpsEventEmitter.emitLocation(
-                            pt.lat, pt.lon, pt.alt, pt.speed, pt.accuracy,
-                            service.locationSource.computeFixType(service.lastFixTimeMs), service.totalDistanceM, pt.timeMs, service.pointCount,
-                            service.isAutoPaused, service.signalLost, service.autoPauseGap.liveMovingMs(pt.timeMs)
-                        )
-                        service.notifier.updateNotification(
-            GpsRecorderNotification.NotificationSnapshot(
-                points = service.pointCount,
-                elapsedMs = service.getElapsedMs(),
-                isAutoPaused = service.isAutoPaused,
-                signalLost = service.signalLost
-            )
-        )
+                        emitDroppedFix(pt)
                         return
                     }
                 }
@@ -574,21 +370,7 @@ class LocationChangedHandler internal constructor(
                     val threshold = service.getRadialDistanceThresholdM().toDouble()
                     if (d < threshold) {
                         SafeLog.d(GpsRecorderService.TAG, "Radial filter (raw): dropping too-close fix (d=${d}m < ${threshold}m)")
-                        service.lastFixTimeMs = pt.timeMs
-                        service.stateRepository.saveLiveState(pt)
-                        GpsEventEmitter.emitLocation(
-                            pt.lat, pt.lon, pt.alt, pt.speed, pt.accuracy,
-                            service.locationSource.computeFixType(service.lastFixTimeMs), service.totalDistanceM, pt.timeMs, service.pointCount,
-                            service.isAutoPaused, service.signalLost, service.autoPauseGap.liveMovingMs(pt.timeMs)
-                        )
-                        service.notifier.updateNotification(
-            GpsRecorderNotification.NotificationSnapshot(
-                points = service.pointCount,
-                elapsedMs = service.getElapsedMs(),
-                isAutoPaused = service.isAutoPaused,
-                signalLost = service.signalLost
-            )
-        )
+                        emitDroppedFix(pt)
                         return
                     }
                 }
@@ -597,7 +379,7 @@ class LocationChangedHandler internal constructor(
             // data, but still keep the displayed distance sane by routing the
             // accuracy/velocity gates through the distance accumulator only.
             service.pointCount = service.segmentedBuffer.appendPointToCurrentSegment(pt)
-            accumulateDistance(pt, precomputedD)
+            distanceAccumulator.accumulateDistance(pt, precomputedD)
             service.lastFixTimeMs = pt.timeMs
         }
         // Save current state to SharedPreferences so JS can poll via getState()
@@ -626,47 +408,38 @@ class LocationChangedHandler internal constructor(
         )
     }
 
-    private fun accumulateDistance(pt: GpsPoint, precomputedDistanceM: Double? = null) {
-        val acc = pt.accuracy
-        if (acc != null && acc > ACCURACY_THRESHOLD_M) {
-            // Fix too inaccurate to trust for distance — skip but don't advance
-            // prev. The next fix is compared against the last good point.
-            return
-        }
-        val pLat = service.prevLat
-        val pLon = service.prevLon
-        val pTime = service.prevTimeMs
-        if (pLat != null && pLon != null && pTime != null) {
-            val dtSec = (pt.timeMs - pTime) / 1000.0
-            if (dtSec <= 0.0) {
-                // Zero/negative dt (duplicate timestamp or clock skew). Drop
-                // without advancing prev — the next fix's dt will be measured
-                // from the last good fix.
-                SafeLog.d(GpsRecorderService.TAG, "accumulateDistance: dropping zero-dt fix (dt=${dtSec}s)")
-                return
-            }
-            val d = precomputedDistanceM ?: TrackMath.haversineMeters(pLat, pLon, pt.lat, pt.lon)
-            // L22 fix: bypass velocity gate for sub-half-second dt — the
-            // displacement is too small to produce a reliable velocity.
-            if (dtSec >= MIN_VELOCITY_GATE_DT_SEC) {
-                val velocityMps = d / dtSec
-                // Drop the contribution if the implied velocity exceeds the walk/
-                // run ceiling. These are usually GPS glitches after a cold start
-                // or tunnel exit; they would otherwise inflate service.totalDistanceM.
-                if (velocityMps > MAX_VELOCITY_MPS) {
-                    SafeLog.d(GpsRecorderService.TAG, "accumulateDistance: dropping velocity outlier (v=${velocityMps}m/s d=${d}m dt=${dtSec}s)")
-                    // Do NOT advance prev — keep the last good fix as the
-                    // reference so the next fix's distance is computed from it,
-                    // not from this outlier.
-                    return
-                }
-            }
-            service.totalDistanceM += d
-        }
-        // Candidate accepted (or no prev to compare against) — advance cursor.
-        service.prevLat = pt.lat
-        service.prevLon = pt.lon
-        service.prevTimeMs = pt.timeMs
+    // K10: shared helpers for the emit-on-drop pattern. `emitFix` does the
+    // saveLiveState + emitLocation sequence that every drop site in this
+    // file (and in AutoPauseHandler) performs; `updateNotificationSnapshot`
+    // wraps the NotificationSnapshot builder; `emitDroppedFix` chains the
+    // two for the 6 on-the-fly-filter drop sites that DO update the
+    // notification (the auto-pause branches in AutoPauseHandler
+    // intentionally skip the notifier call — paused fixes don't toggle the
+    // notification — so they call their own emitFix copy directly).
+    private fun emitFix(pt: GpsPoint) {
+        service.lastFixTimeMs = pt.timeMs
+        service.stateRepository.saveLiveState(pt)
+        GpsEventEmitter.emitLocation(
+            pt.lat, pt.lon, pt.alt, pt.speed, pt.accuracy,
+            service.locationSource.computeFixType(service.lastFixTimeMs), service.totalDistanceM, pt.timeMs, service.pointCount,
+            service.isAutoPaused, service.signalLost, service.autoPauseGap.liveMovingMs(pt.timeMs)
+        )
+    }
+
+    private fun updateNotificationSnapshot() {
+        service.notifier.updateNotification(
+            GpsRecorderNotification.NotificationSnapshot(
+                points = service.pointCount,
+                elapsedMs = service.getElapsedMs(),
+                isAutoPaused = service.isAutoPaused,
+                signalLost = service.signalLost
+            )
+        )
+    }
+
+    private fun emitDroppedFix(pt: GpsPoint) {
+        emitFix(pt)
+        updateNotificationSnapshot()
     }
 
     // ------------------------------------------------------------------
