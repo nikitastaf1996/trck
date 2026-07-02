@@ -61,7 +61,7 @@ class GpsRecorderService : Service(), LocationListener {
         service = this,
         listener = this,
         onFatalError = { msg ->
-            GpsRecorderModule.emitError(msg, fatal = true)
+            GpsEventEmitter.emitError(msg, fatal = true)
             stopRecording()
         },
         onGnssStatusPersist = { sats, fixType ->
@@ -114,7 +114,15 @@ class GpsRecorderService : Service(), LocationListener {
     internal val autoPauseGap = AutoPauseGapController(this)
 
     // K5: state persistence / recovery helper.
-    private val stateRepository = StateRepository(this)
+    // K7: made `internal` so LocationChangedHandler can call
+    // saveLiveState() via `service.stateRepository.saveLiveState(pt)`.
+    internal val stateRepository = StateRepository(this)
+
+    // K7: onLocationChanged / accumulateDistance extracted to a dedicated
+    // LocationListener implementation. The service still implements
+    // LocationListener (because `locationSource` takes a LocationListener
+    // param) but delegates the four overrides to this handler.
+    private val locationHandler = LocationChangedHandler(this)
 
     companion object {
         internal const val TAG = "GpsRecorderService"
@@ -179,12 +187,12 @@ class GpsRecorderService : Service(), LocationListener {
         // before it can touch the buffer or the distance accumulator. Tightened
         // from 50 m to 25 m per the user's request — 25 m is still permissive
         // enough for cold-start fixes but filters out the worst multipath noise.
-        private const val ACCURACY_THRESHOLD_M = 25.0f
+        internal const val ACCURACY_THRESHOLD_M = 25.0f
 
         // Maximum acceptable age of a GPS fix (ms). Fixes older than this are dropped
         // in onLocationChanged to prevent stale cached fixes from inflating the
         // distance of a fresh recording. See "starts with 9 m / 69 m" bug fix.
-        private const val MAX_FIX_AGE_MS = 3000L
+        internal const val MAX_FIX_AGE_MS = 3000L
 
         // ---- Velocity-based filter (replaces the old 1 km static jump gate) ----
         //
@@ -203,7 +211,7 @@ class GpsRecorderService : Service(), LocationListener {
         //
         // Duplicate-timestamp fixes (dt == 0) are dropped because they would imply
         // infinite velocity.
-        private const val MAX_VELOCITY_MPS = 5.5556f   // 20 km/h walking/running ceiling
+        internal const val MAX_VELOCITY_MPS = 5.5556f   // 20 km/h walking/running ceiling
 
         // ---- Gaussian smoothing (post-processing) ----
         // Half-window size: each output point is a weighted average of the input
@@ -225,16 +233,16 @@ class GpsRecorderService : Service(), LocationListener {
         // the last AUTO_PAUSE_RAW_WINDOW_MS of fixes (regardless of whether
         // they passed the on-the-fly filter) and look at the maximum
         // pairwise displacement inside that window.
-        private const val AUTO_PAUSE_RAW_WINDOW_MS = 10_000L
+        internal const val AUTO_PAUSE_RAW_WINDOW_MS = 10_000L
         // Instantaneous speed below which the user is considered stationary.
         // 0.35 m/s ~ 1.26 km/h — a slow shuffle; anything below this is
         // effectively standing still.
-        private const val AUTO_PAUSE_SPEED_THRESHOLD_MPS = 0.35f
+        internal const val AUTO_PAUSE_SPEED_THRESHOLD_MPS = 0.35f
         // Maximum pairwise displacement within the sliding window below
         // which the user is considered stationary (i.e. not just bouncing
         // in place due to GPS noise). 3.5 m ~ the diameter of a typical
         // urban GPS noise bubble when standing still.
-        private const val AUTO_PAUSE_DISPLACEMENT_THRESHOLD_M = 3.5
+        internal const val AUTO_PAUSE_DISPLACEMENT_THRESHOLD_M = 3.5
 
         // ---- Auto-pause exit hysteresis (CODE_REVIEW_TODO Task 2) ----
         // To prevent the amber "АВТОПАУЗА" banner from flickering on rapid
@@ -253,9 +261,9 @@ class GpsRecorderService : Service(), LocationListener {
         // starts cleanly at the moment resume is confirmed. This loses ~2
         // seconds of track data at each resume — an acceptable trade-off
         // per CODE_REVIEW_TODO Task 2.
-        private const val MOVING_CONFIRMATION_THRESHOLD = 3   // consecutive fixes
-        private const val HYSTERESIS_SPEED_MS = 0.5f          // 0.5 m/s ≈ slow walk
-        private const val HYSTERESIS_DISPLACEMENT_MPS = 1.5   // fallback when speed is null/0
+        internal const val MOVING_CONFIRMATION_THRESHOLD = 3   // consecutive fixes
+        internal const val HYSTERESIS_SPEED_MS = 0.5f          // 0.5 m/s ≈ slow walk
+        internal const val HYSTERESIS_DISPLACEMENT_MPS = 1.5   // fallback when speed is null/0
         internal const val KEY_CONSECUTIVE_MOVING_FIXES = "consecutive_moving_fixes"
 
         // ---- Gap detection (signal loss) (Phase 4) ----
@@ -309,7 +317,7 @@ class GpsRecorderService : Service(), LocationListener {
         // velocity gate is bypassed for dt < MIN_VELOCITY_GATE_DT_SEC
         // — the displacement is too small to produce a reliable velocity.
         // dt <= 0 (duplicate timestamp) is still dropped.
-        private const val MIN_VELOCITY_GATE_DT_SEC = 0.5
+        internal const val MIN_VELOCITY_GATE_DT_SEC = 0.5
 
         // ---- L21: reloadPointsFromTempFile abort threshold ----
         // If more than this fraction of points have unparseable
@@ -401,14 +409,9 @@ class GpsRecorderService : Service(), LocationListener {
     // acceptable per Task 2).
     @Volatile internal var consecutiveMovingFixes: Int = 0
 
-    // ---- Time-sampling on-the-fly filter state ----
-    // Monotonic counter incremented for EVERY fix that arrives (after the
-    // stale-fix / gap / auto-pause checks). When time_sampling_enabled is
-    // on, only fixes where (counter % N == 0) are kept; the rest are
-    // dropped before any other gate runs. Reset to 0 in startRecording()
-    // so each recording starts a fresh sampling window. Not persisted across
-    // service restarts — a restart simply begins a new window.
-    @Volatile private var timeSamplingCounter: Int = 0
+    // K7: timeSamplingCounter moved to LocationChangedHandler (the handler
+    // owns it because the time-sampling gate runs entirely inside
+    // onLocationChanged, which now lives on the handler).
 
     // ---- L26: append-only temp-file state ----
     // `tempFileInitialized` becomes true after the first flush writes the
@@ -451,7 +454,7 @@ class GpsRecorderService : Service(), LocationListener {
                 } else {
                     autoPauseGap.liveMovingMs(now)
                 }
-                GpsRecorderModule.emitDuration(elapsed, currentMovingMs)
+                GpsEventEmitter.emitDuration(elapsed, currentMovingMs)
 
                 // Gap watchdog (Phase 4, L15-moved): if no fix in
                 // GAP_THRESHOLD_MS, declare signal lost so the UI can show
@@ -503,7 +506,7 @@ class GpsRecorderService : Service(), LocationListener {
                 signalLost = signalLost
             )
         )
-                        GpsRecorderModule.emitState(
+                        GpsEventEmitter.emitState(
                             isRecording, pointCount, getElapsedMs(),
                             isAutoPaused, signalLost, autoPauseGap.liveMovingMs(now)
                         )
@@ -635,12 +638,13 @@ class GpsRecorderService : Service(), LocationListener {
             // reset() reads `startTimeMs` (just set above) so lastResumeMs
             // is initialized to the recording start.
             autoPauseGap.reset()
-            // Reset the time-sampling counter so the new recording starts at
-            // fix #1 (which is always kept under any N because 1 % N != 0 is
-            // false only for N=1; we treat the very first fix specially — see
-            // onLocationChanged — so the first fix of a recording is always
-            // kept regardless of N).
-            timeSamplingCounter = 0
+            // K7: reset the time-sampling counter (now owned by
+            // LocationChangedHandler) so the new recording starts at fix #1
+            // (always kept under any N because 1 % N != 0 is false only for
+            // N=1; the handler treats the very first fix specially — see
+            // LocationChangedHandler.onLocationChanged — so the first fix of
+            // a recording is always kept regardless of N).
+            locationHandler.timeSamplingCounter = 0
             tempFileName = "gps_temp_${startTimeMs}.gpx"
             tempFileBuffer.tempFileName = tempFileName
             // L25 fix: reset the saveLiveState throttle so the first fix of
@@ -670,7 +674,7 @@ class GpsRecorderService : Service(), LocationListener {
             )
         ) {
             wakeLockManager.release()
-            GpsRecorderModule.emitError("Не удалось запустить foreground service", fatal = true)
+            GpsEventEmitter.emitError("Не удалось запустить foreground service", fatal = true)
             stopSelf()
         }
 
@@ -699,7 +703,7 @@ class GpsRecorderService : Service(), LocationListener {
             tempFileBuffer.writeGpxHeader()
         }
 
-        GpsRecorderModule.emitState(
+        GpsEventEmitter.emitState(
             true, pointCount, System.currentTimeMillis() - startTimeMs,
             isAutoPaused, signalLost, autoPauseGap.liveMovingMs()
         )
@@ -780,9 +784,9 @@ class GpsRecorderService : Service(), LocationListener {
         // was empty — emitting a 'saved' event in that case would make the UI
         // flash a 'GPX СОХРАНЁН' card with no real file behind it.
         if (savedOk) {
-            GpsRecorderModule.emitSaved(savedFilePath, pointCount, finalDistanceM)
+            GpsEventEmitter.emitSaved(savedFilePath, pointCount, finalDistanceM)
         }
-        GpsRecorderModule.emitState(false, 0, 0L, false, false, 0L)
+        GpsEventEmitter.emitState(false, 0, 0L, false, false, 0L)
 
         // Stop foreground + service
         stopForeground(STOP_FOREGROUND_REMOVE)
@@ -861,620 +865,37 @@ class GpsRecorderService : Service(), LocationListener {
     // ------------------------------------------------------------------
     // GPS callback
     // ------------------------------------------------------------------
+    //
+    // K7: the 470-line onLocationChanged body (8 filter stages: stale-fix,
+    // gap-detection / recovery, auto-pause enter / exit hysteresis,
+    // time-sampling, accuracy, velocity, radial-distance, raw-mode distance
+    // accumulator) was extracted verbatim to LocationChangedHandler.kt so
+    // this file could get under 1000 lines. The service still implements
+    // LocationListener (because LocationSource takes a LocationListener
+    // param) but every override is a one-line delegation to the handler.
 
-    override fun onLocationChanged(location: Location) {
-        if (!isRecording) return
-        val pt = GpsPoint(
-            lat = location.latitude,
-            lon = location.longitude,
-            alt = if (location.hasAltitude()) location.altitude else null,
-            speed = if (location.hasSpeed()) location.speed else null,
-            accuracy = if (location.hasAccuracy()) location.accuracy else null,
-            timeMs = if (location.time > 0) location.time else System.currentTimeMillis()
-        )
-        // A. Always reject stale cached fixes first. The OS occasionally hands us a
-        // slightly stale fix right after requestLocationUpdates() is called, and
-        // such a fix would poison prevLat/prevLon and inflate totalDistanceM on
-        // the next fresh fix. This is the second half of the "starts with 9 m /
-        // 69 m" fix (the first half is removing the getLastKnownLocation() seed).
-        val fixAgeMs = System.currentTimeMillis() - pt.timeMs
-        if (fixAgeMs > MAX_FIX_AGE_MS) {
-            // L33 fix: downgrade to SafeLog.d and strip lat/lon — this was
-            // the only Log.w call in the service that leaked GPS coordinates
-            // in release builds.
-            SafeLog.d(TAG, "Dropping stale fix: age=${fixAgeMs}ms")
-            return
-        }
+    override fun onLocationChanged(location: Location) =
+        locationHandler.onLocationChanged(location)
 
-        // ---- Phase 4: Gap detection (signal loss) ----
-        // If this fix arrived more than GAP_THRESHOLD_MS after the previous one,
-        // OR if the watchdog has already declared signalLost, treat this as gap
-        // recovery: split the track into a new segment and reset the validation
-        // cursor so the velocity gate doesn't compare across the gap. Distance
-        // across the gap is NOT added to totalDistanceM (prevLat is null after
-        // reset, so both the velocity gate and accumulateDistance skip it).
-        //
-        // Gated on the gap_detection_enabled setting. When the user has
-        // disabled gap detection, we skip the segment-split entirely (the
-        // next fix is appended to the current segment, and the velocity
-        // gate will compare it against the pre-gap point — the legacy pre-
-        // Phase-4 behaviour). signalLost can only be true at this point if
-        // the watchdog declared it while the setting was on, so even when
-        // the setting has just been toggled off mid-recording we still
-        // honor a previously-declared signalLost by clearing it without
-        // splitting the segment.
-        //
-        // Skip this block while auto-paused: stationary users have no
-        // incoming fixes by design, and the current segment was already
-        // finalized on auto-pause entry. Running handleGapRecovery here
-        // would create spurious 1-point segments in the GPX. See CHANGELOG.md.
-        //
-        // CODE_REVIEW_TODO Task 1: also skip while inside the auto-pause
-        // resume grace window. The resume fix itself arrives with
-        // isAutoPaused already flipped to false (exitAutoPause ran earlier
-        // in this same onLocationChanged call), so without the grace check
-        // this branch would compare `pt.timeMs - lastFixTimeMs` (which
-        // exitAutoPause just refreshed to `pt.timeMs`, so the diff is 0)
-        // — but on the NEXT fix, if the user stood still for ~25 s before
-        // resuming, lastFixTimeMs may still point to a stale pre-pause
-        // value and the diff would exceed GAP_THRESHOLD_MS, falsely
-        // triggering a segment split. The grace check makes the invariant
-        // explicit.
-        if (isGapDetectionEnabled() && !isAutoPaused
-            && pt.timeMs >= autoPauseResumeGraceUntilMs   // Task 1
-        ) {
-            val gapDetected = lastFixTimeMs > 0L && (pt.timeMs - lastFixTimeMs) > GAP_THRESHOLD_MS
-            if (gapDetected || signalLost) {
-                Log.i(
-                    TAG,
-                    "Gap recovery: gapSinceLast=${if (lastFixTimeMs > 0L) pt.timeMs - lastFixTimeMs else -1}ms" +
-                        " signalLostWas=$signalLost"
-                )
-                autoPauseGap.handleGapRecovery(pt.timeMs)
-            }
-        } else if (signalLost) {
-            // Setting was toggled off after the watchdog declared signalLost,
-            // OR we're auto-paused (in which case the watchdog should not have
-            // fired — but be defensive). Clear the flag without splitting the
-            // segment so the UI banner dismisses itself, but the track keeps
-            // its current segment structure.
-            signalLost = false
-            autoPauseGap.persistAutoPauseState()
-            notifier.updateNotification(
-            GpsRecorderNotification.NotificationSnapshot(
-                points = pointCount,
-                elapsedMs = getElapsedMs(),
-                isAutoPaused = isAutoPaused,
-                signalLost = signalLost
-            )
-        )
-            Log.i(TAG, "Gap detection disabled or auto-paused — clearing signalLost flag")
-        }
-
-        // ---- Phase 3: Auto-pause (stop detection) ----
-        // When enabled, we maintain a sliding window of the last
-        // AUTO_PAUSE_RAW_WINDOW_MS of raw fixes and check two conditions:
-        //   1. Instantaneous speed < AUTO_PAUSE_SPEED_THRESHOLD_MPS
-        //   2. Maximum pairwise displacement in the window < AUTO_PAUSE_DISPLACEMENT_THRESHOLD_M
-        // If both are true, the user is considered stationary; we enter (or
-        // stay in) auto-pause and skip recording the point. When the user
-        // starts moving again, we exit auto-pause and start a new segment.
-        if (isAutoPauseEnabled()) {
-            // Push to sliding raw window and prune entries older than the window.
-            rawWindow.add(pt)
-            val windowCutoff = pt.timeMs - AUTO_PAUSE_RAW_WINDOW_MS
-            while (rawWindow.isNotEmpty() && rawWindow.peek().timeMs < windowCutoff) {
-                rawWindow.poll()
-            }
-
-            // L11 fix: do NOT treat a missing speed as 'stationary'. When
-            // Location.hasSpeed() is false (cold start, poor signal, some
-            // devices / emulators), pt.speed is null. The previous code
-            // coerced it to 0f, which made speedOk = true (stationary) and
-            // contributed to false auto-pause triggers even while the user
-            // was moving. We now treat a null speed as 'not stationary' so
-            // the displacement check (line below) is the sole backstop —
-            // exactly what we want when the GPS can't tell us our speed.
-            val speedOk = pt.speed?.let { it < AUTO_PAUSE_SPEED_THRESHOLD_MPS } ?: false
-            val disp = autoPauseGap.maxDisplacementInWindow()
-            val dispOk = disp < AUTO_PAUSE_DISPLACEMENT_THRESHOLD_M
-            val stopped = speedOk && dispOk
-
-            if (stopped) {
-                // User is stationary.
-                if (!isAutoPaused) {
-                    Log.i(
-                        TAG,
-                        "Auto-pause entering: speed=${pt.speed} disp=${disp}m window=${rawWindow.size}"
-                    )
-                    autoPauseGap.enterAutoPause(pt.timeMs)
-                }
-                // CODE_REVIEW_TODO Task 2: a stationary fix while paused
-                // resets the moving-confirmation counter (the user has to
-                // re-accumulate MOVING_CONFIRMATION_THRESHOLD consecutive
-                // fast fixes to resume). enterAutoPause() also resets it,
-                // but we reset here too so a slow fix during the
-                // confirmation window — without re-entering pause — also
-                // resets the counter.
-                if (isAutoPaused) consecutiveMovingFixes = 0
-                // While paused: do NOT add the point to the buffer and do NOT
-                // accumulate distance. But DO update lastFixTimeMs and live
-                // state so the UI knows we still have a fix (and isn't fooled
-                // into thinking we lost signal).
-                lastFixTimeMs = pt.timeMs
-                stateRepository.saveLiveState(pt)
-                GpsRecorderModule.emitLocation(
-                    pt.lat, pt.lon, pt.alt, pt.speed, pt.accuracy,
-                    locationSource.computeFixType(lastFixTimeMs), totalDistanceM, pt.timeMs, pointCount,
-                    isAutoPaused, signalLost, autoPauseGap.liveMovingMs(pt.timeMs)
-                )
-                return
-            } else {
-                // User is moving.
-                if (isAutoPaused) {
-                    // CODE_REVIEW_TODO Task 2: hysteresis — require
-                    // MOVING_CONFIRMATION_THRESHOLD consecutive "clearly
-                    // moving" fixes before resuming. This prevents the
-                    // amber "АВТОПАУЗА" banner from flickering on rapid
-                    // pause/resume oscillation (e.g. very slow walking
-                    // ~0.3 m/s with GPS drift can oscillate at the 10 s
-                    // window boundary). Each flicker creates a new <trkseg>
-                    // and toggles the notification / banner — technically
-                    // correct but feels glitchy.
-                    //
-                    // A fix counts as "clearly moving" if EITHER:
-                    //   - pt.speed >= HYSTERESIS_SPEED_MS (primary), OR
-                    //   - pt.speed is null/0 AND haversine displacement
-                    //     from the last kept fix implies velocity >=
-                    //     HYSTERESIS_DISPLACEMENT_MPS (fallback for
-                    //     receivers that don't populate Location.speed).
-                    //
-                    // The first (MOVING_CONFIRMATION_THRESHOLD - 1)
-                    // confirmation fixes are dropped (same pattern as the
-                    // stopped branch above) so the post-pause segment
-                    // starts cleanly at the moment resume is confirmed.
-                    // This loses ~2 s of track data at each resume —
-                    // acceptable per Task 2.
-                    val speedBased = pt.speed != null && pt.speed >= HYSTERESIS_SPEED_MS
-                    val dispBased = (!speedBased && (pt.speed == null || pt.speed == 0f)) && run {
-                        val pLat = prevLat
-                        val pLon = prevLon
-                        val pTime = prevTimeMs
-                        if (pLat != null && pLon != null && pTime != null) {
-                            val dtSec = (pt.timeMs - pTime) / 1000.0
-                            if (dtSec > 0) {
-                                val d = TrackMath.haversineMeters(pLat, pLon, pt.lat, pt.lon)
-                                (d / dtSec) >= HYSTERESIS_DISPLACEMENT_MPS
-                            } else false
-                        } else false
-                    }
-                    if (speedBased || dispBased) {
-                        consecutiveMovingFixes++
-                        if (consecutiveMovingFixes >= MOVING_CONFIRMATION_THRESHOLD) {
-                            Log.i(
-                                TAG,
-                                "Auto-pause resuming after $consecutiveMovingFixes confirmation fixes:" +
-                                    " speed=${pt.speed} disp=${disp}m window=${rawWindow.size}"
-                            )
-                            autoPauseGap.exitAutoPause(pt.timeMs)
-                            // ← fall through; this fix is added to the new
-                            // post-resume segment (exitAutoPause called
-                            // createNewSegment above).
-                        } else {
-                            // Confirmation in progress — still auto-paused.
-                            // Drop the fix (same pattern as the stopped
-                            // branch) so the buffer stays clean until the
-                            // resume is confirmed. The UI still gets the
-                            // location event so the user sees their
-                            // current position update.
-                            Log.i(
-                                TAG,
-                                "Auto-pause confirmation $consecutiveMovingFixes/$MOVING_CONFIRMATION_THRESHOLD:" +
-                                    " speed=${pt.speed} disp=${disp}m — staying paused"
-                            )
-                            lastFixTimeMs = pt.timeMs
-                            stateRepository.saveLiveState(pt)
-                            GpsRecorderModule.emitLocation(
-                                pt.lat, pt.lon, pt.alt, pt.speed, pt.accuracy,
-                                locationSource.computeFixType(lastFixTimeMs), totalDistanceM, pt.timeMs, pointCount,
-                                isAutoPaused, signalLost, autoPauseGap.liveMovingMs(pt.timeMs)
-                            )
-                            return
-                        }
-                    } else {
-                        // User moved a little but not clearly enough to
-                        // count toward resume confirmation. Reset the
-                        // counter and stay paused. Drop the fix.
-                        if (consecutiveMovingFixes > 0) {
-                            Log.i(
-                                TAG,
-                                "Auto-pause confirmation reset (was $consecutiveMovingFixes):" +
-                                    " speed=${pt.speed} disp=${disp}m — staying paused"
-                            )
-                        }
-                        consecutiveMovingFixes = 0
-                        lastFixTimeMs = pt.timeMs
-                        stateRepository.saveLiveState(pt)
-                        GpsRecorderModule.emitLocation(
-                            pt.lat, pt.lon, pt.alt, pt.speed, pt.accuracy,
-                            locationSource.computeFixType(lastFixTimeMs), totalDistanceM, pt.timeMs, pointCount,
-                            isAutoPaused, signalLost, autoPauseGap.liveMovingMs(pt.timeMs)
-                        )
-                        return
-                    }
-                }
-            }
-        }
-
-        // The "post_process_enabled" setting is now interpreted as ON-THE-FLY track
-        // filtering: when it is on, noisy / wild points are dropped at write time
-        // so the GPX buffer only ever contains clean, validated fixes and there is
-        // nothing left to post-process at finalization. When it is off, every fix
-        // is recorded raw (the fallback / diagnostic mode).
-        //
-        // ---- Time-sampling on-the-fly filter (independent toggle) ----
-        // Keep every N-th fix; drop the rest. The dropped fix is still "fresh"
-        // (it's a good GPS fix, just denser than the user wants), so we update
-        // lastFixTimeMs + saveLiveState + emit before returning. This keeps the
-        // UI's lastFix display current and prevents the gap watchdog from
-        // falsely firing (since lastFixTimeMs advances on every fix, kept or
-        // dropped).
-        //
-        // The counter is reset to 0 in startRecording() and incremented for
-        // every fix that reaches this point. The first fix of a recording
-        // (counter == 1 after the increment below) is ALWAYS kept so the
-        // track has a starting point even when N > 1.
-        if (isTimeSamplingEnabled()) {
-            timeSamplingCounter++
-            val n = getTimeSamplingN().coerceAtLeast(1)
-            val keep = (n == 1) || (timeSamplingCounter == 1) || (timeSamplingCounter % n == 0)
-            if (!keep) {
-                SafeLog.d(TAG, "Time sampling: dropping fix #${timeSamplingCounter} (n=$n)")
-                lastFixTimeMs = pt.timeMs
-                stateRepository.saveLiveState(pt)
-                GpsRecorderModule.emitLocation(
-                    pt.lat, pt.lon, pt.alt, pt.speed, pt.accuracy,
-                    locationSource.computeFixType(lastFixTimeMs), totalDistanceM, pt.timeMs, pointCount,
-                    isAutoPaused, signalLost, autoPauseGap.liveMovingMs(pt.timeMs)
-                )
-                notifier.updateNotification(
-            GpsRecorderNotification.NotificationSnapshot(
-                points = pointCount,
-                elapsedMs = getElapsedMs(),
-                isAutoPaused = isAutoPaused,
-                signalLost = signalLost
-            )
-        )
-                return
-            }
-        }
-
-        if (isPostProcessEnabled()) {
-            // B. Accuracy gate: skip fixes whose reported accuracy is worse than the
-            // threshold. These are almost always multipath or cold-start noise.
-            //
-            // L4 fix: dropped fixes MUST still advance lastFixTimeMs, save live
-            // state, and emit a location event — same pattern the time-sampling
-            // drop (above) and the radial filter drop (below) use. Without this
-            // the UI's lastFix display freezes for the dropped fix, the gap
-            // watchdog falsely fires 'signalLost' after 15 s of dropped fixes,
-            // and getState() polling returns stale data.
-            //
-            // We do NOT advance prevLat/prevLon — these are dropped fixes and
-            // must not become the reference for the next fix's velocity /
-            // distance computation.
-            val acc = pt.accuracy
-            if (acc != null && acc > ACCURACY_THRESHOLD_M) {
-                SafeLog.d(TAG, "On-the-fly filter: dropping low-accuracy fix (acc=${acc}m)")
-                lastFixTimeMs = pt.timeMs
-                stateRepository.saveLiveState(pt)
-                GpsRecorderModule.emitLocation(
-                    pt.lat, pt.lon, pt.alt, pt.speed, pt.accuracy,
-                    locationSource.computeFixType(lastFixTimeMs), totalDistanceM, pt.timeMs, pointCount,
-                    isAutoPaused, signalLost, autoPauseGap.liveMovingMs(pt.timeMs)
-                )
-                notifier.updateNotification(
-            GpsRecorderNotification.NotificationSnapshot(
-                points = pointCount,
-                elapsedMs = getElapsedMs(),
-                isAutoPaused = isAutoPaused,
-                signalLost = signalLost
-            )
-        )
-                return
-            }
-            // C. Velocity-based plausibility gate: compute the instantaneous
-            // velocity from the previous accepted fix to this candidate, and drop
-            // the candidate if it implies the user moved faster than the walking /
-            // running ceiling (20 km/h). This replaces the old static 1 km jump
-            // gate, which only caught glitches that were already absurdly large.
-            //
-            //   velocity = haversine(prev, curr) / (t_curr - t_prev)
-            //
-            // A zero-dt fix (duplicate timestamp) is dropped because it would
-            // imply infinite velocity.
-            //
-            // L22 fix: a sub-half-second dt (50–200 ms) bypasses the velocity
-            // gate entirely. Some GPS receivers emit clustered fixes with
-            // very small dt; a normal 1.4 m/s walk over 100 ms yields 14 m/s,
-            // which would exceed the 20 km/h ceiling and get the fix dropped
-            // even though it's a legitimate walking point. The displacement
-            // is too small to produce a reliable velocity, so we accept the
-            // fix without a velocity check. dt <= 0 (duplicate timestamp) is
-            // still dropped.
-            //
-            // NOTE: prevLat is null after a resetValidationCursor() call (auto-
-            // pause resume / gap recovery), so this gate is naturally bypassed
-            // for the first fix after such a transition — exactly what we want,
-            // since that fix has no meaningful "previous" to compare against.
-            //
-            // L4 fix (see accuracy gate above): the zero-dt and velocity drops
-            // also mirror the time-sampling drop pattern so the UI stays fresh
-            // and the gap watchdog doesn't fire falsely.
-            var distanceToAdd = 0.0
-            val pLat = prevLat
-            val pLon = prevLon
-            val pTime = prevTimeMs
-            if (pLat != null && pLon != null && pTime != null) {
-                val dtSec = (pt.timeMs - pTime) / 1000.0
-                if (dtSec <= 0.0) {
-                    SafeLog.d(TAG, "On-the-fly filter: dropping zero-dt fix (dt=${dtSec}s)")
-                    lastFixTimeMs = pt.timeMs
-                    stateRepository.saveLiveState(pt)
-                    GpsRecorderModule.emitLocation(
-                        pt.lat, pt.lon, pt.alt, pt.speed, pt.accuracy,
-                        locationSource.computeFixType(lastFixTimeMs), totalDistanceM, pt.timeMs, pointCount,
-                        isAutoPaused, signalLost, autoPauseGap.liveMovingMs(pt.timeMs)
-                    )
-                    notifier.updateNotification(
-            GpsRecorderNotification.NotificationSnapshot(
-                points = pointCount,
-                elapsedMs = getElapsedMs(),
-                isAutoPaused = isAutoPaused,
-                signalLost = signalLost
-            )
-        )
-                    return
-                }
-                val d = TrackMath.haversineMeters(pLat, pLon, pt.lat, pt.lon)
-                if (dtSec >= MIN_VELOCITY_GATE_DT_SEC) {
-                    val velocityMps = d / dtSec
-                    if (velocityMps > MAX_VELOCITY_MPS) {
-                        SafeLog.d(TAG, "On-the-fly filter: dropping velocity outlier (v=${velocityMps}m/s d=${d}m dt=${dtSec}s)")
-                        lastFixTimeMs = pt.timeMs
-                        stateRepository.saveLiveState(pt)
-                        GpsRecorderModule.emitLocation(
-                            pt.lat, pt.lon, pt.alt, pt.speed, pt.accuracy,
-                            locationSource.computeFixType(lastFixTimeMs), totalDistanceM, pt.timeMs, pointCount,
-                            isAutoPaused, signalLost, autoPauseGap.liveMovingMs(pt.timeMs)
-                        )
-                        notifier.updateNotification(
-            GpsRecorderNotification.NotificationSnapshot(
-                points = pointCount,
-                elapsedMs = getElapsedMs(),
-                isAutoPaused = isAutoPaused,
-                signalLost = signalLost
-            )
-        )
-                        return
-                    }
-                }
-                distanceToAdd = d
-                // ---- Radial-distance on-the-fly filter (independent toggle) ----
-                // Drops the candidate if it is closer than threshold meters to
-                // the last KEPT point (which is what prevLat/prevLon currently
-                // point to — they only advance after a fix is appended below).
-                // This is independent of the accuracy / velocity gate above; it
-                // can be enabled on its own to suppress stationary GPS jitter
-                // that the velocity gate considers plausible (e.g. the user
-                // standing still and the GPS drifting around within a 3 m
-                // radius at ~0.3 m/s — below the 0.35 m/s auto-pause threshold
-                // but well within the 20 km/h velocity ceiling).
-                //
-                // We re-use the haversine distance `d` already computed above so
-                // we don't pay for a second haversine call. The dropped fix is
-                // still "fresh" (good GPS), so we update lastFixTimeMs +
-                // saveLiveState + emit before returning — same pattern as the
-                // time-sampling drop above.
-                //
-                // Stage distanceToAdd in a local and only commit to
-                // totalDistanceM *after* the radial filter check passes, so
-                // the cursor and the accumulator always advance together
-                // (otherwise dropped fixes would double-count their step
-                // distance). See CHANGELOG.md.
-                if (isRadialDistanceFilterEnabled()) {
-                    val threshold = getRadialDistanceThresholdM().toDouble()
-                    if (d < threshold) {
-                        SafeLog.d(TAG, "Radial filter: dropping too-close fix (d=${d}m < ${threshold}m)")
-                        lastFixTimeMs = pt.timeMs
-                        stateRepository.saveLiveState(pt)
-                        GpsRecorderModule.emitLocation(
-                            pt.lat, pt.lon, pt.alt, pt.speed, pt.accuracy,
-                            locationSource.computeFixType(lastFixTimeMs), totalDistanceM, pt.timeMs, pointCount,
-                            isAutoPaused, signalLost, autoPauseGap.liveMovingMs(pt.timeMs)
-                        )
-                        notifier.updateNotification(
-            GpsRecorderNotification.NotificationSnapshot(
-                points = pointCount,
-                elapsedMs = getElapsedMs(),
-                isAutoPaused = isAutoPaused,
-                signalLost = signalLost
-            )
-        )
-                        return
-                    }
-                }
-            }
-            // D. Point passed both gates — commit it to the current segment and
-            // advance the previous-fix cursor.
-            // Accumulate only after confirming the point passes the radial
-            // filter, so dropped fixes don't leak distance into totalDistanceM.
-            totalDistanceM += distanceToAdd
-            pointCount = segmentedBuffer.appendPointToCurrentSegment(pt)
-            prevLat = pt.lat
-            prevLon = pt.lon
-            prevTimeMs = pt.timeMs
-            lastFixTimeMs = pt.timeMs
-        } else {
-            // ---- Radial-distance on-the-fly filter (raw mode) ----
-            // Same logic as in the post_process branch above, but we have to
-            // compute the haversine ourselves because the velocity gate runs
-            // inside accumulateDistance() and we don't have a `d` in scope.
-            // We check against prevLat (last KEPT point) before appending.
-            //
-            // L29 fix: when the radial filter is enabled, we compute `d` here
-            // and pass it to accumulateDistance() via the new
-            // `precomputedDistanceM` parameter — eliminating the duplicate
-            // haversine call that the previous version made inside
-            // accumulateDistance(). When the radial filter is disabled, we
-            // pass null and let accumulateDistance() compute `d` itself.
-            var precomputedD: Double? = null
-            if (isRadialDistanceFilterEnabled()) {
-                val pLat = prevLat
-                val pLon = prevLon
-                if (pLat != null && pLon != null) {
-                    val d = TrackMath.haversineMeters(pLat, pLon, pt.lat, pt.lon)
-                    precomputedD = d
-                    val threshold = getRadialDistanceThresholdM().toDouble()
-                    if (d < threshold) {
-                        SafeLog.d(TAG, "Radial filter (raw): dropping too-close fix (d=${d}m < ${threshold}m)")
-                        lastFixTimeMs = pt.timeMs
-                        stateRepository.saveLiveState(pt)
-                        GpsRecorderModule.emitLocation(
-                            pt.lat, pt.lon, pt.alt, pt.speed, pt.accuracy,
-                            locationSource.computeFixType(lastFixTimeMs), totalDistanceM, pt.timeMs, pointCount,
-                            isAutoPaused, signalLost, autoPauseGap.liveMovingMs(pt.timeMs)
-                        )
-                        notifier.updateNotification(
-            GpsRecorderNotification.NotificationSnapshot(
-                points = pointCount,
-                elapsedMs = getElapsedMs(),
-                isAutoPaused = isAutoPaused,
-                signalLost = signalLost
-            )
-        )
-                        return
-                    }
-                }
-            }
-            // E. Fallback: record every fix raw so the GPX file keeps the noisy
-            // data, but still keep the displayed distance sane by routing the
-            // accuracy/velocity gates through the distance accumulator only.
-            pointCount = segmentedBuffer.appendPointToCurrentSegment(pt)
-            accumulateDistance(pt, precomputedD)
-            lastFixTimeMs = pt.timeMs
-        }
-        // Save current state to SharedPreferences so JS can poll via getState()
-        // even if the event emitter is not delivering events reliably.
-        stateRepository.saveLiveState(pt)
-        // Emit the event with pointCount + auto-pause / signal state so the JS
-        // UI can reflect pause / gap status in real time.
-        //
-        // Emit liveMovingMs(pt.timeMs): the frozen movingMs field is only
-        // updated at auto-pause transitions, so between transitions it would
-        // make the displayed avg pace wildly off. liveMovingMs adds the time
-        // elapsed since the last resume so the value tracks the actual walk
-        // second-by-second. See CHANGELOG.md.
-        GpsRecorderModule.emitLocation(
-            pt.lat, pt.lon, pt.alt, pt.speed, pt.accuracy,
-            locationSource.computeFixType(lastFixTimeMs), totalDistanceM, pt.timeMs, pointCount,
-            isAutoPaused, signalLost, autoPauseGap.liveMovingMs(pt.timeMs)
-        )
-        notifier.updateNotification(
-            GpsRecorderNotification.NotificationSnapshot(
-                points = pointCount,
-                elapsedMs = getElapsedMs(),
-                isAutoPaused = isAutoPaused,
-                signalLost = signalLost
-            )
-        )
-    }
-
-    /**
-     * Adds the Haversine distance between [pt] and the previous accepted fix to
-     * [totalDistanceM]. Filters out fixes with poor accuracy or implausible
-     * velocity (walk/run ceiling 20 km/h) to avoid GPS noise inflating the
-     * distance. This is the path used when on-the-fly filtering is OFF (raw
-     * recording) — the point itself is still added to the buffer (raw mode),
-     * but the distance accumulator stays sane.
-     *
-     * L29 fix: accepts an optional [precomputedDistanceM] so callers that
-     * have already computed the haversine (e.g. the raw-mode radial filter)
-     * can pass it in instead of recomputing it here. When null, the
-     * function computes the distance itself.
-     *
-     * L22 fix: sub-half-second dt (50–200 ms) bypasses the velocity gate.
-     * See the on-the-fly filter comment in onLocationChanged for details.
-     *
-     * BUGFIX (raw-mode distance leakage): previously this function updated
-     * `prevLat` / `prevLon` / `prevTimeMs` UNCONDITIONALLY at the end, even
-     * when the candidate was rejected by the accuracy or velocity gate. That
-     * meant the next fix's distance was computed from the rejected outlier
-     * instead of the last good point — so a single GPS glitch (e.g. a 200 m
-     * teleport) added the *return* hop back to the true track on the next
-     * fix, even though the outbound hop was correctly dropped. The displayed
-     * distance silently grew by the size of every glitch.
-     *
-     * Now we only advance the cursor when the candidate is ACCEPTED. If the
-     * candidate is rejected, the cursor stays at the last good fix and the
-     * next fix is compared against that — which is what the on-the-fly filter
-     * path already did. The two paths now behave identically w.r.t. the
-     * prev cursor; they differ only in whether the raw point is appended to
-     * the buffer.
-     */
-    private fun accumulateDistance(pt: GpsPoint, precomputedDistanceM: Double? = null) {
-        val acc = pt.accuracy
-        if (acc != null && acc > ACCURACY_THRESHOLD_M) {
-            // Fix too inaccurate to trust for distance — skip but don't advance
-            // prev. The next fix is compared against the last good point.
-            return
-        }
-        val pLat = prevLat
-        val pLon = prevLon
-        val pTime = prevTimeMs
-        if (pLat != null && pLon != null && pTime != null) {
-            val dtSec = (pt.timeMs - pTime) / 1000.0
-            if (dtSec <= 0.0) {
-                // Zero/negative dt (duplicate timestamp or clock skew). Drop
-                // without advancing prev — the next fix's dt will be measured
-                // from the last good fix.
-                SafeLog.d(TAG, "accumulateDistance: dropping zero-dt fix (dt=${dtSec}s)")
-                return
-            }
-            val d = precomputedDistanceM ?: TrackMath.haversineMeters(pLat, pLon, pt.lat, pt.lon)
-            // L22 fix: bypass velocity gate for sub-half-second dt — the
-            // displacement is too small to produce a reliable velocity.
-            if (dtSec >= MIN_VELOCITY_GATE_DT_SEC) {
-                val velocityMps = d / dtSec
-                // Drop the contribution if the implied velocity exceeds the walk/
-                // run ceiling. These are usually GPS glitches after a cold start
-                // or tunnel exit; they would otherwise inflate totalDistanceM.
-                if (velocityMps > MAX_VELOCITY_MPS) {
-                    SafeLog.d(TAG, "accumulateDistance: dropping velocity outlier (v=${velocityMps}m/s d=${d}m dt=${dtSec}s)")
-                    // Do NOT advance prev — keep the last good fix as the
-                    // reference so the next fix's distance is computed from it,
-                    // not from this outlier.
-                    return
-                }
-            }
-            totalDistanceM += d
-        }
-        // Candidate accepted (or no prev to compare against) — advance cursor.
-        prevLat = pt.lat
-        prevLon = pt.lon
-        prevTimeMs = pt.timeMs
-    }
+    // K7: accumulateDistance moved to LocationChangedHandler. The handler
+    // calls it as a private method from inside its onLocationChanged
+    // (raw-mode branch only — see the `else` clause after the
+    // isPostProcessEnabled gate).
 
     // K5: saveLiveState / persistRawWindow / restoreRawWindow extracted to
     // StateRepository. Call sites go through `stateRepository.xxx(...)`.
 
-    // Required overrides for older Android API levels
-    override fun onProviderEnabled(provider: String) {}
-    override fun onProviderDisabled(provider: String) {
-        Log.w(TAG, "Provider disabled: $provider")
-    }
+    // Required overrides for older Android API levels (K7: delegated to
+    // LocationChangedHandler).
+    override fun onProviderEnabled(provider: String) =
+        locationHandler.onProviderEnabled(provider)
+
+    override fun onProviderDisabled(provider: String) =
+        locationHandler.onProviderDisabled(provider)
+
     @Deprecated("legacy")
-    override fun onStatusChanged(provider: String?, status: Int, extras: Bundle?) {}
+    override fun onStatusChanged(provider: String?, status: Int, extras: Bundle?) =
+        locationHandler.onStatusChanged(provider, status, extras)
 
     // ------------------------------------------------------------------
     // Wakelock
@@ -1522,7 +943,7 @@ class GpsRecorderService : Service(), LocationListener {
      */
     private fun isRadialDistanceFilterEnabled(): Boolean = GpsRecorderSettings.isRadialDistanceFilterEnabled(this)
 
-    private fun getRadialDistanceThresholdM(): Int = GpsRecorderSettings.getRadialDistanceThresholdM(this)
+    internal fun getRadialDistanceThresholdM(): Int = GpsRecorderSettings.getRadialDistanceThresholdM(this)
 
     /**
      * Reads the time-sampling on-the-fly filter setting. When enabled,
@@ -1532,7 +953,7 @@ class GpsRecorderService : Service(), LocationListener {
      */
     private fun isTimeSamplingEnabled(): Boolean = GpsRecorderSettings.isTimeSamplingEnabled(this)
 
-    private fun getTimeSamplingN(): Int = GpsRecorderSettings.getTimeSamplingN(this)
+    internal fun getTimeSamplingN(): Int = GpsRecorderSettings.getTimeSamplingN(this)
 
     /**
      * Reads the Douglas-Peucker post-processing setting. When enabled,

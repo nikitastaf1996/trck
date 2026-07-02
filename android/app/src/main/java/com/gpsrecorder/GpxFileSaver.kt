@@ -307,7 +307,7 @@ class GpxFileSaver(
             return total
         } catch (e: Exception) {
             Log.w(tag, "recomputeDistanceFromSavedGpx failed for '$savedPath'", e)
-            GpsRecorderModule.emitError(
+            GpsEventEmitter.emitError(
                 "Could not recompute distance from saved GPX file; showing live distance instead.",
                 fatal = false
             )

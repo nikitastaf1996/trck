@@ -367,7 +367,7 @@ class StateRepository(private val service: GpsRecorderService) {
             )
         ) {
             service.wakeLockManager.release()
-            GpsRecorderModule.emitError("Не удалось запустить foreground service", fatal = true)
+            GpsEventEmitter.emitError("Не удалось запустить foreground service", fatal = true)
             service.stopSelf()
         }
         }
