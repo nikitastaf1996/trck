@@ -11,6 +11,87 @@ and what the fix does.
 
 ---
 
+## O7/O24 refactor — split giant files into cohesive modules
+
+The two giant unwieldy files (`GpsRecorderService.kt` at 3 445 lines and
+`App.tsx` at 2 135 lines) have been split into focused, single-responsibility
+modules. **No behaviour changes** — every constant, every invariant, every
+Russian string, every L* / U* / O* fix is preserved verbatim. The existing
+tests (`__tests__/format.test.ts` — 39 assertions, all green) and the
+`GapPauseRaceTest.kt` contract are unchanged.
+
+### Kotlin side (`android/app/src/main/java/com/gpsrecorder/`)
+
+| File | Lines | Responsibility |
+|---|---|---|
+| `GpsRecorderService.kt` | 3 445 → 2 892 | Orchestration shell: lifecycle, GPS callbacks, segmented buffer, auto-pause + gap state machine, distance accumulator, temp-file buffering, save pipeline, state persistence. Delegates GPX formatting / parsing / post-processing / settings / notification to the modules below. |
+| `GpxIO.kt` (new) | 316 | Pure GPX 1.1 parse / format / serialize (XmlPullParser-based). Owns `GpsPoint`, `GpxTrkPt`, `GpxSegment`, `GpxParseResult` data classes, the shared `ISO_SDF` / `FILENAME_SDF` SimpleDateFormat instances (L32), and the `TEMP_FILE_CLOSING_TAGS` constants (L26). |
+| `GpxPostProcessors.kt` (new) | 301 | Finalize-time post-processors: `gaussianSmoothGpx` (±5 kernel, σ=1.5, L2 elevation fix) and `douglasPeuckerGpx` (iterative, explicit ArrayDeque stack). Owns `GAUSSIAN_HALF_WINDOW` / `GAUSSIAN_SIGMA`. |
+| `GpsRecorderSettings.kt` (new) | 156 | Single source of truth for the `"gps_recorder_settings"` prefs file name and all 8 toggle keys + 3 numeric keys + 3 defaults. Eliminates 11 duplicated `"gps_recorder_settings"` string literals and ~40 lines of `getSharedPreferences(...).getXxx(KEY, default)` boilerplate. |
+| `GpsRecorderNotification.kt` (new) | 197 | Foreground notification builder + `startForeground` lifecycle. Encapsulates the L18 `ForegroundServiceStartNotAllowedException` catch + wakelock-release / `stopSelf` / fatal-error-emit recovery. |
+| `GpsPoint.kt` (new) | 21 | Top-level `data class GpsPoint` (was a private inner class of the service). |
+
+### TypeScript side (`src/components/`)
+
+| File | Lines | Responsibility |
+|---|---|---|
+| `App.tsx` | 2 135 → 1 369 | Composition root: state (30 `useState`, 13 `useRef`, 1 `useReducer`), 8 `useEffect`, 17 `useCallback`, 6 native event subscriptions, `handleStart` / `handleStop`, all 10 settings toggle handlers. Renders using the extracted components below. |
+| `ToggleRow.tsx` (new) | 148 | Reusable settings toggle row (label + subtitle + iOS-style switch + knob). Replaces 8 inlined copies of the same ~30-line JSX block. |
+| `FilterSettingGroup.tsx` (new) | 84 | ToggleRow + StepperRow combined into a single "card". Replaces 3 inlined copies (radial distance, time sampling, Douglas-Peucker). |
+| `StatsDisplay.tsx` (new) | 213 | Primary stats block (TIME / DISTANCE / TEMPO / AVG TEMPO) + status row + 5-fix window pace smoothing. Exports `getStatusText()` and `selectPaceTimeMs()` as pure testable functions. |
+| `StartStopButton.tsx` (new) | 85 | Big circular START / STOP button with start / stop / pressed / stopping variants. |
+| `SavedCard.tsx` (new) | 159 | "GPX СОХРАНЁН" card with final-distance + pace display. Replaces an inline IIFE; the pace-time-base logic is now a pure exported function `selectPaceTimeMs`. |
+| `ErrorCard.tsx` (new) | 106 | Error display card with optional "Открыть настройки" button (U2). |
+| `Overlays.tsx` (new) | 127 | `PermissionWaitOverlay` (U1) + `StopOverlay` (U20) — two variants sharing the same layout. |
+| `Banners.tsx` (new) | 174 | `SignalLostBanner` + `BatteryOptBanner` + `OverFilterWarning` + `PauseBadge`. |
+
+### Verification
+
+- `npx tsc --noEmit` — clean (0 errors)
+- `npx jest` — 39 / 39 tests pass (`__tests__/format.test.ts`)
+- `npx eslint` — clean (0 errors / 0 warnings)
+- All Russian UI strings preserved verbatim.
+- All `L*` / `U*` / `O*` invariants preserved (L1 startLocationUpdates early-return, L4 emit-on-drop, L18 ForegroundServiceStartNotAllowedException catch, L25 saveLiveState throttle, L26 append-only temp file, L32 shared SimpleDateFormat, START_STICKY recovery, gap-pause race Task 1 grace window, Task 2 hysteresis, etc.).
+- `versionCode` bumped 3 → 4, `versionName` 1.2 → 1.3 per AGENTS.md O25.
+
+### What was NOT extracted (deliberately)
+
+The following clusters were left in `GpsRecorderService.kt` because extracting
+them would require defining callback interfaces that add more complexity than
+they save:
+
+- `AutoPauseGapController` — the auto-pause + gap state machine (enterAutoPause,
+  exitAutoPause, handleGapRecovery, liveMovingMs, persistAutoPauseState) is
+  tightly coupled to `onLocationChanged` (470 lines) and the `durationTick`
+  gap watchdog. The race invariants (Task 1 grace window, Task 2 hysteresis)
+  are subtle; extracting them risks regression.
+- `LocationSource` — `startLocationUpdates` returns `Boolean` and has the L1
+  early-return contract where it calls `stopRecording()` itself on failure.
+  Extracting it would require a callback for "fatal error → stop recording".
+- `StateRepository` — `recoverStateIfAny` touches ~15 fields across the service
+  and re-registers the foreground notification (L19). Extracting it would
+  require either passing all those fields in/out or making the repository a
+  friend class, neither of which is a clear win.
+- `TempFileBuffer` — the L26 append-only strategy mutates `tempFileInitialized`
+  / `tempFileFlushedSegments` / `tempFileFlushedCurrentSize` on the service,
+  and `reloadPointsFromTempFile` (called from `recoverStateIfAny`) also writes
+  to `trackSegments` / `currentSegment` / `pointCount` under `pointBufferLock`.
+  Extracting it cleanly would require lifting those fields out of the service.
+
+These are candidates for a follow-up refactor pass if the file needs to shrink
+further.
+
+Similarly, on the TypeScript side, the state-management hooks
+(`useRecordingSession`, `useSettings`, `usePermissions`, `useGnssMonitor`)
+were NOT extracted because the 6 native event subscriptions + their 7 mirror
+refs form a tightly-coupled state machine. Extracting them risks breaking the
+U18 synchronous-ref-mirror discipline and the L24 out-of-order event guard.
+The current refactor focuses on the presentational layer, which is where the
+duplication was worst (8 inlined toggle rows + 3 inlined filter groups + 4
+inline banners + 2 inline overlays + 1 inline IIFE in the saved card).
+
+---
+
 ## Auto-pause vs. gap-detection interaction
 
 These fixes address a class of bugs where the gap-detection (signal-loss)

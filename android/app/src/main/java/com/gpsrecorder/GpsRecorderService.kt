@@ -1,16 +1,12 @@
 package com.gpsrecorder
 
 import android.Manifest
-import android.app.ForegroundServiceStartNotAllowedException
 import android.app.Notification
-import android.app.NotificationChannel
 import android.app.NotificationManager
-import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
-import android.content.pm.ServiceInfo
 import android.location.GnssStatus
 import android.location.Location
 import android.location.LocationListener
@@ -24,21 +20,15 @@ import android.os.Looper
 import android.os.PowerManager
 import android.provider.MediaStore
 import android.util.Log
-import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import org.json.JSONArray
 import org.json.JSONObject
-import org.xmlpull.v1.XmlPullParser
-import org.xmlpull.v1.XmlPullParserFactory
 import java.io.File
 import java.io.FileOutputStream
 import java.io.InputStream
 import java.io.OutputStream
 import java.io.RandomAccessFile
-import java.text.SimpleDateFormat
 import java.util.Date
-import java.util.Locale
-import java.util.TimeZone
 import java.util.LinkedList
 
 /**
@@ -62,6 +52,9 @@ import java.util.LinkedList
  *    file entirely on its own.
  */
 class GpsRecorderService : Service(), LocationListener {
+
+    // O7/O24: extracted helpers
+    private val notifier = GpsRecorderNotification(this)
 
     companion object {
         private const val TAG = "GpsRecorderService"
@@ -90,8 +83,6 @@ class GpsRecorderService : Service(), LocationListener {
         // KEY_IS_AUTO_PAUSED / KEY_SIGNAL_LOST / KEY_MOVING_MS live in
         // PREFS_NAME because they are per-recording live state, just like
         // KEY_IS_RECORDING.
-        private const val KEY_AUTO_PAUSE_ENABLED = "auto_pause_enabled"
-        private const val KEY_GAP_DETECTION_ENABLED = "gap_detection_enabled"
         private const val KEY_IS_AUTO_PAUSED = "is_auto_paused"
         private const val KEY_SIGNAL_LOST = "signal_lost"
         private const val KEY_MOVING_MS = "moving_ms"
@@ -156,14 +147,12 @@ class GpsRecorderService : Service(), LocationListener {
 
         // ---- Gaussian smoothing (post-processing) ----
         // Half-window size: each output point is a weighted average of the input
-        // points within ±GAUSSIAN_HALF_WINDOW of it. ±5 points at 1 Hz covers a
+        // points within ±GpxPostProcessors.GAUSSIAN_HALF_WINDOW of it. ±5 points at 1 Hz covers a
         // ~11 s window, which is large enough to suppress single-fix glitches but
         // small enough not to round off real corners.
-        private const val GAUSSIAN_HALF_WINDOW = 5
         // Gaussian sigma (in points, not seconds) — controls how flat the kernel
         // is. With sigma=1.5 and a ±5 window, the weights drop to ~1% of the peak
         // at the edges, so the window edges contribute negligibly.
-        private const val GAUSSIAN_SIGMA = 1.5
 
         // ---- Legacy post-processing algorithm thresholds ----
         // (kept as constants so they're easy to tune.)
@@ -237,14 +226,11 @@ class GpsRecorderService : Service(), LocationListener {
         // Prefs keys + defaults are owned by GpsRecorderModule, but the
         // service reads them via getRadialDistanceThresholdM(). The defaults
         // here are only used if the prefs file is empty (first launch).
-        private const val DEFAULT_RADIAL_DISTANCE_THRESHOLD_M = 5
 
         // ---- Time-sampling on-the-fly filter (defaults; user-tunable) ----
-        private const val DEFAULT_TIME_SAMPLING_N = 5
 
         // ---- Douglas-Peucker post-processing (defaults; user-tunable) ----
         // Epsilon in meters; the service reads it via getDouglasPeuckerEpsilonM().
-        private const val DEFAULT_DOUGLAS_PEUCKER_EPSILON_M = 5.0
 
         // ---- L20: raw-window persistence across service restarts ----
         // Number of trailing raw fixes (from `rawWindow`) to serialize to
@@ -286,18 +272,12 @@ class GpsRecorderService : Service(), LocationListener {
         // handlers, lifecycle methods), so a single shared instance per
         // format is safe. If we ever call from a background thread,
         // switch to ThreadLocal.
-        private val ISO_SDF = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US).apply {
-            timeZone = TimeZone.getTimeZone("UTC")
-        }
-        private val FILENAME_SDF = SimpleDateFormat("yyyy-MM-dd_HH-mm-ss", Locale.US)
 
         // ---- L26: append-only temp file ----
         // Closing tags written at the end of every flush so the temp
         // file is always a complete, parseable GPX document (recoverable
         // on crash). Before appending new points / segment breaks, we
         // truncate these closing tags via RandomAccessFile.setLength.
-        private const val TEMP_FILE_CLOSING_TAGS = "    </trkseg>\n  </trk>\n</gpx>\n"
-        private val TEMP_FILE_CLOSING_TAGS_BYTES = TEMP_FILE_CLOSING_TAGS.toByteArray(Charsets.UTF_8)
     }
 
     private var locationManager: LocationManager? = null
@@ -481,7 +461,14 @@ class GpsRecorderService : Service(), LocationListener {
                         lastResumeMs = null
                         Log.w(TAG, "Signal lost: no fix for ${sinceLast}ms (movingMs frozen at $movingMs)")
                         persistAutoPauseState()
-                        updateNotification()
+                        notifier.updateNotification(
+            GpsRecorderNotification.NotificationSnapshot(
+                points = pointCount,
+                elapsedMs = getElapsedMs(),
+                isAutoPaused = isAutoPaused,
+                signalLost = signalLost
+            )
+        )
                         GpsRecorderModule.emitState(
                             isRecording, pointCount, getElapsedMs(),
                             isAutoPaused, signalLost, liveMovingMs(now)
@@ -513,14 +500,6 @@ class GpsRecorderService : Service(), LocationListener {
     /**
      * A simple POJO for a single GPS fix.
      */
-    private data class GpsPoint(
-        val lat: Double,
-        val lon: Double,
-        val alt: Double?,   // meters, may be null
-        val speed: Float?,  // m/s, may be null
-        val accuracy: Float?, // meters, may be null
-        val timeMs: Long    // epoch millis
-    )
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -661,7 +640,18 @@ class GpsRecorderService : Service(), LocationListener {
 
         // Start the foreground notification FIRST (Android requires this within 5s of
         // startForegroundService()).
-        startForegroundIfNeeded()
+        notifier.startForegroundIfNeeded(
+            GpsRecorderNotification.NotificationSnapshot(
+                points = pointCount,
+                elapsedMs = getElapsedMs(),
+                isAutoPaused = isAutoPaused,
+                signalLost = signalLost
+            )
+        ) {
+            releaseWakeLock()
+            GpsRecorderModule.emitError("Не удалось запустить foreground service", fatal = true)
+            stopSelf()
+        }
 
         // Start GPS + GNSS status tracking.
         //
@@ -782,127 +772,10 @@ class GpsRecorderService : Service(), LocationListener {
     // Foreground notification
     // ------------------------------------------------------------------
 
-    private fun startForegroundIfNeeded() {
-        ensureNotificationChannel()
-        val notification = buildNotification(pointCount, getElapsedMs())
-        try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-                // Android 14+ requires explicit foregroundServiceType and the
-                // FOREGROUND_SERVICE_LOCATION permission.
-                startForeground(
-                    NOTIFICATION_ID,
-                    notification,
-                    ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION
-                )
-            } else {
-                startForeground(NOTIFICATION_ID, notification)
-            }
-        } catch (e: ForegroundServiceStartNotAllowedException) {
-            // L18 fix: catch ForegroundServiceStartNotAllowedException
-            // SPECIFICALLY — this is the Android 12+ exception thrown when
-            // startForeground is called from the background (e.g. after a
-            // START_STICKY restart that happens while the app is in the
-            // background). Without foreground state, Android will kill the
-            // service within seconds. The 5-second startForegroundService
-            // deadline has already passed, so we risk an ANR if we just log.
-            //
-            // Action: release the wakelock (it was acquired at startRecording
-            // time and would otherwise leak until the system kills the
-            // process), stop the service, and emit a fatal error event so
-            // the JS UI resets to idle and the user can retry.
-            Log.e(TAG, "startForeground threw ForegroundServiceStartNotAllowedException — releasing wakelock and stopping", e)
-            releaseWakeLock()
-            GpsRecorderModule.emitError(
-                "Не удалось запустить foreground service",
-                fatal = true
-            )
-            stopSelf()
-        }
-        // NOTE: per L18 fix, we do NOT catch generic Exception here —
-        // other crashes (e.g. IllegalArgumentException from a malformed
-        // notification, or RuntimeException from a missing permission
-        // we should have checked earlier) should propagate so we notice
-        // them in development rather than silently swallowing them.
-    }
 
-    private fun ensureNotificationChannel() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
-            if (nm.getNotificationChannel(CHANNEL_ID) == null) {
-                val channel = NotificationChannel(
-                    CHANNEL_ID,
-                    getString(R.string.notification_channel_name),
-                    NotificationManager.IMPORTANCE_LOW
-                ).apply {
-                    description = getString(R.string.notification_channel_desc)
-                    setShowBadge(false)
-                    setSound(null, null)
-                    enableVibration(false)
-                }
-                nm.createNotificationChannel(channel)
-            }
-        }
-    }
 
-    private fun buildNotification(points: Int, elapsedMs: Long): Notification {
-        return buildNotificationWithText(points, elapsedMs, isAutoPaused, signalLost)
-    }
 
-    /**
-     * Builds the foreground-service notification with optional auto-pause /
-     * signal-lost text variants. Called by [buildNotification] for the normal
-     * case and directly when we change pause / signal state and want to
-     * refresh the notification immediately.
-     */
-    private fun buildNotificationWithText(
-        points: Int,
-        elapsedMs: Long,
-        paused: Boolean,
-        signalLost: Boolean
-    ): Notification {
-        val mainIntent = Intent(this, MainActivity::class.java).apply {
-            flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
-        }
-        val mainPi = PendingIntent.getActivity(
-            this, 0, mainIntent,
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        )
 
-        val stopIntent = Intent(this, GpsRecorderService::class.java).apply {
-            action = ACTION_NOTIFICATION_STOP
-        }
-        val stopPi = PendingIntent.getService(
-            this, 1, stopIntent,
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        )
-
-        // O11: use Russian plurals for the point count (точка / точки / точек).
-        val pointsStr = resources.getQuantityString(R.plurals.notification_points, points, points)
-        val text = when {
-            signalLost -> getString(R.string.notification_text_signal_lost, pointsStr, formatDuration(elapsedMs))
-            paused -> getString(R.string.notification_text_paused, pointsStr, formatDuration(elapsedMs))
-            else -> getString(R.string.notification_text, pointsStr, formatDuration(elapsedMs))
-        }
-
-        return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle(getString(R.string.notification_title))
-            .setContentText(text)
-            .setSmallIcon(R.drawable.ic_gps_notification)
-            .setOngoing(true)
-            .setOnlyAlertOnce(true)
-            .setContentIntent(mainPi)
-            .addAction(0, getString(R.string.notification_action_stop), stopPi)
-            .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
-            .setCategory(NotificationCompat.CATEGORY_SERVICE)
-            .setPriority(NotificationCompat.PRIORITY_LOW)
-            .build()
-    }
-
-    private fun updateNotification() {
-        if (!isRecording) return
-        val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
-        nm.notify(NOTIFICATION_ID, buildNotification(pointCount, getElapsedMs()))
-    }
 
     /**
      * Starts location updates from the available providers.
@@ -1156,10 +1029,7 @@ class GpsRecorderService : Service(), LocationListener {
      * Stored apart from `gps_recorder_state` so it survives the per-recording
      * state clear in stopRecording().
      */
-    private fun isAutoPauseEnabled(): Boolean {
-        return getSharedPreferences("gps_recorder_settings", Context.MODE_PRIVATE)
-            .getBoolean(KEY_AUTO_PAUSE_ENABLED, false)
-    }
+    private fun isAutoPauseEnabled(): Boolean = GpsRecorderSettings.isAutoPauseEnabled(this)
 
     /**
      * Reads the gap-detection setting from the SEPARATE settings prefs file.
@@ -1176,10 +1046,7 @@ class GpsRecorderService : Service(), LocationListener {
      * The setting is written by GpsRecorderModule.setGapDetectionEnabled()
      * from JS and survives the per-recording state clear.
      */
-    private fun isGapDetectionEnabled(): Boolean {
-        return getSharedPreferences("gps_recorder_settings", Context.MODE_PRIVATE)
-            .getBoolean(KEY_GAP_DETECTION_ENABLED, true)
-    }
+    private fun isGapDetectionEnabled(): Boolean = GpsRecorderSettings.isGapDetectionEnabled(this)
 
     /**
      * Persists the auto-pause / signal-lost / moving-time live state to
@@ -1230,7 +1097,14 @@ class GpsRecorderService : Service(), LocationListener {
         // consecutive fast fixes.
         consecutiveMovingFixes = 0
         persistAutoPauseState()
-        updateNotification()
+        notifier.updateNotification(
+            GpsRecorderNotification.NotificationSnapshot(
+                points = pointCount,
+                elapsedMs = getElapsedMs(),
+                isAutoPaused = isAutoPaused,
+                signalLost = signalLost
+            )
+        )
         Log.i(TAG, "Auto-pause entered at $now (movingMs=$movingMs)")
     }
 
@@ -1292,7 +1166,14 @@ class GpsRecorderService : Service(), LocationListener {
         // the next auto-pause cycle starts fresh.
         consecutiveMovingFixes = 0
         persistAutoPauseState()
-        updateNotification()
+        notifier.updateNotification(
+            GpsRecorderNotification.NotificationSnapshot(
+                points = pointCount,
+                elapsedMs = getElapsedMs(),
+                isAutoPaused = isAutoPaused,
+                signalLost = signalLost
+            )
+        )
         Log.i(TAG, "Auto-pause exited at $now (movingMs=$movingMs, graceUntil=$autoPauseResumeGraceUntilMs)")
     }
 
@@ -1322,7 +1203,14 @@ class GpsRecorderService : Service(), LocationListener {
         // correctly auto-paused.
         lastResumeMs = now
         persistAutoPauseState()
-        updateNotification()
+        notifier.updateNotification(
+            GpsRecorderNotification.NotificationSnapshot(
+                points = pointCount,
+                elapsedMs = getElapsedMs(),
+                isAutoPaused = isAutoPaused,
+                signalLost = signalLost
+            )
+        )
         Log.i(TAG, "Gap recovered at $now — new segment started, movingMs accumulation resumed")
     }
 
@@ -1408,7 +1296,14 @@ class GpsRecorderService : Service(), LocationListener {
             // its current segment structure.
             signalLost = false
             persistAutoPauseState()
-            updateNotification()
+            notifier.updateNotification(
+            GpsRecorderNotification.NotificationSnapshot(
+                points = pointCount,
+                elapsedMs = getElapsedMs(),
+                isAutoPaused = isAutoPaused,
+                signalLost = signalLost
+            )
+        )
             Log.i(TAG, "Gap detection disabled or auto-paused — clearing signalLost flag")
         }
 
@@ -1598,7 +1493,14 @@ class GpsRecorderService : Service(), LocationListener {
                     computeFixType(), totalDistanceM, pt.timeMs, pointCount,
                     isAutoPaused, signalLost, liveMovingMs(pt.timeMs)
                 )
-                updateNotification()
+                notifier.updateNotification(
+            GpsRecorderNotification.NotificationSnapshot(
+                points = pointCount,
+                elapsedMs = getElapsedMs(),
+                isAutoPaused = isAutoPaused,
+                signalLost = signalLost
+            )
+        )
                 return
             }
         }
@@ -1627,7 +1529,14 @@ class GpsRecorderService : Service(), LocationListener {
                     computeFixType(), totalDistanceM, pt.timeMs, pointCount,
                     isAutoPaused, signalLost, liveMovingMs(pt.timeMs)
                 )
-                updateNotification()
+                notifier.updateNotification(
+            GpsRecorderNotification.NotificationSnapshot(
+                points = pointCount,
+                elapsedMs = getElapsedMs(),
+                isAutoPaused = isAutoPaused,
+                signalLost = signalLost
+            )
+        )
                 return
             }
             // C. Velocity-based plausibility gate: compute the instantaneous
@@ -1673,7 +1582,14 @@ class GpsRecorderService : Service(), LocationListener {
                         computeFixType(), totalDistanceM, pt.timeMs, pointCount,
                         isAutoPaused, signalLost, liveMovingMs(pt.timeMs)
                     )
-                    updateNotification()
+                    notifier.updateNotification(
+            GpsRecorderNotification.NotificationSnapshot(
+                points = pointCount,
+                elapsedMs = getElapsedMs(),
+                isAutoPaused = isAutoPaused,
+                signalLost = signalLost
+            )
+        )
                     return
                 }
                 val d = TrackMath.haversineMeters(pLat, pLon, pt.lat, pt.lon)
@@ -1688,7 +1604,14 @@ class GpsRecorderService : Service(), LocationListener {
                             computeFixType(), totalDistanceM, pt.timeMs, pointCount,
                             isAutoPaused, signalLost, liveMovingMs(pt.timeMs)
                         )
-                        updateNotification()
+                        notifier.updateNotification(
+            GpsRecorderNotification.NotificationSnapshot(
+                points = pointCount,
+                elapsedMs = getElapsedMs(),
+                isAutoPaused = isAutoPaused,
+                signalLost = signalLost
+            )
+        )
                         return
                     }
                 }
@@ -1726,7 +1649,14 @@ class GpsRecorderService : Service(), LocationListener {
                             computeFixType(), totalDistanceM, pt.timeMs, pointCount,
                             isAutoPaused, signalLost, liveMovingMs(pt.timeMs)
                         )
-                        updateNotification()
+                        notifier.updateNotification(
+            GpsRecorderNotification.NotificationSnapshot(
+                points = pointCount,
+                elapsedMs = getElapsedMs(),
+                isAutoPaused = isAutoPaused,
+                signalLost = signalLost
+            )
+        )
                         return
                     }
                 }
@@ -1771,7 +1701,14 @@ class GpsRecorderService : Service(), LocationListener {
                             computeFixType(), totalDistanceM, pt.timeMs, pointCount,
                             isAutoPaused, signalLost, liveMovingMs(pt.timeMs)
                         )
-                        updateNotification()
+                        notifier.updateNotification(
+            GpsRecorderNotification.NotificationSnapshot(
+                points = pointCount,
+                elapsedMs = getElapsedMs(),
+                isAutoPaused = isAutoPaused,
+                signalLost = signalLost
+            )
+        )
                         return
                     }
                 }
@@ -1799,7 +1736,14 @@ class GpsRecorderService : Service(), LocationListener {
             computeFixType(), totalDistanceM, pt.timeMs, pointCount,
             isAutoPaused, signalLost, liveMovingMs(pt.timeMs)
         )
-        updateNotification()
+        notifier.updateNotification(
+            GpsRecorderNotification.NotificationSnapshot(
+                points = pointCount,
+                elapsedMs = getElapsedMs(),
+                isAutoPaused = isAutoPaused,
+                signalLost = signalLost
+            )
+        )
     }
 
     /**
@@ -1916,10 +1860,10 @@ class GpsRecorderService : Service(), LocationListener {
             // The helper accepts an InputStream, so we open the appropriate
             // stream (ContentResolver for MediaStore URI, FileInputStream for
             // legacy File paths) and pass it in.
-            val parseResult: GpxParseResult = if (savedUriStr != null) {
+            val parseResult: GpxIO.GpxParseResult = if (savedUriStr != null) {
                 try {
                     val uri = android.net.Uri.parse(savedUriStr)
-                    val parsed = contentResolver.openInputStream(uri)?.use { parseGpxSegments(it) }
+                    val parsed = contentResolver.openInputStream(uri)?.use { GpxIO.parseGpxSegments(it) }
                         ?: run {
                             Log.w(TAG, "recomputeDistanceFromSavedGpx: openInputStream returned null for $savedUriStr")
                             return -1.0
@@ -1947,7 +1891,7 @@ class GpsRecorderService : Service(), LocationListener {
                     Log.w(TAG, "recomputeDistanceFromSavedGpx: cannot resolve path '$savedPath'")
                     return -1.0
                 }
-                file.inputStream().use { parseGpxSegments(it) }
+                file.inputStream().use { GpxIO.parseGpxSegments(it) }
             }
             // Parse each <trkseg> independently and sum intra-segment
             // distances. Inter-segment jumps (across pauses / gaps) are NOT
@@ -2207,10 +2151,7 @@ class GpsRecorderService : Service(), LocationListener {
      * The setting is written by GpsRecorderModule.setPostProcessEnabled() from JS.
      * Stored apart from `gps_recorder_state` so it survives the per-recording clear.
      */
-    private fun isPostProcessEnabled(): Boolean {
-        return getSharedPreferences("gps_recorder_settings", Context.MODE_PRIVATE)
-            .getBoolean("post_process_enabled", false)
-    }
+    private fun isPostProcessEnabled(): Boolean = GpsRecorderSettings.isPostProcessEnabled(this)
 
     /**
      * Reads the Gaussian-smoothing setting from the SEPARATE settings prefs file.
@@ -2221,10 +2162,7 @@ class GpsRecorderService : Service(), LocationListener {
      * Stored in the same prefs file as `post_process_enabled` so it survives the
      * per-recording state clear.
      */
-    private fun isGaussianSmoothingEnabled(): Boolean {
-        return getSharedPreferences("gps_recorder_settings", Context.MODE_PRIVATE)
-            .getBoolean("gaussian_smoothing_enabled", false)
-    }
+    private fun isGaussianSmoothingEnabled(): Boolean = GpsRecorderSettings.isGaussianSmoothingEnabled(this)
 
     /**
      * Reads the radial-distance on-the-fly filter setting from the separate
@@ -2233,15 +2171,9 @@ class GpsRecorderService : Service(), LocationListener {
      * (see [getRadialDistanceThresholdM]). The first fix of each segment
      * (prevLat == null) is always kept.
      */
-    private fun isRadialDistanceFilterEnabled(): Boolean {
-        return getSharedPreferences("gps_recorder_settings", Context.MODE_PRIVATE)
-            .getBoolean("radial_distance_filter_enabled", false)
-    }
+    private fun isRadialDistanceFilterEnabled(): Boolean = GpsRecorderSettings.isRadialDistanceFilterEnabled(this)
 
-    private fun getRadialDistanceThresholdM(): Int {
-        return getSharedPreferences("gps_recorder_settings", Context.MODE_PRIVATE)
-            .getInt("radial_distance_threshold_m", DEFAULT_RADIAL_DISTANCE_THRESHOLD_M)
-    }
+    private fun getRadialDistanceThresholdM(): Int = GpsRecorderSettings.getRadialDistanceThresholdM(this)
 
     /**
      * Reads the time-sampling on-the-fly filter setting. When enabled,
@@ -2249,15 +2181,9 @@ class GpsRecorderService : Service(), LocationListener {
      * the rest. The very first fix of a recording is always kept so the
      * track has a starting point even if N > 1.
      */
-    private fun isTimeSamplingEnabled(): Boolean {
-        return getSharedPreferences("gps_recorder_settings", Context.MODE_PRIVATE)
-            .getBoolean("time_sampling_enabled", false)
-    }
+    private fun isTimeSamplingEnabled(): Boolean = GpsRecorderSettings.isTimeSamplingEnabled(this)
 
-    private fun getTimeSamplingN(): Int {
-        return getSharedPreferences("gps_recorder_settings", Context.MODE_PRIVATE)
-            .getInt("time_sampling_n", DEFAULT_TIME_SAMPLING_N)
-    }
+    private fun getTimeSamplingN(): Int = GpsRecorderSettings.getTimeSamplingN(this)
 
     /**
      * Reads the Douglas-Peucker post-processing setting. When enabled,
@@ -2266,16 +2192,9 @@ class GpsRecorderService : Service(), LocationListener {
      * the file back, applies Douglas-Peucker to each <trkseg> independently,
      * and overwrites the file with the simplified track.
      */
-    private fun isDouglasPeuckerEnabled(): Boolean {
-        return getSharedPreferences("gps_recorder_settings", Context.MODE_PRIVATE)
-            .getBoolean("douglas_peucker_enabled", false)
-    }
+    private fun isDouglasPeuckerEnabled(): Boolean = GpsRecorderSettings.isDouglasPeuckerEnabled(this)
 
-    private fun getDouglasPeuckerEpsilonM(): Double {
-        val s = getSharedPreferences("gps_recorder_settings", Context.MODE_PRIVATE)
-            .getString("douglas_peucker_epsilon_m", null)
-        return s?.toDoubleOrNull() ?: DEFAULT_DOUGLAS_PEUCKER_EPSILON_M
-    }
+    private fun getDouglasPeuckerEpsilonM(): Double = GpsRecorderSettings.getDouglasPeuckerEpsilonM(this)
 
     /**
      * Writes the GPX header + opening <trk> + <name> + first opening <trkseg>
@@ -2295,13 +2214,13 @@ class GpsRecorderService : Service(), LocationListener {
         try {
             val f = getTempFile()
             FileOutputStream(f).use { out ->
-                out.write(gpxHeader().toByteArray(Charsets.UTF_8))
+                out.write(GpxIO.gpxHeader().toByteArray(Charsets.UTF_8))
                 out.write("  <trk>\n    <name>GPS Recording</name>\n".toByteArray(Charsets.UTF_8))
                 // L26 fix: open the first <trkseg> here. flushToTempFile()
                 // appends points + segment boundaries, then re-appends the
                 // closing tags.
                 out.write("    <trkseg>\n".toByteArray(Charsets.UTF_8))
-                out.write(TEMP_FILE_CLOSING_TAGS_BYTES)
+                out.write(GpxIO.TEMP_FILE_CLOSING_TAGS_BYTES)
             }
             tempFileInitialized = true
             tempFileFlushedSegments = 1  // one <trkseg> opened
@@ -2322,13 +2241,13 @@ class GpsRecorderService : Service(), LocationListener {
     private fun truncateTempFileClosingTags(f: File): Boolean {
         return try {
             val len = f.length()
-            if (len < TEMP_FILE_CLOSING_TAGS_BYTES.size) {
+            if (len < GpxIO.TEMP_FILE_CLOSING_TAGS_BYTES.size) {
                 // File is too short — fall back to full rewrite.
                 Log.w(TAG, "truncateTempFileClosingTags: file too short ($len bytes) — falling back to full rewrite")
                 return false
             }
             RandomAccessFile(f, "rw").use { raf ->
-                raf.setLength(len - TEMP_FILE_CLOSING_TAGS_BYTES.size)
+                raf.setLength(len - GpxIO.TEMP_FILE_CLOSING_TAGS_BYTES.size)
             }
             true
         } catch (e: Exception) {
@@ -2345,7 +2264,7 @@ class GpsRecorderService : Service(), LocationListener {
      */
     private fun fullRewriteTempFile() {
         try {
-            val content = serializeSegmentsToGpx("GPS Recording")
+            val content = GpxIO.serializeSegmentsToGpx("GPS Recording", segmentsSnapshot())
             val f = getTempFile()
             FileOutputStream(f).use { out ->
                 out.write(content.toByteArray(Charsets.UTF_8))
@@ -2362,50 +2281,6 @@ class GpsRecorderService : Service(), LocationListener {
         }
     }
 
-    /**
-     * Serializes all current segments (finalized + current) as a complete GPX
-     * document. Each segment becomes its own <trkseg> block so that pauses /
-     * gaps appear as clean segment breaks in the output file (no straight-
-     * line "stitches" across them). Empty segments are omitted.
-     *
-     * L17 fix: single-point segments are ALWAYS dropped. The previous code
-     * kept them when no segment had ≥ 2 points (a rare edge case where a
-     * recording consisted entirely of 1-point segments), producing a GPX
-     * with multiple useless 1-point <trkseg> blocks — exactly the pattern
-     * the comment below said it was trying to avoid. If this leaves zero
-     * segments, the GPX contains just `<trk></trk>` (no <trkseg>), matching
-     * the existing behavior for fully-empty recordings.
-     *
-     * A 1-point <trkseg> is useless to consumers (Strava, OSM, etc. — they
-     * need at least 2 points to draw a line) and was a side-effect of the
-     * gap-recovery + auto-pause interaction: a fix arrived right after a
-     * gap, briefly looked like movement (so it was appended to a fresh
-     * post-gap segment), and then auto-pause immediately triggered
-     * (splitting that 1-point segment off). Dropping such segments at
-     * serialization time is safe because a single point has no neighbours
-     * to form a line with — its spatial contribution to the track is zero.
-     */
-    private fun serializeSegmentsToGpx(name: String): String {
-        val segments = segmentsSnapshot()
-        val sb = StringBuilder()
-        sb.append(gpxHeader())
-        sb.append("  <trk>\n")
-        sb.append("    <name>").append(name).append("</name>\n")
-        // L17 fix: ALWAYS drop segments with < 2 points. If this leaves
-        // zero <trkseg> blocks, that's fine — the <trk> wrapper is still
-        // emitted so the GPX document is well-formed.
-        for (seg in segments) {
-            if (seg.size < 2) continue  // always drop 1-point and empty segments
-            sb.append("    <trkseg>\n")
-            for (p in seg) {
-                sb.append(formatGpxPoint(p))
-            }
-            sb.append("    </trkseg>\n")
-        }
-        sb.append("  </trk>\n")
-        sb.append("</gpx>\n")
-        return sb.toString()
-    }
 
     /**
      * Flushes the current in-memory points to the temp file.
@@ -2466,7 +2341,7 @@ class GpsRecorderService : Service(), LocationListener {
             val currentPoints = snapshot.lastOrNull() ?: emptyList()
             if (currentPoints.size > tempFileFlushedCurrentSize) {
                 for (i in tempFileFlushedCurrentSize until currentPoints.size) {
-                    sb.append(formatGpxPoint(currentPoints[i]))
+                    sb.append(GpxIO.formatGpxPoint(currentPoints[i]))
                 }
                 tempFileFlushedCurrentSize = currentPoints.size
             }
@@ -2479,7 +2354,7 @@ class GpsRecorderService : Service(), LocationListener {
                 fullRewriteTempFile()
                 return
             }
-            sb.append(TEMP_FILE_CLOSING_TAGS)
+            sb.append(GpxIO.TEMP_FILE_CLOSING_TAGS)
             // "true" = append mode (don't overwrite).
             FileOutputStream(f, /* append = */ true).use { out ->
                 out.write(sb.toString().toByteArray(Charsets.UTF_8))
@@ -2530,12 +2405,12 @@ class GpsRecorderService : Service(), LocationListener {
             return ""
         }
 
-        val timestamp = FILENAME_SDF.format(Date(startTimeMs))
+        val timestamp = GpxIO.FILENAME_SDF.format(Date(startTimeMs))
         val fileName = "trck_$timestamp.gpx"
 
         // Phase 5: serialize with one <trkseg> per segment so pauses / gaps
         // appear as clean segment breaks in the final file.
-        val rawGpxContent = serializeSegmentsToGpx("GPS Recording $timestamp")
+        val rawGpxContent = GpxIO.serializeSegmentsToGpx("GPS Recording $timestamp", segmentsSnapshot())
 
         val rawBytes = rawGpxContent.toByteArray(Charsets.UTF_8)
         // On-the-fly filtering (if enabled) was already applied in onLocationChanged,
@@ -2632,21 +2507,21 @@ class GpsRecorderService : Service(), LocationListener {
                 var processed = rawText
                 if (gaussianSmooth) {
                     processed = try {
-                        gaussianSmoothGpx(processed)
+                        GpxPostProcessors.gaussianSmoothGpx(processed)
                     } catch (e: Exception) {
                         Log.e(TAG, "gaussianSmoothGpx failed; keeping pre-smoothing content", e)
                         processed
                     }
                 }
                 if (douglasPeucker) {
-                    val before = countTrkpt(processed)
+                    val before = GpxIO.countTrkpt(processed)
                     processed = try {
-                        douglasPeuckerGpx(processed, douglasPeuckerEpsilon)
+                        GpxPostProcessors.douglasPeuckerGpx(processed, douglasPeuckerEpsilon)
                     } catch (e: Exception) {
                         Log.e(TAG, "douglasPeuckerGpx failed; keeping pre-DP content", e)
                         processed
                     }
-                    val after = countTrkpt(processed)
+                    val after = GpxIO.countTrkpt(processed)
                     Log.i(TAG, "Douglas-Peucker applied (epsilon=${douglasPeuckerEpsilon}m): $before -> $after points")
                 }
                 val processedBytes = processed.toByteArray(Charsets.UTF_8)
@@ -2702,21 +2577,21 @@ class GpsRecorderService : Service(), LocationListener {
             var processed = f.readText(Charsets.UTF_8)
             if (gaussianSmooth) {
                 processed = try {
-                    gaussianSmoothGpx(processed)
+                    GpxPostProcessors.gaussianSmoothGpx(processed)
                 } catch (e: Exception) {
                     Log.e(TAG, "gaussianSmoothGpx failed; keeping pre-smoothing content", e)
                     processed
                 }
             }
             if (douglasPeucker) {
-                val before = countTrkpt(processed)
+                val before = GpxIO.countTrkpt(processed)
                 processed = try {
-                    douglasPeuckerGpx(processed, douglasPeuckerEpsilon)
+                    GpxPostProcessors.douglasPeuckerGpx(processed, douglasPeuckerEpsilon)
                 } catch (e: Exception) {
                     Log.e(TAG, "douglasPeuckerGpx failed; keeping pre-DP content", e)
                     processed
                 }
-                val after = countTrkpt(processed)
+                val after = GpxIO.countTrkpt(processed)
                 Log.i(TAG, "Douglas-Peucker applied (epsilon=${douglasPeuckerEpsilon}m): $before -> $after points")
             }
             FileOutputStream(f).use { it.write(processed.toByteArray(Charsets.UTF_8)) }
@@ -2727,311 +2602,17 @@ class GpsRecorderService : Service(), LocationListener {
 
     // ------------------------------------------------------------------
 
-    /**
-     * Gaussian / kernel smoothing of the GPX track.
-     *
-     * Replaces each point's lat/lon (and altitude, if present) with a weighted
-     * average of itself and its neighbours within ±GAUSSIAN_HALF_WINDOW points.
-     * The weights follow a Gaussian kernel:
-     *
-     *     w(i, j) = exp( -0.5 * ((i - j) / GAUSSIAN_SIGMA)^2 )
-     *
-     * Timestamps, speed, and accuracy are preserved verbatim — only the spatial
-     * coordinates are smoothed. The output has the SAME number of points as the
-     * input (no interpolation, no dropping); only the lat/lon/ele values change.
-     *
-     * Effect: single-fix GPS glitches (which typically look like a spike 20–80 m
-     * away from the true track) get pulled back towards their neighbours, since
-     * the Gaussian-weighted average is dominated by the surrounding clean fixes.
-     * Real corners are preserved reasonably well because the kernel is narrow
-     * (±5 points at 1 Hz = ±5 s window).
-     *
-     * If parsing fails or no trkpt is found, the input is returned unchanged so
-     * the user still gets a usable (raw) file rather than nothing.
-     */
-    private fun gaussianSmoothGpx(rawGpx: String): String {
-        // Phase 5: segment-isolated smoothing. We parse each <trkseg> block
-        // separately, smooth the points within it independently, and re-emit
-        // them inside their own <trkseg>. This prevents the Gaussian kernel
-        // from "bleeding" coordinates across pauses / gaps — e.g. the first
-        // point after a gap should NOT be averaged together with the last
-        // point before the gap, because they belong to different parts of
-        // the user's actual movement.
-        //
-        // L30 fix: parse via XmlPullParser instead of regex.
-        val parseResult = parseGpxSegments(rawGpx)
-        if (parseResult.segments.isEmpty()) {
-            Log.w(TAG, "gaussianSmoothGpx: no <trkseg> found, returning raw input")
-            return rawGpx
-        }
 
-        // 1. Pre-compute the Gaussian kernel weights for offsets -W..+W.
-        //    w[k] = exp(-0.5 * (k / sigma)^2), k in [-W, W].
-        val w = DoubleArray(2 * GAUSSIAN_HALF_WINDOW + 1) { kOff ->
-            val k = (kOff - GAUSSIAN_HALF_WINDOW).toDouble()
-            Math.exp(-0.5 * (k / GAUSSIAN_SIGMA) * (k / GAUSSIAN_SIGMA))
-        }
 
-        val origName = Regex("<name>([^<]*)</name>").find(rawGpx)?.groupValues?.get(1)
-            ?: "GPS Recording"
 
-        val sb = StringBuilder()
-        sb.append(gpxHeader())
-        sb.append("  <trk>\n")
-        sb.append("    <name>").append(origName).append("</name>\n")
 
-        var totalIn = 0
-        var totalOut = 0
-        for (seg in parseResult.segments) {
-            val parsed = seg.points
-            totalIn += parsed.size
-            if (parsed.isEmpty()) {
-                // Preserve empty <trkseg> blocks as-is so the segment
-                // structure is preserved in the output.
-                sb.append("    <trkseg>\n")
-                sb.append("    </trkseg>\n")
-                continue
-            }
-
-            // 2. Smooth each point within this segment independently.
-            //
-            // L2 fix: elevation MUST be weighted-averaged just like lat/lon.
-            // The previous implementation tracked `nEle` (raw count of
-            // non-null-elevation points in the window) and divided by it,
-            // which produced `sumEleVal / nEle` — a value roughly
-            // `sumW / nEle`-times too small (for a symmetric ±5 kernel
-            // with sumW ≈ 2.0, every smoothed elevation came out at
-            // ~40% of its true value). GPX viewers that plot elevation
-            // showed a track sitting far below its real altitude.
-            //
-            // We now track `sumWEle` (sum of the kernel weights actually
-            // used for elevation points) and divide by it. If no
-            // elevation points fall in the window, the output has no
-            // <ele> tag (preserving whatever the input had — typically
-            // nothing, which is correct).
-            val smoothed = ArrayList<GpxTrkPt>(parsed.size)
-            for (i in parsed.indices) {
-                var sumW = 0.0
-                var sumLat = 0.0
-                var sumLon = 0.0
-                var sumEleVal = 0.0
-                var sumWEle = 0.0
-                for (kOff in 0 until w.size) {
-                    val j = i + (kOff - GAUSSIAN_HALF_WINDOW)
-                    if (j < 0 || j >= parsed.size) continue
-                    val weight = w[kOff]
-                    sumW += weight
-                    sumLat += parsed[j].lat * weight
-                    sumLon += parsed[j].lon * weight
-                    val e = parsed[j].ele
-                    if (e != null) {
-                        sumEleVal += e * weight
-                        sumWEle += weight
-                    }
-                }
-                val newLat = if (sumW > 0.0) sumLat / sumW else parsed[i].lat
-                val newLon = if (sumW > 0.0) sumLon / sumW else parsed[i].lon
-                val newEle = if (sumWEle > 0.0) sumEleVal / sumWEle else null
-                smoothed.add(
-                    GpxTrkPt(
-                        lat = newLat,
-                        lon = newLon,
-                        ele = newEle,
-                        speed = parsed[i].speed,
-                        accuracy = parsed[i].accuracy,
-                        timeMs = parsed[i].timeMs,
-                        interpolated = false
-                    )
-                )
-            }
-            totalOut += smoothed.size
-
-            // 3. Re-emit the smoothed points inside their own <trkseg>.
-            sb.append("    <trkseg>\n")
-            for (p in smoothed) {
-                sb.append(formatGpxPointWithInterpolated(p))
-            }
-            sb.append("    </trkseg>\n")
-        }
-        sb.append("  </trk>\n")
-        sb.append("</gpx>\n")
-        Log.i(
-            TAG,
-            "gaussianSmoothGpx: segments=${parseResult.segments.size} points in=$totalIn out=$totalOut" +
-                " half-window=$GAUSSIAN_HALF_WINDOW sigma=$GAUSSIAN_SIGMA"
-        )
-        return sb.toString()
-    }
-
-    /**
-     * Douglas-Peucker simplification of the GPX track.
-     *
-     * For each <trkseg>, applies the iterative Douglas-Peucker algorithm with
-     * tolerance [epsilonM] meters: keeps the segment's first and last points
-     * unconditionally, then recursively keeps the point of maximum
-     * perpendicular distance from the line connecting the segment's current
-     * endpoints — if that max distance exceeds epsilon, split there and
-     * recurse on both halves; otherwise drop all intermediate points.
-     *
-     * Perpendicular distance is computed as the great-circle cross-track
-     * distance (correct at any latitude, not just near the equator). The
-     * algorithm is implemented iteratively with an explicit stack to avoid
-     * stack overflow on long tracks (a 3-hour walk at 1 Hz = ~10 800 points,
-     * which would blow the JVM default stack at recursion depth ~10 800).
-     *
-     * Timestamps, speed, accuracy, and elevation of the kept points are
-     * preserved verbatim. The output has fewer (or equal) points than the
-     * input — only the spatial density is reduced.
-     *
-     * Segments with < 3 points are returned unchanged (nothing to simplify).
-     * Empty <trkseg> blocks are preserved as-is so the segment structure of
-     * the input is mirrored in the output.
-     *
-     * If parsing fails or no <trkseg> is found, the input is returned
-     * unchanged so the user still gets a usable (raw / pre-DP) file.
-     */
-    private fun douglasPeuckerGpx(rawGpx: String, epsilonM: Double): String {
-        // L30 fix: parse via XmlPullParser instead of regex.
-        val parseResult = parseGpxSegments(rawGpx)
-        if (parseResult.segments.isEmpty()) {
-            Log.w(TAG, "douglasPeuckerGpx: no <trkseg> found, returning raw input")
-            return rawGpx
-        }
-
-        val origName = Regex("<name>([^<]*)</name>").find(rawGpx)?.groupValues?.get(1)
-            ?: "GPS Recording"
-
-        val sb = StringBuilder()
-        sb.append(gpxHeader())
-        sb.append("  <trk>\n")
-        sb.append("    <name>").append(origName).append("</name>\n")
-
-        var totalIn = 0
-        var totalOut = 0
-        for (seg in parseResult.segments) {
-            val parsed = seg.points
-            totalIn += parsed.size
-            if (parsed.isEmpty()) {
-                // Preserve empty <trkseg> blocks as-is so the segment
-                // structure is preserved in the output.
-                sb.append("    <trkseg>\n")
-                sb.append("    </trkseg>\n")
-                continue
-            }
-
-            val kept = if (parsed.size < 3 || epsilonM <= 0.0) {
-                // Nothing to simplify: keep all points verbatim.
-                parsed
-            } else {
-                douglasPeuckerSimplify(parsed, epsilonM)
-            }
-            totalOut += kept.size
-
-            sb.append("    <trkseg>\n")
-            for (p in kept) {
-                sb.append(formatGpxPointWithInterpolated(p))
-            }
-            sb.append("    </trkseg>\n")
-        }
-        sb.append("  </trk>\n")
-        sb.append("</gpx>\n")
-        Log.i(
-            TAG,
-            "douglasPeuckerGpx: segments=${parseResult.segments.size} points in=$totalIn out=$totalOut" +
-                " epsilon=${epsilonM}m"
-        )
-        return sb.toString()
-    }
-
-    /**
-     * Iterative Douglas-Peucker. Returns the subset of [points] that survives
-     * simplification with tolerance [epsilonM] meters. The first and last
-     * points are always kept. Intermediate points are kept iff their
-     * perpendicular (cross-track) distance from the line connecting the
-     * current endpoints exceeds epsilon, in which case the segment is split
-     * there and each half is processed independently.
-     *
-     * Uses an explicit ArrayDeque as the stack so we don't blow the JVM call
-     * stack on long tracks.
-     */
-    private fun douglasPeuckerSimplify(
-        points: List<GpxTrkPt>,
-        epsilonM: Double
-    ): List<GpxTrkPt> {
-        val n = points.size
-        if (n < 3) return points
-        val keep = BooleanArray(n) { false }
-        keep[0] = true
-        keep[n - 1] = true
-        val stack = ArrayDeque<Pair<Int, Int>>()
-        stack.addLast(0 to n - 1)
-        while (stack.isNotEmpty()) {
-            val (start, end) = stack.removeLast()
-            if (end - start < 2) continue
-            val a = points[start]
-            val b = points[end]
-            var maxDist = -1.0
-            var maxIdx = -1
-            for (i in start + 1 until end) {
-                val d = TrackMath.crossTrackDistanceM(points[i].lat, points[i].lon, a.lat, a.lon, b.lat, b.lon)
-                if (d > maxDist) {
-                    maxDist = d
-                    maxIdx = i
-                }
-            }
-            if (maxIdx >= 0 && maxDist > epsilonM) {
-                keep[maxIdx] = true
-                stack.addLast(start to maxIdx)
-                stack.addLast(maxIdx to end)
-            }
-        }
-        val out = ArrayList<GpxTrkPt>(n)
-        for (i in 0 until n) {
-            if (keep[i]) out.add(points[i])
-        }
-        return out
-    }
-
-    /** Counts <trkpt> elements in a GPX document (used for post-process logging). */
-    private fun countTrkpt(gpx: String): Int {
-        return Regex("<trkpt ").findAll(gpx).count()
-    }
-
-    /**
-     * Like [formatGpxPoint] but also emits an <interpolated>true</interpolated>
-     * tag inside <extensions> when [p.interpolated] is true. Synthetic points
-     * have no accuracy, so we always emit <extensions> for them.
-     */
-    private fun formatGpxPointWithInterpolated(p: GpxTrkPt): String {
-        val sb = StringBuilder()
-        sb.append("      <trkpt lat=\"").append(p.lat).append("\" lon=\"").append(p.lon).append("\">\n")
-        if (p.ele != null) {
-            sb.append("        <ele>").append(p.ele).append("</ele>\n")
-        }
-        sb.append("        <time>").append(isoTime(p.timeMs)).append("</time>\n")
-        if (p.speed != null) {
-            sb.append("        <speed>").append(p.speed).append("</speed>\n")
-        }
-        if (p.accuracy != null || p.interpolated) {
-            sb.append("        <extensions>\n")
-            if (p.accuracy != null) {
-                sb.append("          <accuracy>").append(p.accuracy).append("</accuracy>\n")
-            }
-            if (p.interpolated) {
-                sb.append("          <interpolated>true</interpolated>\n")
-            }
-            sb.append("        </extensions>\n")
-        }
-        sb.append("      </trkpt>\n")
-        return sb.toString()
-    }
 
     /**
      * Lightweight trkpt representation used by the post-processing pipeline.
      * Carries an [interpolated] flag so synthetic points can be tagged in the
      * output GPX.
      */
-    private data class GpxTrkPt(
+    private data class GpxIO.GpxTrkPt(
         val lat: Double,
         val lon: Double,
         val ele: Double?,
@@ -3043,12 +2624,12 @@ class GpsRecorderService : Service(), LocationListener {
 
     /**
      * L30 fix: a parsed GPX segment, used by the new XmlPullParser-based
-     * helper. Each segment is a list of [GpxTrkPt]. Points whose timestamp
+     * helper. Each segment is a list of [GpxIO.GpxTrkPt]. Points whose timestamp
      * could not be parsed (L21) are dropped from this list and counted in
-     * [GpxParseResult.skippedPointCount] so callers can decide whether to
+     * [GpxIO.GpxParseResult.skippedPointCount] so callers can decide whether to
      * abort.
      */
-    private data class GpxSegment(val points: List<GpxTrkPt>)
+    private data class GpxIO.GpxSegment(val points: List<GpxIO.GpxTrkPt>)
 
     /**
      * L30 / L21: result of parsing a GPX document. [segments] holds the
@@ -3058,141 +2639,18 @@ class GpsRecorderService : Service(), LocationListener {
      * total number of <trkpt> elements seen (parsed + skipped), used by
      * callers to compute the skip ratio.
      */
-    private data class GpxParseResult(
-        val segments: List<GpxSegment>,
+    private data class GpxIO.GpxParseResult(
+        val segments: List<GpxIO.GpxSegment>,
         val skippedPointCount: Int,
         val totalPointCount: Int
-    )
 
-    /**
-     * L30 fix: shared XmlPullParser-based GPX parser. Replaces the regex-
-     * based parsing in reloadPointsFromTempFile / recomputeDistanceFromSavedGpx
-     * / gaussianSmoothGpx / douglasPeuckerGpx. Handles CDATA, comments, and
-     * attribute order variations that the regex would have failed on.
-     *
-     * L21 fix: points whose <time> tag is missing or unparseable are dropped
-     * from the returned segments and counted in [GpxParseResult.skippedPointCount].
-     * Callers can decide whether to abort if the skip ratio is too high
-     * (see [RELOAD_BAD_TIMESTAMP_ABORT_FRACTION]).
-     *
-     * Points with missing or unparseable lat/lon attributes are also dropped
-     * (same accounting).
-     */
-    private fun parseGpxSegments(input: InputStream): GpxParseResult {
-        val segments = mutableListOf<GpxSegment>()
-        var skipped = 0
-        var total = 0
-        try {
-            val parser = XmlPullParserFactory.newInstance().newPullParser()
-            parser.setInput(input, "UTF-8")
-            var currentSegment: MutableList<GpxTrkPt>? = null
-            var curLat: Double? = null
-            var curLon: Double? = null
-            var curEle: Double? = null
-            var curSpeed: Float? = null
-            var curAcc: Float? = null
-            var curTimeIso: String? = null
-            var event = parser.eventType
-            while (event != XmlPullParser.END_DOCUMENT) {
-                when (event) {
-                    XmlPullParser.START_TAG -> {
-                        when (parser.name) {
-                            "trkseg" -> currentSegment = mutableListOf()
-                            "trkpt" -> {
-                                curLat = parser.getAttributeValue(null, "lat")?.toDoubleOrNull()
-                                curLon = parser.getAttributeValue(null, "lon")?.toDoubleOrNull()
-                                curEle = null
-                                curSpeed = null
-                                curAcc = null
-                                curTimeIso = null
-                            }
-                            "ele" -> curEle = parser.nextText().toDoubleOrNull()
-                            "speed" -> curSpeed = parser.nextText().toFloatOrNull()
-                            "accuracy" -> curAcc = parser.nextText().toFloatOrNull()
-                            "time" -> curTimeIso = parser.nextText()
-                        }
-                    }
-                    XmlPullParser.END_TAG -> {
-                        when (parser.name) {
-                            "trkseg" -> {
-                                currentSegment?.let { segments.add(GpxSegment(it)) }
-                                currentSegment = null
-                            }
-                            "trkpt" -> {
-                                total++
-                                val lat = curLat
-                                val lon = curLon
-                                val timeMs = parseIsoTime(curTimeIso)
-                                if (lat == null || lon == null || timeMs == null || currentSegment == null) {
-                                    // L21 fix: skip points with missing /
-                                    // unparseable lat / lon / time.
-                                    skipped++
-                                } else {
-                                    currentSegment!!.add(
-                                        GpxTrkPt(lat, lon, curEle, curSpeed, curAcc, timeMs, interpolated = false)
-                                    )
-                                }
-                            }
-                        }
-                    }
-                }
-                event = parser.next()
-            }
-        } catch (e: Exception) {
-            Log.w(TAG, "parseGpxSegments: XmlPullParser failed (returning partial result)", e)
-        }
-        return GpxParseResult(segments, skipped, total)
-    }
-
-    /** Convenience overload for parsing a String. */
-    private fun parseGpxSegments(text: String): GpxParseResult {
-        return parseGpxSegments(text.byteInputStream(Charsets.UTF_8))
-    }
 
     // ------------------------------------------------------------------
     // GPX formatting helpers
     // ------------------------------------------------------------------
 
-    private fun gpxHeader(): String {
-        val nowIso = isoTime(System.currentTimeMillis())
-        return StringBuilder()
-            .append("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n")
-            .append("<gpx version=\"1.1\" creator=\"GpsRecorder\" ")
-            .append("xmlns=\"http://www.topografix.com/GPX/1/1\" ")
-            .append("xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" ")
-            .append("xsi:schemaLocation=\"http://www.topografix.com/GPX/1/1 ")
-            .append("http://www.topografix.com/GPX/1/1/gpx.xsd\">\n")
-            .append("  <metadata><time>").append(nowIso).append("</time></metadata>\n")
-            .toString()
-    }
 
-    private fun formatGpxPoint(p: GpsPoint): String {
-        val sb = StringBuilder()
-        sb.append("      <trkpt lat=\"").append(p.lat).append("\" lon=\"").append(p.lon).append("\">\n")
-        if (p.alt != null) {
-            sb.append("        <ele>").append(p.alt).append("</ele>\n")
-        }
-        sb.append("        <time>").append(isoTime(p.timeMs)).append("</time>\n")
-        if (p.speed != null) {
-            // GPX speed is in m/s
-            sb.append("        <speed>").append(p.speed).append("</speed>\n")
-        }
-        if (p.accuracy != null) {
-            // There's no standard GPX tag for accuracy; we use <extensions> with a custom
-            // namespace so it's still valid GPX but the accuracy info is preserved.
-            sb.append("        <extensions>\n")
-            sb.append("          <accuracy>").append(p.accuracy).append("</accuracy>\n")
-            sb.append("        </extensions>\n")
-        }
-        sb.append("      </trkpt>\n")
-        return sb.toString()
-    }
 
-    private fun isoTime(ms: Long): String {
-        // L32 fix: use the shared companion-val SimpleDateFormat instead
-        // of allocating a new one on every call.
-        return ISO_SDF.format(Date(ms))
-    }
 
     // ------------------------------------------------------------------
     // State persistence (for crash/restart recovery)
@@ -3312,7 +2770,18 @@ class GpsRecorderService : Service(), LocationListener {
             // state was held, so Android could kill the service again.
             // Safe because onCreate runs on the main thread before
             // onStartCommand.
-            startForegroundIfNeeded()
+            notifier.startForegroundIfNeeded(
+            GpsRecorderNotification.NotificationSnapshot(
+                points = pointCount,
+                elapsedMs = getElapsedMs(),
+                isAutoPaused = isAutoPaused,
+                signalLost = signalLost
+            )
+        ) {
+            releaseWakeLock()
+            GpsRecorderModule.emitError("Не удалось запустить foreground service", fatal = true)
+            stopSelf()
+        }
         }
     }
 
@@ -3339,7 +2808,7 @@ class GpsRecorderService : Service(), LocationListener {
         try {
             val f = getTempFile()
             if (!f.exists()) return
-            val parseResult = f.inputStream().use { parseGpxSegments(it) }
+            val parseResult = f.inputStream().use { GpxIO.parseGpxSegments(it) }
             // L21 fix: abort if too many points had bad timestamps.
             if (parseResult.totalPointCount > 0 &&
                 parseResult.skippedPointCount.toDouble() / parseResult.totalPointCount > RELOAD_BAD_TIMESTAMP_ABORT_FRACTION
@@ -3382,7 +2851,7 @@ class GpsRecorderService : Service(), LocationListener {
                     return
                 }
                 for ((idx, seg) in parsedSegments.withIndex()) {
-                    // Convert GpxTrkPt (post-process representation) back to
+                    // Convert GpxIO.GpxTrkPt (post-process representation) back to
                     // GpsPoint (recording buffer representation) — same fields.
                     val asGpsPoints = ArrayList<GpsPoint>(seg.points.size)
                     for (p in seg.points) {
@@ -3413,16 +2882,6 @@ class GpsRecorderService : Service(), LocationListener {
         }
     }
 
-    private fun parseIsoTime(iso: String?): Long? {
-        // L32 fix: use the shared companion-val SimpleDateFormat instead
-        // of allocating a new one on every call.
-        if (iso == null) return null
-        return try {
-            ISO_SDF.parse(iso)?.time
-        } catch (e: Exception) {
-            null
-        }
-    }
 
     // ------------------------------------------------------------------
     // Helpers
@@ -3430,16 +2889,4 @@ class GpsRecorderService : Service(), LocationListener {
 
     private fun getElapsedMs(): Long =
         if (isRecording) System.currentTimeMillis() - startTimeMs else 0L
-
-    // O24: This is duplicated in App.tsx (formatDuration). The two MUST stay
-    // in sync — if you change the format here, change the JS version too.
-    // See CHANGELOG.md / TODO 4, O24 for context.
-    private fun formatDuration(ms: Long): String {
-        val totalSec = ms / 1000
-        val h = totalSec / 3600
-        val m = (totalSec % 3600) / 60
-        val s = totalSec % 60
-        return if (h > 0) String.format(Locale.US, "%d:%02d:%02d", h, m, s)
-        else String.format(Locale.US, "%02d:%02d", m, s)
-    }
 }

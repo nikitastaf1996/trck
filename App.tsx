@@ -32,9 +32,7 @@
 
 import React, { useEffect, useRef, useState, useCallback, useReducer } from 'react';
 import {
-  ActivityIndicator,
   AppState,
-  Platform,
   Pressable,
   ScrollView,
   StatusBar,
@@ -57,19 +55,22 @@ import {
 // The built-in SafeAreaView from 'react-native' is unreliable on Android notches.
 import { SafeAreaView } from 'react-native-safe-area-context';
 // O8: extracted presentational components + shared palette / formatters.
-import { BigStat } from './src/components/BigStat';
-import { Divider } from './src/components/Divider';
-import { StepperRow } from './src/components/StepperRow';
 import { GnssPill } from './src/components/GnssPill';
-import { ErrorBoundary } from './src/components/ErrorBoundary';
+import { ToggleRow } from './src/components/ToggleRow';
+import { FilterSettingGroup } from './src/components/FilterSettingGroup';
+import { StatsDisplay } from './src/components/StatsDisplay';
+import { StartStopButton } from './src/components/StartStopButton';
+import { SavedCard } from './src/components/SavedCard';
+import { ErrorCard } from './src/components/ErrorCard';
+import { PermissionWaitOverlay, StopOverlay } from './src/components/Overlays';
+import {
+  SignalLostBanner,
+  BatteryOptBanner,
+  OverFilterWarning,
+} from './src/components/Banners';
 import {
   COLOR,
-  pad2,
   pluralRu,
-  formatDuration,
-  formatDistance,
-  computeAvgPace,
-  computeCurrentPace,
   type RecordingState,
 } from './src/styles';
 
@@ -983,55 +984,10 @@ function App(): React.ReactElement {
     }
   }, [douglasPeuckerEpsilonM, settingsLocked]);
 
-  const distanceFmt = formatDistance(distance);
-  // Smoothed current pace: average of the last few GPS speeds. This is much
-  // less jittery than the raw 1 Hz instantaneous speed, which can swing
-  // between e.g. 2.8 m/s and 4.1 m/s on consecutive fixes just from GPS
-  // noise. The window is short (5 fixes ≈ 5 s) so the pace still tracks
-  // real changes in effort within a few seconds.
-  //
-  // U7: now that U4 populates the window from BOTH the 'gnss' event (idle)
-  // AND the 'location' event (recording), we use the window whenever it
-  // has data — regardless of recording state. This eliminates the abrupt
-  // pace jump on idle→recording transition, because the smoothed value
-  // carries over (the location event just starts pushing into the same
-  // window the gnss event was filling).
-  //
-  // While auto-paused, we suppress the pace (show "—") because the user is
-  // stationary and any window average is meaningless.
-  const smoothedSpeed = (() => {
-    if (isAutoPaused) return null;
-    const w = recentSpeedsRef.current;
-    if (w.length > 0) {
-      const sum = w.reduce((a, b) => a + b, 0);
-      return sum / w.length;
-    }
-    return currentSpeed;
-  })();
-  const currentPace = computeCurrentPace(smoothedSpeed);
-  // Phase 6 + bugfix: when auto-pause is enabled, compute average pace using
-  // the active moving time (which excludes paused intervals) instead of wall-
-  // clock elapsed time. This keeps the displayed avg pace honest when the
-  // user stands still for long stretches (e.g. at traffic lights).
-  //
-  // Bugfix: also use movingMs when gap detection is enabled but auto-pause
-  // is off. In that case movingMs excludes signal-loss intervals (the
-  // watchdog freezes it when signalLost fires, see GpsRecorderService), so
-  // the avg pace stays honest across tunnels / indoor stretches where the
-  // GPS drops out. Without this, a 5-minute tunnel would inflate the avg
-  // pace from e.g. 5:30/km to 6:30/km because elapsedMs kept ticking
-  // When BOTH settings are off, movingMs equals elapsedMs (no transitions
-  // ever fire), so we use elapsedMs directly to avoid the small overhead
-  // of the movingMs path.
-  //
-  // CODE_REVIEW_TODO Task 4: when showMovingTime is on, ALWAYS use movingMs
-  // for the pace base (regardless of auto-pause / gap detection state).
-  // This keeps the pace display consistent with the time display, which
-  // also switches to movingMs when the toggle is on.
-  const paceTimeMs = (showMovingTime || autoPauseEnabled || gapDetectionEnabled)
-    ? movingMs
-    : elapsedMs;
-  const avgPace = computeAvgPace(paceTimeMs, distance);
+  // Note: distanceFmt / smoothedSpeed / currentPace / paceTimeMs / avgPace
+  // were previously computed here and used by the inlined stats JSX. They
+  // are now computed inside <StatsDisplay> (see src/components/StatsDisplay.tsx),
+  // which is the only consumer. Keeping them here would be dead code.
 
   // O14: if the native module is not loaded (e.g. package not registered,
   // or the iOS branch was removed but the JS still ran), the fallback
@@ -1066,156 +1022,31 @@ function App(): React.ReactElement {
           hasFix={hasFix}
         />
 
-        {/* Phase 4: signal-loss banner. Shown when the gap watchdog in the
-            service has declared signal lost (no fix in 15+ seconds) while a
-            recording is in progress.
-            U9: defensively suppress this banner when isAutoPaused is true.
-            The native service already clears signalLost when entering auto-
-            pause (the two are mutually exclusive on the native side), but
-            the JS UI renders them in separate conditional blocks. Adding
-            && !isAutoPaused here ensures only ONE banner can ever render
-            even if both flags somehow end up true simultaneously (e.g.
-            during a transition race between the two native watchdogs). */}
-        {isRecording && signalLost && !isAutoPaused && (
-          <View style={styles.signalLostBanner}>
-            <Text style={styles.signalLostTitle}>ПОТЕРЯ СИГНАЛА GPS</Text>
-            <Text style={styles.signalLostText}>
-              Нет фиксации более 15 с. Запись продолжится; новый сегмент
-              трека начнётся автоматически при восстановлении сигнала.
-            </Text>
-          </View>
-        )}
+        {isRecording && signalLost && !isAutoPaused && <SignalLostBanner />}
 
-        {/* Primary stats: TIME, DISTANCE, PACE, AVG PACE */}
-        <BigStat
-          // CODE_REVIEW_TODO Task 4: when showMovingTime is on, the label
-          // changes from "ВРЕМЯ" to "ВРЕМЯ В ДВИЖЕНИИ" so the user knows
-          // the displayed time is the active moving time (excludes
-          // auto-paused and signal-lost intervals), not wall-clock time.
-          // The toggle is NOT locked during recording — the user can flip
-          // it any time and the display switches on the next 1 Hz duration
-          // event.
-          label={showMovingTime ? 'ВРЕМЯ В ДВИЖЕНИИ' : 'ВРЕМЯ'}
-          // U22: when auto-paused, prefix the time with "⏸ " so it's
-          // crystal clear the displayed time is wall-clock (still ticking)
-          // but the recording is paused. The amber colour + the
-          // "АВТОПАУЗА · запись приостановлена" badge below already signal
-          // pause, but users may still perceive the ticking timer as
-          // "still recording time while paused" — the prefix removes
-          // that ambiguity. (Alternative fix per TODO; the main fix would
-          // switch the main timer to movingMs and show both times, but
-          // that requires restructuring the BigStat layout.)
-          //
-          // CODE_REVIEW_TODO Task 4: when showMovingTime is on, display
-          // movingMs instead of elapsedMs. While auto-paused, movingMs is
-          // frozen (doesn't tick) — that's the desired behaviour: the user
-          // explicitly asked to see moving time, and during a pause moving
-          // time isn't advancing. The ⏸ prefix is kept for clarity even
-          // though the frozen time itself signals the pause.
-          value={
-            isAutoPaused
-              ? `⏸ ${formatDuration(showMovingTime ? movingMs : elapsedMs)}`
-              : formatDuration(showMovingTime ? movingMs : elapsedMs)
-          }
-          // Phase 3: when auto-pause is active, render the TIME value in
-          // amber and show a small "ПАУЗА" indicator above it so the user
-          // knows the timer is wall-clock but recording is paused.
-          valueColor={isAutoPaused ? COLOR.pauseAccent : undefined}
+        <StatsDisplay
+          recordingState={recordingState}
+          elapsedMs={elapsedMs}
+          movingMs={movingMs}
+          distance={distance}
+          currentSpeed={currentSpeed}
+          isAutoPaused={isAutoPaused}
+          signalLost={signalLost}
+          showMovingTime={showMovingTime}
+          autoPauseEnabled={autoPauseEnabled}
+          gapDetectionEnabled={gapDetectionEnabled}
+          recentSpeedsRef={recentSpeedsRef}
         />
-        {isAutoPaused && (
-          <View style={styles.pauseBadge}>
-            <View style={styles.pauseDot} />
-            <Text style={styles.pauseBadgeText}>
-              АВТОПАУЗА · запись приостановлена
-            </Text>
-          </View>
-        )}
-        <Divider />
 
-        <BigStat
-          label="ДИСТАНЦИЯ"
-          value={distanceFmt.value}
-          unit={distanceFmt.unit}
-        />
-        <Divider />
-
-        <View style={styles.twoCol}>
-          <BigStat
-            label="ТЕМП"
-            value={currentPace ?? '—'}
-            unit={currentPace ? '/км' : undefined}
-            compact
-          />
-          <View style={styles.colDivider} />
-          <BigStat
-            label="СРЕД. ТЕМП"
-            value={avgPace ?? '—'}
-            unit={avgPace ? '/км' : undefined}
-            compact
-          />
-        </View>
-
-        {/* Status / recording indicator */}
-        <View style={styles.statusRow}>
-          <View
-            style={[
-              styles.statusDot,
-              isAutoPaused
-            ? styles.dotPaused
-            : isRecording
-            ? styles.dotOn
-            : styles.dotOff,
-            ]}
-          />
-          <Text style={styles.statusText}>
-            {/* U8: removed the dead `pointCount > 0 ? \`\${pointCount} ТОЧЕК\``
-                branch — the 'state' event handler resets pointCount to 0
-                whenever recording stops, so when we're NOT recording the
-                count is always 0 and the branch is unreachable. The
-                'ОЖИДАНИЕ' fallback is the only reachable not-recording
-                status now. */}
-            {isAutoPaused
-              ? 'АВТОПАУЗА'
-              : signalLost
-              ? 'НЕТ СИГНАЛА'
-              : isRecording
-              ? 'ЗАПИСЬ'
-              : isStopping
-              ? 'ОСТАНОВКА…'
-              : 'ОЖИДАНИЕ'}
-          </Text>
-        </View>
-
-        {/* U12: non-blocking warning banner shown above the START button when
-            the user previously denied the battery-optimization exemption.
-            Doze mode may kill the foreground service during long background
-            recordings. Tap to re-open the system dialog. */}
         {batteryOptDenied && !isRecording && !isStopping && (
-          <Pressable style={styles.batteryOptBanner} onPress={handleRetryBatteryOpt}>
-            <Text style={styles.batteryOptBannerText}>
-              ⚠️ Фоновые записи могут прерываться (Doze). Нажмите здесь, чтобы настроить.
-            </Text>
-          </Pressable>
+          <BatteryOptBanner onPress={handleRetryBatteryOpt} />
         )}
 
-        {/* Big circular START / STOP button */}
-        <View style={styles.buttonWrap}>
-          <Pressable
-            style={({ pressed }) => [
-              styles.bigButton,
-              isRecording ? styles.bigButtonStop : styles.bigButtonStart,
-              (pressed || isStopping) && styles.bigButtonPressed,
-              isStopping && styles.bigButtonStopping,
-            ]}
-            onPress={isRecording ? handleStop : handleStart}
-            disabled={isStopping}
-            android_ripple={{ color: 'rgba(255,255,255,0.18)', radius: 220 }}
-          >
-            <Text style={styles.bigButtonText}>
-              {isStopping ? '…' : isRecording ? 'СТОП' : 'СТАРТ'}
-            </Text>
-          </Pressable>
-        </View>
+        <StartStopButton
+          recordingState={recordingState}
+          onStart={handleStart}
+          onStop={handleStop}
+        />
 
         {/* Settings section header + "locked during recording" notice */}
         <View style={styles.settingsHeader}>
@@ -1230,190 +1061,64 @@ function App(): React.ReactElement {
           )}
         </View>
 
-        {/* On-the-fly track filtering toggle (locked while recording) */}
-        <Pressable
-          style={[
-            styles.toggleRow,
-            postProcessEnabled ? styles.toggleRowOn : styles.toggleRowOff,
-            settingsLocked && styles.toggleRowLocked,
-          ]}
+        <ToggleRow
+          title="Фильтрация трека на лету"
+          subtitle={
+            postProcessEnabled
+              ? 'Включена: точность ≤ 25 м, скорость ≤ 20 км/ч — выбросы отсекаются при записи'
+              : 'Выключена: запись сырых GPS-данных без изменений'
+          }
+          value={postProcessEnabled}
           onPress={handleTogglePostProcess}
           disabled={settingsLocked}
-        >
-          <View style={styles.toggleLabelWrap}>
-            <Text style={styles.toggleTitle}>Фильтрация трека на лету</Text>
-            <Text style={styles.toggleSubtitle}>
-              {postProcessEnabled
-                ? 'Включена: точность ≤ 25 м, скорость ≤ 20 км/ч — выбросы отсекаются при записи'
-                : 'Выключена: запись сырых GPS-данных без изменений'}
-            </Text>
-          </View>
-          <View
-            style={[
-              styles.toggleSwitch,
-              postProcessEnabled ? styles.toggleSwitchOn : styles.toggleSwitchOff,
-            ]}
-          >
-            <View
-              style={[
-                styles.toggleKnob,
-                postProcessEnabled ? styles.toggleKnobOn : styles.toggleKnobOff,
-              ]}
-            />
-          </View>
-        </Pressable>
+        />
 
-        {/* Gaussian / kernel smoothing toggle (locked while recording) */}
-        <Pressable
-          style={[
-            styles.toggleRow,
-            gaussianSmoothingEnabled ? styles.toggleRowOn : styles.toggleRowOff,
-            settingsLocked && styles.toggleRowLocked,
-          ]}
+        <ToggleRow
+          title="Сглаживание Гауссом (постобработка)"
+          subtitle={
+            gaussianSmoothingEnabled
+              ? 'Включено: после записи к треку применяется гауссово сглаживание (окно ±5 точек, σ=1.5)'
+              : 'Выключено: GPX сохраняется как есть, без финального сглаживания'
+          }
+          value={gaussianSmoothingEnabled}
           onPress={handleToggleGaussianSmoothing}
           disabled={settingsLocked}
-        >
-          <View style={styles.toggleLabelWrap}>
-            <Text style={styles.toggleTitle}>Сглаживание Гауссом (постобработка)</Text>
-            <Text style={styles.toggleSubtitle}>
-              {gaussianSmoothingEnabled
-                ? 'Включено: после записи к треку применяется гауссово сглаживание (окно ±5 точек, σ=1.5)'
-                : 'Выключено: GPX сохраняется как есть, без финального сглаживания'}
-            </Text>
-          </View>
-          <View
-            style={[
-              styles.toggleSwitch,
-              gaussianSmoothingEnabled ? styles.toggleSwitchOn : styles.toggleSwitchOff,
-            ]}
-          >
-            <View
-              style={[
-                styles.toggleKnob,
-                gaussianSmoothingEnabled ? styles.toggleKnobOn : styles.toggleKnobOff,
-              ]}
-            />
-          </View>
-        </Pressable>
+        />
 
-        {/* Phase 1/3: Auto-pause toggle (locked while recording). When
-            enabled, recording auto-pauses while the user is stationary
-            (speed < 0.35 m/s + max displacement in 10 s window < 3.5 m) and
-            auto-resumes when they start moving again. The track is split
-            into separate <trkseg> blocks at each pause / resume so the GPX
-            file has clean segment breaks. */}
-        <Pressable
-          style={[
-            styles.toggleRow,
-            autoPauseEnabled ? styles.toggleRowOn : styles.toggleRowOff,
-            settingsLocked && styles.toggleRowLocked,
-          ]}
+        <ToggleRow
+          title="Автопауза при остановке"
+          subtitle={
+            autoPauseEnabled
+              ? 'Включена: пауза при скорости < 0.35 м/с и смещении < 3.5 м за 10 с. Средний темп считается по чистому времени движения'
+              : 'Выключена: запись идёт непрерывно, даже когда вы стоите на месте'
+          }
+          value={autoPauseEnabled}
           onPress={handleToggleAutoPause}
           disabled={settingsLocked}
-        >
-          <View style={styles.toggleLabelWrap}>
-            <Text style={styles.toggleTitle}>Автопауза при остановке</Text>
-            <Text style={styles.toggleSubtitle}>
-              {autoPauseEnabled
-                ? 'Включена: пауза при скорости < 0.35 м/с и смещении < 3.5 м за 10 с. Средний темп считается по чистому времени движения'
-                : 'Выключена: запись идёт непрерывно, даже когда вы стоите на месте'}
-            </Text>
-          </View>
-          <View
-            style={[
-              styles.toggleSwitch,
-              autoPauseEnabled ? styles.toggleSwitchOn : styles.toggleSwitchOff,
-            ]}
-          >
-            <View
-              style={[
-                styles.toggleKnob,
-                autoPauseEnabled ? styles.toggleKnobOn : styles.toggleKnobOff,
-              ]}
-            />
-          </View>
-        </Pressable>
+        />
 
-        {/* Phase 4: Gap-detection toggle (locked while recording). When
-            enabled (DEFAULT), a watchdog in the service declares signal
-            lost after 15 s without a fix, the UI shows a red "ПОТЕРЯ СИГНАЛА
-            GPS" banner, and the next arriving fix starts a new <trkseg> so
-            the track has a clean break at the outage. When disabled, signal
-            outages do NOT split the track and the banner never appears —
-            the legacy pre-Phase-4 behaviour. */}
-        <Pressable
-          style={[
-            styles.toggleRow,
-            gapDetectionEnabled ? styles.toggleRowOn : styles.toggleRowOff,
-            settingsLocked && styles.toggleRowLocked,
-          ]}
+        <ToggleRow
+          title="Разделение трека при потере сигнала"
+          subtitle={
+            gapDetectionEnabled
+              ? 'Включено: нет фиксации > 15 с → новый сегмент <trkseg> и баннер "ПОТЕРЯ СИГНАЛА". Расстояние через разрыв не считается'
+              : 'Выключено: провалы сигнала игнорируются, трек пишётся одним сегментом (как в прежних версиях)'
+          }
+          value={gapDetectionEnabled}
           onPress={handleToggleGapDetection}
           disabled={settingsLocked}
-        >
-          <View style={styles.toggleLabelWrap}>
-            <Text style={styles.toggleTitle}>Разделение трека при потере сигнала</Text>
-            <Text style={styles.toggleSubtitle}>
-              {gapDetectionEnabled
-                ? 'Включено: нет фиксации > 15 с → новый сегмент <trkseg> и баннер "ПОТЕРЯ СИГНАЛА". Расстояние через разрыв не считается'
-                : 'Выключено: провалы сигнала игнорируются, трек пишётся одним сегментом (как в прежних версиях)'}
-            </Text>
-          </View>
-          <View
-            style={[
-              styles.toggleSwitch,
-              gapDetectionEnabled ? styles.toggleSwitchOn : styles.toggleSwitchOff,
-            ]}
-          >
-            <View
-              style={[
-                styles.toggleKnob,
-                gapDetectionEnabled ? styles.toggleKnobOn : styles.toggleKnobOff,
-              ]}
-            />
-          </View>
-        </Pressable>
+        />
 
-        {/* CODE_REVIEW_TODO Task 4: Show-moving-time display toggle.
-            Pure display preference — NOT locked while recording (the user
-            can toggle it any time, including mid-recording). When ON, the
-            top time display switches from wall-clock elapsed time to
-            active moving time (excludes auto-paused and signal-lost
-            intervals), and the average pace is recomputed from moving
-            time. The native side always emits both values; the UI just
-            chooses which to show. The label above the time changes from
-            "ВРЕМЯ" to "ВРЕМЯ В ДВИЖЕНИИ" as a visual indicator. */}
-        <Pressable
-          style={[
-            styles.toggleRow,
-            showMovingTime ? styles.toggleRowOn : styles.toggleRowOff,
-            // NOTE: no settingsLocked style — this toggle is intentionally
-            // unlocked during recording per Task 4 spec.
-          ]}
+        <ToggleRow
+          title="Показывать время в движении"
+          subtitle={
+            showMovingTime
+              ? 'Включено: верхний таймер и средний темп считаются по чистому времени движения (без учёта пауз и потерь сигнала). Можно менять во время записи.'
+              : 'Выключено: верхний таймер и средний темп считаются по общему времени (включая паузы). Можно менять во время записи.'
+          }
+          value={showMovingTime}
           onPress={handleToggleShowMovingTime}
-          // NOTE: no disabled={settingsLocked} — see comment above.
-        >
-          <View style={styles.toggleLabelWrap}>
-            <Text style={styles.toggleTitle}>Показывать время в движении</Text>
-            <Text style={styles.toggleSubtitle}>
-              {showMovingTime
-                ? 'Включено: верхний таймер и средний темп считаются по чистому времени движения (без учёта пауз и потерь сигнала). Можно менять во время записи.'
-                : 'Выключено: верхний таймер и средний темп считаются по общему времени (включая паузы). Можно менять во время записи.'}
-            </Text>
-          </View>
-          <View
-            style={[
-              styles.toggleSwitch,
-              showMovingTime ? styles.toggleSwitchOn : styles.toggleSwitchOff,
-            ]}
-          >
-            <View
-              style={[
-                styles.toggleKnob,
-                showMovingTime ? styles.toggleKnobOn : styles.toggleKnobOff,
-              ]}
-            />
-          </View>
-        </Pressable>
+        />
 
         {/* ---- Three data-reduction filters (user-requested) ---- */}
         {/*
@@ -1435,146 +1140,53 @@ function App(): React.ReactElement {
              Gaussian smoothing if both are on.
         */}
 
-        {/* 1. Radial distance filter toggle + stepper */}
-        <View style={styles.settingGroup}>
-          <Pressable
-            style={[
-              styles.toggleRow,
-              styles.toggleRowGrouped,
-              radialDistanceFilterEnabled ? styles.toggleRowOn : styles.toggleRowOff,
-              settingsLocked && styles.toggleRowLocked,
-            ]}
-            onPress={handleToggleRadialDistanceFilter}
-            disabled={settingsLocked}
-          >
-            <View style={styles.toggleLabelWrap}>
-              <Text style={styles.toggleTitle}>Радиальный фильтр (на лету)</Text>
-              <Text style={styles.toggleSubtitle}>
-                {radialDistanceFilterEnabled
-                  ? `Включён: точка пропускается, если она ближе ${radialDistanceThresholdM} м к последней сохранённой`
-                  : 'Выключен: каждая принятая точка сохраняется в трек'}
-              </Text>
-            </View>
-            <View
-              style={[
-                styles.toggleSwitch,
-                radialDistanceFilterEnabled ? styles.toggleSwitchOn : styles.toggleSwitchOff,
-              ]}
-            >
-              <View
-                style={[
-                  styles.toggleKnob,
-                  radialDistanceFilterEnabled ? styles.toggleKnobOn : styles.toggleKnobOff,
-                ]}
-              />
-            </View>
-          </Pressable>
-          <StepperRow
-            label="Мин. расстояние"
-            value={radialDistanceThresholdM}
-            unit="м"
-            min={0}
-            max={1000}
-            disabled={settingsLocked}
-            onDecrement={() => handleStepperRadialThreshold(-1)}
-            onIncrement={() => handleStepperRadialThreshold(+1)}
-          />
-        </View>
+        <FilterSettingGroup
+          title="Радиальный фильтр (на лету)"
+          subtitleOn={`Включён: точка пропускается, если она ближе ${radialDistanceThresholdM} м к последней сохранённой`}
+          subtitleOff="Выключен: каждая принятая точка сохраняется в трек"
+          value={radialDistanceFilterEnabled}
+          onToggle={handleToggleRadialDistanceFilter}
+          stepperLabel="Мин. расстояние"
+          stepperValue={radialDistanceThresholdM}
+          stepperUnit="м"
+          stepperMin={0}
+          stepperMax={1000}
+          onDecrement={() => handleStepperRadialThreshold(-1)}
+          onIncrement={() => handleStepperRadialThreshold(+1)}
+          settingsLocked={settingsLocked}
+        />
 
-        {/* 2. Time sampling filter toggle + stepper */}
-        <View style={styles.settingGroup}>
-          <Pressable
-            style={[
-              styles.toggleRow,
-              styles.toggleRowGrouped,
-              timeSamplingEnabled ? styles.toggleRowOn : styles.toggleRowOff,
-              settingsLocked && styles.toggleRowLocked,
-            ]}
-            onPress={handleToggleTimeSampling}
-            disabled={settingsLocked}
-          >
-            <View style={styles.toggleLabelWrap}>
-              <Text style={styles.toggleTitle}>Децимация по времени (на лету)</Text>
-              <Text style={styles.toggleSubtitle}>
-                {timeSamplingEnabled
-                  ? `Включена: сохраняется каждая ${timeSamplingN}-я точка (≈ раз в ${timeSamplingN} с при 1 Гц)`
-                  : 'Выключена: сохраняются все принятые точки'}
-              </Text>
-            </View>
-            <View
-              style={[
-                styles.toggleSwitch,
-                timeSamplingEnabled ? styles.toggleSwitchOn : styles.toggleSwitchOff,
-              ]}
-            >
-              <View
-                style={[
-                  styles.toggleKnob,
-                  timeSamplingEnabled ? styles.toggleKnobOn : styles.toggleKnobOff,
-                ]}
-              />
-            </View>
-          </Pressable>
-          <StepperRow
-            label="Шаг N"
-            value={timeSamplingN}
-            // U5: correct Russian plural form for the unit label.
-            unit={pluralRu(timeSamplingN, ['точка', 'точки', 'точек'])}
-            min={1}
-            max={60}
-            disabled={settingsLocked}
-            onDecrement={() => handleStepperTimeSamplingN(-1)}
-            onIncrement={() => handleStepperTimeSamplingN(+1)}
-          />
-        </View>
+<FilterSettingGroup
+          title="Децимация по времени (на лету)"
+          subtitleOn={`Включена: сохраняется каждая ${timeSamplingN}-я точка (≈ раз в ${timeSamplingN} с при 1 Гц)`}
+          subtitleOff="Выключена: сохраняются все принятые точки"
+          value={timeSamplingEnabled}
+          onToggle={handleToggleTimeSampling}
+          stepperLabel="Шаг N"
+          stepperValue={timeSamplingN}
+          stepperUnit={pluralRu(timeSamplingN, ['точка', 'точки', 'точек'])}
+          stepperMin={1}
+          stepperMax={60}
+          onDecrement={() => handleStepperTimeSamplingN(-1)}
+          onIncrement={() => handleStepperTimeSamplingN(+1)}
+          settingsLocked={settingsLocked}
+        />
 
-        {/* 3. Douglas-Peucker post-processing toggle + stepper */}
-        <View style={styles.settingGroup}>
-          <Pressable
-            style={[
-              styles.toggleRow,
-              styles.toggleRowGrouped,
-              douglasPeuckerEnabled ? styles.toggleRowOn : styles.toggleRowOff,
-              settingsLocked && styles.toggleRowLocked,
-            ]}
-            onPress={handleToggleDouglasPeucker}
-            disabled={settingsLocked}
-          >
-            <View style={styles.toggleLabelWrap}>
-              <Text style={styles.toggleTitle}>Douglas-Peucker (постобработка)</Text>
-              <Text style={styles.toggleSubtitle}>
-                {douglasPeuckerEnabled
-                  ? `Включён: трек упрощается, точки ближе ${douglasPeuckerEpsilonM} м от линии сегмента удаляются`
-                  : 'Выключен: GPX сохраняется как есть, без финального упрощения'}
-              </Text>
-            </View>
-            <View
-              style={[
-                styles.toggleSwitch,
-                douglasPeuckerEnabled ? styles.toggleSwitchOn : styles.toggleSwitchOff,
-              ]}
-            >
-              <View
-                style={[
-                  styles.toggleKnob,
-                  douglasPeuckerEnabled ? styles.toggleKnobOn : styles.toggleKnobOff,
-                ]}
-              />
-            </View>
-          </Pressable>
-          <StepperRow
-            label="Эпсилон (допуск)"
-            value={douglasPeuckerEpsilonM}
-            unit="м"
-            min={0}
-            max={500}
-            disabled={settingsLocked}
-            onDecrement={() => handleStepperDouglasPeuckerEpsilon(-1)}
-            onIncrement={() => handleStepperDouglasPeuckerEpsilon(+1)}
-          />
-        </View>
-
-        {/* CODE_REVIEW_TODO Task 3: over-filter warning banner.
+<FilterSettingGroup
+          title="Douglas-Peucker (постобработка)"
+          subtitleOn={`Включён: трек упрощается, точки ближе ${douglasPeuckerEpsilonM} м от линии сегмента удаляются`}
+          subtitleOff="Выключен: GPX сохраняется как есть, без финального упрощения"
+          value={douglasPeuckerEnabled}
+          onToggle={handleToggleDouglasPeucker}
+          stepperLabel="Эпсилон (допуск)"
+          stepperValue={douglasPeuckerEpsilonM}
+          stepperUnit="м"
+          stepperMin={0}
+          stepperMax={500}
+          onDecrement={() => handleStepperDouglasPeuckerEpsilon(-1)}
+          onIncrement={() => handleStepperDouglasPeuckerEpsilon(+1)}
+          settingsLocked={settingsLocked}
+        />{/* CODE_REVIEW_TODO Task 3: over-filter warning banner.
             When all three data-reduction filters (radial distance, time
             sampling, Douglas-Peucker) are enabled simultaneously, the
             track becomes extremely sparse — for a hiker at 1 m/s, this
@@ -1587,20 +1199,7 @@ function App(): React.ReactElement {
             battery-optimization banner). Updates live as toggles flip. */}
         {radialDistanceFilterEnabled &&
           timeSamplingEnabled &&
-          douglasPeuckerEnabled && (
-          <View style={styles.overFilterWarningContainer}>
-            <Text style={styles.overFilterWarningTitle}>
-              ⚠ Предупреждение
-            </Text>
-            <Text style={styles.overFilterWarningBody}>
-              Включены все три фильтра прореживания (радиальный, временной,
-              Дуглас-Пекер). Трек может получиться слишком редким, особенно
-              при медленном движении (ходьба, пеший туризм). Углы и повороты
-              могут быть потеряны. Рекомендуется оставить включённым не более
-              двух фильтров одновременно.
-            </Text>
-          </View>
-        )}
+          douglasPeuckerEnabled && <OverFilterWarning />}
 
         {!hasPermissions && (
           <Pressable style={styles.permissionButton} onPress={handleGrantPermissions}>
@@ -1611,81 +1210,25 @@ function App(): React.ReactElement {
         )}
 
         {lastSavedPath && (
-          <View style={styles.savedCard}>
-            <View style={styles.cardRow}>
-              <Text style={styles.savedTitle}>GPX СОХРАНЁН</Text>
-              {/* U19: dismiss button so the user can clear the saved card
-                  without starting a new recording. */}
-              <Pressable
-                style={styles.cardDismissBtn}
-                onPress={() => setLastSavedPath(null)}
-                hitSlop={8}
-                accessibilityLabel="Скрыть карточку сохранения"
-              >
-                <Text style={styles.cardDismissText}>✕</Text>
-              </Pressable>
-            </View>
-            <Text style={styles.savedPath}>{lastSavedPath}</Text>
-            {lastSavedDistance != null && (() => {
-              const fmt = formatDistance(lastSavedDistance);
-              // U3: use the save-time snapshot of the toggle state, NOT the
-              // current toggle state. After a recording ends, the settings
-              // unlock and the user can flip auto-pause / gap detection to
-              // prepare for the next run — without the snapshot, the saved
-              // card's pace would silently recompute under the new state.
-              const ap = lastSavedSettings?.autoPauseEnabled ?? false;
-              const gd = lastSavedSettings?.gapDetectionEnabled ?? true;
-              // CODE_REVIEW_TODO Task 4: also use the save-time snapshot of
-              // showMovingTime so the saved card's pace uses the same time
-              // base the user was looking at when they stopped the recording.
-              const smt = lastSavedSettings?.showMovingTime ?? false;
-              const tMs = (smt || ap || gd)
-                ? lastSavedMovingMs
-                : lastSavedElapsedMs;
-              const pace = computeAvgPace(tMs, lastSavedDistance);
-              return (
-                <Text style={styles.savedDistance}>
-                  Финальная дистанция: {fmt.value} {fmt.unit}
-                  {pace ? `  ·  ${pace} /км` : ''}
-                </Text>
-              );
-            })()}
-          </View>
+          <SavedCard
+            path={lastSavedPath}
+            distance={lastSavedDistance}
+            movingMs={lastSavedMovingMs}
+            elapsedMs={lastSavedElapsedMs}
+            settings={lastSavedSettings}
+            onDismiss={() => setLastSavedPath(null)}
+          />
         )}
 
         {errorMsg && (
-          <View style={styles.errorCard}>
-            <View style={styles.cardRow}>
-              <Text style={styles.errorText}>{errorMsg}</Text>
-              {/* U19: dismiss button so the user can clear the error card
-                  without starting a new recording. */}
-              <Pressable
-                style={styles.cardDismissBtn}
-                onPress={() => setErrorMsg(null)}
-                hitSlop={8}
-                accessibilityLabel="Скрыть ошибку"
-              >
-                <Text style={styles.cardDismissText}>✕</Text>
-              </Pressable>
-            </View>
-            {/* U2: when permissions are missing (permanently denied or just
-                not yet granted), offer a button that opens the system app
-                settings page so the user can grant them. The native module
-                GpsRecorder.openAppSettings() is already exported; we just
-                call it. The existing AppState listener (mount useEffect)
-                re-checks hasPermissions when the user returns and updates
-                the card automatically. */}
-            {!hasPermissions && (
-              <Pressable
-                style={styles.openSettingsBtn}
-                onPress={() => {
-                  GpsRecorder.openAppSettings().catch(() => { /* ignore */ });
-                }}
-              >
-                <Text style={styles.openSettingsBtnText}>Открыть настройки</Text>
-              </Pressable>
-            )}
-          </View>
+          <ErrorCard
+            message={errorMsg}
+            hasPermissions={hasPermissions}
+            onDismiss={() => setErrorMsg(null)}
+            onOpenSettings={() => {
+              GpsRecorder.openAppSettings().catch(() => { /* ignore */ });
+            }}
+          />
         )}
 
         <View style={styles.footerNote}>
@@ -1697,42 +1240,12 @@ function App(): React.ReactElement {
         </View>
       </ScrollView>
 
-      {/* U1: permission-wait overlay. Shown while the system permission dialog
-          is on screen so the user knows the START tap was registered and can
-          cancel out of the wait. Non-blocking visually but covers the UI. */}
-      {waitingForPermissions && (
-        <View style={styles.permissionWaitOverlay}>
-          <View style={styles.permissionWaitCard}>
-            <ActivityIndicator size="large" color={COLOR.primary} />
-            <Text style={styles.permissionWaitText}>
-              Ожидание разрешений…
-            </Text>
-            <Pressable
-              style={styles.permissionWaitCancelBtn}
-              onPress={handleCancelPermissionWait}
-            >
-              <Text style={styles.permissionWaitCancelText}>Отмена</Text>
-            </Pressable>
-          </View>
-        </View>
-      )}
+      <PermissionWaitOverlay
+        visible={waitingForPermissions}
+        onCancel={handleCancelPermissionWait}
+      />
 
-      {/* U20: stop/save overlay. Shown while recordingState === 'stopping' so
-          the user knows the finalize step is in progress (Gaussian smoothing
-          + Douglas-Peucker on a long track can take several seconds). The
-          overlay is non-blocking visually but covers the UI; it disappears
-          when recordingState transitions to 'idle' (i.e. when the 'saved'
-          event arrives). */}
-      {isStopping && (
-        <View style={styles.permissionWaitOverlay}>
-          <View style={styles.permissionWaitCard}>
-            <ActivityIndicator size="large" color={COLOR.accentStop} />
-            <Text style={styles.permissionWaitText}>
-              Сохранение GPX…
-            </Text>
-          </View>
-        </View>
-      )}
+      <StopOverlay visible={isStopping} />
     </SafeAreaView>
   );
 }
@@ -1745,101 +1258,16 @@ const styles = StyleSheet.create({
     paddingTop: 16,
     paddingBottom: 60,
   },
-  twoCol: {
-    flexDirection: 'row',
-    alignItems: 'stretch',
-  },
-  colDivider: {
-    width: StyleSheet.hairlineWidth,
-    backgroundColor: COLOR.divider,
-    marginHorizontal: 0,
-  },
   // ---- Status row ----
-  statusRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'center',
-    marginTop: 16,
-    marginBottom: 8,
-    gap: 8,
-  },
-  statusDot: {
-    width: 8, height: 8, borderRadius: 4,
-  },
   // Green when recording (active = good, matches the GNSS pill colour scheme).
   // Grey when idle. Amber when auto-paused. Red is reserved for the STOP
   // button + signal-lost banner so the user doesn't read a red dot as
   // "something is wrong" while a recording is happily in progress.
-  dotOn: { backgroundColor: COLOR.gnssGreen },
-  dotOff: { backgroundColor: COLOR.gnssGray },
   // Phase 3: amber dot shown while auto-pause is active.
-  dotPaused: { backgroundColor: COLOR.pauseAccent },
-  statusText: {
-    fontSize: 11,
-    fontWeight: '700',
-    color: COLOR.secondary,
-    letterSpacing: 1.5,
-  },
   // ---- Phase 3: auto-pause badge (shown below the TIME stat) ----
-  pauseBadge: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'center',
-    gap: 8,
-    marginTop: -8,
-    marginBottom: 4,
-  },
-  pauseDot: {
-    width: 8, height: 8, borderRadius: 4,
-    backgroundColor: COLOR.pauseAccent,
-  },
-  pauseBadgeText: {
-    fontSize: 11,
-    fontWeight: '700',
-    color: COLOR.pauseAccent,
-    letterSpacing: 1.5,
-  },
   // ---- Phase 4: signal-lost banner ----
-  signalLostBanner: {
-    backgroundColor: COLOR.signalLostBg,
-    borderRadius: 12,
-    padding: 14,
-    marginBottom: 16,
-    borderWidth: 1,
-    borderColor: COLOR.signalLostBorder,
-  },
-  signalLostTitle: {
-    fontSize: 12,
-    fontWeight: '800',
-    color: COLOR.signalLostAccent,
-    letterSpacing: 1.5,
-    marginBottom: 6,
-  },
-  signalLostText: {
-    fontSize: 12,
-    color: COLOR.signalLostAccent,
-    lineHeight: 17,
-  },
   // ---- Big button ----
-  buttonWrap: { alignItems: 'center', marginTop: 24, marginBottom: 16 },
   // U12: battery-optimization warning banner.
-  batteryOptBanner: {
-    backgroundColor: COLOR.pauseBg,
-    borderWidth: 1,
-    borderColor: COLOR.pauseBorder,
-    borderRadius: 10,
-    paddingVertical: 10,
-    paddingHorizontal: 14,
-    marginBottom: 12,
-    marginTop: 4,
-  },
-  batteryOptBannerText: {
-    color: COLOR.pauseAccent,
-    fontSize: 12,
-    fontWeight: '600',
-    lineHeight: 16,
-    textAlign: 'center',
-  },
   // ---- CODE_REVIEW_TODO Task 3: over-filter warning banner ----
   // Shown directly below the three data-reduction filter settings when ALL
   // three are enabled simultaneously. Uses the existing amber palette
@@ -1847,121 +1275,23 @@ const styles = StyleSheet.create({
   // banner above) for visual consistency with the project's "warning"
   // convention. The left-border accent + title/body layout mirrors the
   // signal-lost banner (red variant) for a familiar look.
-  overFilterWarningContainer: {
-    marginTop: 12,
-    marginBottom: 12,
-    padding: 12,
-    borderRadius: 8,
-    backgroundColor: COLOR.pauseBg,        // light amber
-    borderLeftWidth: 4,
-    borderLeftColor: COLOR.pauseAccent,    // amber accent stripe
-    borderWidth: 1,
-    borderColor: COLOR.pauseBorder,
-  },
-  overFilterWarningTitle: {
-    color: COLOR.pauseAccent,
-    fontWeight: '700',
-    fontSize: 14,
-    marginBottom: 4,
-  },
-  overFilterWarningBody: {
-    color: COLOR.pauseAccent,
-    fontSize: 13,
-    lineHeight: 18,
-  },
-  bigButton: {
-    width: 220, height: 220, borderRadius: 110,
-    alignItems: 'center', justifyContent: 'center',
-    elevation: 6,
-    shadowColor: '#000', shadowOffset: { width: 0, height: 4 },
-    shadowOpacity: 0.18, shadowRadius: 12,
-  },
-  bigButtonStart: { backgroundColor: COLOR.accentStart },
-  bigButtonStop: { backgroundColor: COLOR.accentStop },
-  bigButtonPressed: { transform: [{ scale: 0.98 }] },
-  bigButtonStopping: { backgroundColor: COLOR.accentStopping },
-  bigButtonText: {
-    color: '#FFFFFF', fontSize: 32, fontWeight: '800', letterSpacing: 4,
-  },
   // ---- Post-processing toggle ----
-  toggleRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    paddingHorizontal: 16,
-    paddingVertical: 14,
-    borderRadius: 12,
-    borderWidth: 1,
-    marginBottom: 16,
-  },
   // Variant for toggle rows that are the TOP half of a settingGroup (toggle
   // + stepper card). Removes the bottom margin and rounds only the top
   // corners so the stepper row below visually attaches to it.
-  toggleRowGrouped: {
-    marginBottom: 0,
-    borderBottomLeftRadius: 0,
-    borderBottomRightRadius: 0,
-    borderBottomWidth: 0,
-  },
-  toggleRowOn: {
-    backgroundColor: '#EFF6FF',
-    borderColor: '#BFDBFE',
-  },
-  toggleRowOff: {
-    backgroundColor: '#F9FAFB',
-    borderColor: COLOR.divider,
-  },
   // Visual "locked" state — used when recording is in progress so the toggles
   // are visibly disabled. We deliberately keep the row's on/off color so the
   // user can still tell which settings are active; we only dim the whole row
   // (opacity) and override the background to a neutral grey so the row looks
   // "frozen" rather than "off".
-  toggleRowLocked: {
-    opacity: 0.55,
-  },
-  toggleLabelWrap: {
-    flex: 1,
-    paddingRight: 12,
-  },
-  toggleTitle: {
-    fontSize: 14,
-    fontWeight: '700',
-    color: COLOR.primary,
-    marginBottom: 2,
-  },
-  toggleSubtitle: {
-    fontSize: 11,
-    color: COLOR.secondary,
-    lineHeight: 15,
-  },
-  toggleSwitch: {
-    width: 44,
-    height: 24,
-    borderRadius: 12,
-    padding: 2,
-    justifyContent: 'center',
-  },
-  toggleSwitchOn: { backgroundColor: COLOR.accentStart },
-  toggleSwitchOff: { backgroundColor: '#D1D5DB' },
   // NOTE: we intentionally do NOT override the switch color when locked.
   // The row-level `opacity: 0.55` already conveys "disabled"; forcing the
   // switch to grey made enabled-but-locked toggles look "off" mid-recording,
   // which was one of the wonky-UI complaints.
-  toggleKnob: {
-    width: 20,
-    height: 20,
-    borderRadius: 10,
-    backgroundColor: '#FFFFFF',
-  },
-  toggleKnobOn: { alignSelf: 'flex-end' },
-  toggleKnobOff: { alignSelf: 'flex-start' },
   // ---- Setting group (toggle + stepper card) ----
   // Wraps a toggle row + stepper row so they read as one "card". The
   // marginBottom here replaces the per-row marginBottom (which is removed
   // by toggleRowGrouped on the top row, and absent on StepperRow).
-  settingGroup: {
-    marginBottom: 16,
-  },
   // ---- Settings section header + locked badge ----
   settingsHeader: {
     flexDirection: 'row',
@@ -1996,71 +1326,14 @@ const styles = StyleSheet.create({
   permissionButtonText: { color: COLOR.primary, fontSize: 14, fontWeight: '600' },
   // ---- Saved / error cards ----
   // U19: shared row layout for the saved/error card title + dismiss button.
-  cardRow: {
-    flexDirection: 'row',
-    alignItems: 'flex-start',
-    justifyContent: 'space-between',
-    gap: 8,
-  },
   // U19: shared dismiss (✕) button used by both the saved card and the
   // error card. Small, neutral-coloured, top-right of the card.
-  cardDismissBtn: {
-    width: 24,
-    height: 24,
-    borderRadius: 12,
-    alignItems: 'center',
-    justifyContent: 'center',
-    backgroundColor: 'rgba(0,0,0,0.05)',
-  },
-  cardDismissText: {
-    fontSize: 12,
-    fontWeight: '700',
-    color: COLOR.secondary,
-    lineHeight: 14,
-  },
-  savedCard: {
-    backgroundColor: COLOR.savedBg, borderRadius: 12, padding: 14,
-    marginBottom: 16, borderWidth: 1, borderColor: COLOR.savedBorder,
-  },
-  savedTitle: {
-    fontSize: 11, color: COLOR.savedText, letterSpacing: 1.5,
-    fontWeight: '700', marginBottom: 6,
-  },
-  savedPath: {
-    fontSize: 13, color: COLOR.savedText,
-    fontFamily: Platform.select({ ios: 'Menlo', android: 'monospace' }),
-  },
   // Final distance + pace line shown on the saved card. Slightly larger and
   // bolder than the path so the user notices it.
-  savedDistance: {
-    fontSize: 14,
-    fontWeight: '700',
-    color: COLOR.savedText,
-    marginTop: 8,
-    fontVariant: ['tabular-nums'],
-  },
-  errorCard: {
-    backgroundColor: COLOR.errorBg, borderRadius: 12, padding: 14,
-    marginBottom: 16, borderWidth: 1, borderColor: COLOR.errorBorder,
-  },
-  errorText: { color: COLOR.errorText, fontSize: 13 },
   // U2: "Открыть настройки" button shown inside the error card when the user
   // is missing permissions. Tapping it calls GpsRecorder.openAppSettings(),
   // which opens the Android system app-details page (where the user can
   // grant location / notification permissions manually).
-  openSettingsBtn: {
-    marginTop: 10,
-    paddingVertical: 8,
-    paddingHorizontal: 12,
-    borderRadius: 8,
-    backgroundColor: COLOR.errorBorder,
-    alignSelf: 'flex-start',
-  },
-  openSettingsBtnText: {
-    color: COLOR.errorText,
-    fontSize: 13,
-    fontWeight: '600',
-  },
   // ---- Footer ----
   footerNote: { marginTop: 8 },
   footerText: {
@@ -2070,45 +1343,6 @@ const styles = StyleSheet.create({
   // Full-screen semi-transparent overlay so the user can't tap anything else
   // while waiting for the system permission dialog. Centers a card with a
   // spinner, an explanatory line, and a Cancel button.
-  permissionWaitOverlay: {
-    position: 'absolute',
-    left: 0, right: 0, top: 0, bottom: 0,
-    backgroundColor: 'rgba(0,0,0,0.45)',
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  permissionWaitCard: {
-    backgroundColor: COLOR.bg,
-    borderRadius: 16,
-    paddingVertical: 24,
-    paddingHorizontal: 32,
-    alignItems: 'center',
-    minWidth: 220,
-    elevation: 8,
-    shadowColor: '#000', shadowOffset: { width: 0, height: 4 },
-    shadowOpacity: 0.25, shadowRadius: 16,
-  },
-  permissionWaitText: {
-    marginTop: 14,
-    fontSize: 14,
-    fontWeight: '600',
-    color: COLOR.primary,
-    textAlign: 'center',
-  },
-  permissionWaitCancelBtn: {
-    marginTop: 18,
-    paddingVertical: 8,
-    paddingHorizontal: 20,
-    borderRadius: 10,
-    borderWidth: 1,
-    borderColor: COLOR.divider,
-    backgroundColor: '#F3F4F6',
-  },
-  permissionWaitCancelText: {
-    fontSize: 14,
-    fontWeight: '600',
-    color: COLOR.primary,
-  },
   // O14: full-screen "native module not loaded" fallback.
   nativeMissingContainer: {
     flex: 1,
