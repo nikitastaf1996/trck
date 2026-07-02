@@ -48,7 +48,6 @@ import {
   type GpsStateEvent,
   type GpsSavedEvent,
   type GpsFullState,
-  type GpsFixType,
   type GpsGnssEvent,
 } from './src/NativeGpsRecorder';
 // O19: use react-native-safe-area-context instead of the deprecated built-in.
@@ -73,6 +72,16 @@ import {
   pluralRu,
   type RecordingState,
 } from './src/styles';
+// T1: settings state / refs / handlers / loader extracted from App.tsx into
+// a dedicated hook so the main component stays under control. The hook owns
+// the settingsUpdatingRef re-entrancy guard internally (not returned).
+import { useSettings } from './src/hooks/useSettings';
+// T2: permission state / refs / handlers / one-shot permission check
+// extracted from App.tsx into a dedicated hook (mirrors the T1 pattern).
+import { usePermissions } from './src/hooks/usePermissions';
+// T2: GNSS monitor state (fixType / accuracy / satellites / hasFix) + the
+// start/stop wrappers + handleGnssEvent / resetGnss extracted from App.tsx.
+import { useGnssMonitor } from './src/hooks/useGnssMonitor';
 
 function App(): React.ReactElement {
   const [recordingState, setRecordingState] = useState<RecordingState>('idle');
@@ -85,11 +94,8 @@ function App(): React.ReactElement {
   // was just causing unnecessary re-renders for a value nobody reads.
   const [distance, setDistance] = useState<number>(0);
   const [currentSpeed, setCurrentSpeed] = useState<number | null>(null);
-  const [fixType, setFixType] = useState<GpsFixType>('no fix');
-  const [accuracy, setAccuracy] = useState<number | null>(null);
-  const [satellitesUsed, setSatellitesUsed] = useState<number>(0);
-  const [satellitesInView, setSatellitesInView] = useState<number>(0);
-  const [hasFix, setHasFix] = useState<boolean>(false);
+  // T2: fixType / accuracy / satellitesUsed / satellitesInView / hasFix state
+  // moved into the useGnssMonitor hook (called below, after recordingStateRef).
   const [lastSavedPath, setLastSavedPath] = useState<string | null>(null);
   // Final distance (meters) computed from the SAVED GPX file, post-smoothing.
   // Set when the 'saved' event arrives; shown on the "GPX СОХРАНЁН" card so
@@ -114,53 +120,63 @@ function App(): React.ReactElement {
     // CODE_REVIEW_TODO Task 4: snapshot of showMovingTime at save time.
     showMovingTime: boolean;
   } | null>(null);
-  const [hasPermissions, setHasPermissions] = useState<boolean>(false);
+  // T2: hasPermissions state moved into the usePermissions hook (called below).
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
-  const [postProcessEnabled, setPostProcessEnabled] = useState<boolean>(false);
-  const [gaussianSmoothingEnabled, setGaussianSmoothingEnabled] = useState<boolean>(false);
-  // Phase 1/3/4: auto-pause setting + live pause / signal state + moving time.
-  const [autoPauseEnabled, setAutoPauseEnabled] = useState<boolean>(false);
-  // Phase 4 toggle: gap detection (signal-loss segment splits). Defaults to
-  // true so existing users keep the behaviour from the previous APK.
-  const [gapDetectionEnabled, setGapDetectionEnabled] = useState<boolean>(true);
-  // CODE_REVIEW_TODO Task 4: display-only toggle. When ON, the top time
-  // display shows movingMs (active moving time, excludes auto-paused and
-  // signal-lost intervals) and avg pace uses movingMs. When OFF, the UI
-  // shows elapsedMs (wall-clock) — the legacy behaviour. NOT locked while
-  // recording: the user can toggle it any time, including mid-recording.
-  const [showMovingTime, setShowMovingTime] = useState<boolean>(false);
-  // Three independent data-reduction filters (user requested). Each has an
-  // enabled toggle plus a numeric parameter, exposed via the new
-  // setRadialDistanceFilter* / setTimeSampling* / setDouglasPeucker* bridge
-  // methods. All are persisted in the separate settings prefs file so they
-  // survive the per-recording state clear, and all are locked while a
-  // recording is in progress (see settingsLocked).
-  const [radialDistanceFilterEnabled, setRadialDistanceFilterEnabled] = useState<boolean>(false);
-  const [radialDistanceThresholdM, setRadialDistanceThresholdM] = useState<number>(5);
-  const [timeSamplingEnabled, setTimeSamplingEnabled] = useState<boolean>(false);
-  const [timeSamplingN, setTimeSamplingN] = useState<number>(5);
-  const [douglasPeuckerEnabled, setDouglasPeuckerEnabled] = useState<boolean>(false);
-  const [douglasPeuckerEpsilonM, setDouglasPeuckerEpsilonM] = useState<number>(5);
+
+  // T1: settingsLocked must be computed BEFORE useSettings is called (the
+  // hook takes it as an argument). It's also read directly in the JSX below
+  // (locked badge + disabled props on the toggle / stepper rows).
+  const isRecording = recordingState === 'recording';
+  const isStopping = recordingState === 'stopping';
+  // Settings are locked (read-only) while a recording is in progress so that
+  // toggling them mid-recording cannot change the filter / smoothing behaviour
+  // halfway through the file.
+  const settingsLocked = isRecording || isStopping;
+
+  // T1: all 11 settings state vars, the 3 mirror refs (autoPauseEnabledRef,
+  // gapDetectionEnabledRef, showMovingTimeRef — read by the 'saved' event
+  // handler at save time), the 10 toggle / stepper handlers, and the
+  // loadSettings one-shot loader are extracted into the useSettings hook
+  // (src/hooks/useSettings.ts). The hook owns the settingsUpdatingRef re-
+  // entrancy guard internally; it is NOT returned.
+  const {
+    postProcessEnabled,
+    gaussianSmoothingEnabled,
+    autoPauseEnabled,
+    gapDetectionEnabled,
+    showMovingTime,
+    radialDistanceFilterEnabled,
+    radialDistanceThresholdM,
+    timeSamplingEnabled,
+    timeSamplingN,
+    douglasPeuckerEnabled,
+    douglasPeuckerEpsilonM,
+    autoPauseEnabledRef,
+    gapDetectionEnabledRef,
+    showMovingTimeRef,
+    handleTogglePostProcess,
+    handleToggleGaussianSmoothing,
+    handleToggleAutoPause,
+    handleToggleGapDetection,
+    handleToggleShowMovingTime,
+    handleToggleRadialDistanceFilter,
+    handleStepperRadialThreshold,
+    handleToggleTimeSampling,
+    handleStepperTimeSamplingN,
+    handleToggleDouglasPeucker,
+    handleStepperDouglasPeuckerEpsilon,
+    loadSettings,
+  } = useSettings(settingsLocked, setErrorMsg);
   const [isAutoPaused, setIsAutoPaused] = useState<boolean>(false);
   const [signalLost, setSignalLost] = useState<boolean>(false);
   const [movingMs, setMovingMs] = useState<number>(0);
-  // U13: startTimeRef removed — it was dead code (assigned but never read).
-  // U1: while true, a full-screen spinner overlay with a "Отмена" button is
-  // shown over the UI. Set just before awaiting requestPermissions() and
-  // cleared as soon as the await resolves (whether granted or denied). The
-  // cancel button sets `cancelPermissionWaitRef.current = true` so that when
-  // the await resolves we know to bail out instead of proceeding to start.
-  const [waitingForPermissions, setWaitingForPermissions] = useState<boolean>(false);
-  const cancelPermissionWaitRef = useRef<boolean>(false);
-  // U12: track whether we've already asked the user about battery-optim
-  // exemption (so we don't pop the system dialog on every START) and
-  // whether they denied it (so we can show a warning banner). The ref
-  // survives the component's lifetime; if the app is killed and
-  // relaunched, the user will see the dialog once more (acceptable — the
-  // alternative would require persisting the flag via native prefs, which
-  // is out of scope for the JS-only TODO-3 set).
-  const hasAskedBatteryOptRef = useRef<boolean>(false);
-  const [batteryOptDenied, setBatteryOptDenied] = useState<boolean>(false);
+  // T2: permission state (hasPermissions, waitingForPermissions,
+  // batteryOptDenied), refs (cancelPermissionWaitRef, hasAskedBatteryOptRef),
+  // handlers (handleCancelPermissionWait, handleRetryBatteryOpt,
+  // handleGrantPermissions), and the initialCheck one-shot are extracted into
+  // the usePermissions hook (src/hooks/usePermissions.ts). The hook is called
+  // below (after recordingStateRef is defined, since it takes recordingStateRef
+  // as a parameter per the T2 spec).
   // U18: mirror of `recordingState` for use inside event-subscription closures.
   // We keep the main useEffect's deps stable (so the subscriptions are NOT
   // torn down + recreated on every idle -> recording -> stopping -> idle
@@ -174,6 +190,36 @@ function App(): React.ReactElement {
   // currentSpeed with the gnss speed even though we just started recording.
   // Synchronous ref updates close that race entirely.
   const recordingStateRef = useRef<RecordingState>('idle');
+
+  // T2: permission + GNSS-monitor hooks (both take recordingStateRef per spec).
+  const {
+    hasPermissions,
+    waitingForPermissions,
+    batteryOptDenied,
+    cancelPermissionWaitRef,
+    hasAskedBatteryOptRef,
+    setHasPermissions,
+    setWaitingForPermissions,
+    setBatteryOptDenied,
+    handleCancelPermissionWait,
+    handleRetryBatteryOpt,
+    handleGrantPermissions,
+    initialCheck,
+  } = usePermissions(recordingStateRef);
+  const {
+    fixType,
+    accuracy,
+    satellitesUsed,
+    satellitesInView,
+    hasFix,
+    setFixType,
+    setAccuracy,
+    setHasFix,
+    handleGnssEvent,
+    resetGnss,
+    startMonitor,
+    stopMonitor,
+  } = useGnssMonitor(recordingStateRef);
 
   // Sliding window of the most recent GPS speeds (m/s) seen during the
   // current recording. Used to compute a smoothed "current pace" instead of
@@ -190,14 +236,16 @@ function App(): React.ReactElement {
   const recentSpeedsRef = useRef<number[]>([]);
   const SPEED_WINDOW = 5; // ~5 seconds at 1 Hz — short enough to be responsive
   const [, forceRerender] = useReducer(x => x + 1, 0);
-  // Refs that mirror movingMs / elapsedMs / autoPauseEnabled so the
-  // 'saved' event handler (which is set up ONCE in the mount effect and
-  // must NOT re-run on every state change, otherwise we lose events) can
-  // read their latest values at save time. Without these the closure would
-  // capture the initial 0 values and never see the updated ones.
+  // Refs that mirror movingMs / elapsedMs so the 'saved' event handler
+  // (which is set up ONCE in the mount effect and must NOT re-run on every
+  // state change, otherwise we lose events) can read their latest values at
+  // save time. Without these the closure would capture the initial 0 values
+  // and never see the updated ones.
+  // T1: autoPauseEnabledRef / gapDetectionEnabledRef / showMovingTimeRef were
+  // moved into the useSettings hook — they mirror settings state owned by it
+  // and are returned by the hook for the 'saved' handler to read at save time.
   const movingMsRef = useRef<number>(0);
   const elapsedMsRef = useRef<number>(0);
-  const autoPauseEnabledRef = useRef<boolean>(false);
   // U10: mirror of isAutoPaused for use inside the 'location' event handler
   // (which is set up once at mount and must not re-create on every state
   // change). Without this ref, the handler closure would capture the initial
@@ -208,15 +256,6 @@ function App(): React.ReactElement {
   // 'saved' event handler can cancel it (avoiding a UI flicker between
   // 'stopping' and 'idle' after the saved card is already shown).
   const stopTimeoutRef = useRef<number | null>(null);
-  // Bugfix: mirror gapDetectionEnabled too, so the saved-card pace logic
-  // can read it from the (once-set-up) saved-event closure. See the
-  // paceTimeMs comment above for why gap detection now also affects pace.
-  const gapDetectionEnabledRef = useRef<boolean>(true);
-  // CODE_REVIEW_TODO Task 4: mirror of showMovingTime for use inside the
-  // 'saved' event handler (set up once at mount) so it can read the latest
-  // value at save time without stale-closure issues. Affects which time
-  // base (movingMs vs elapsedMs) is used for the saved-card pace display.
-  const showMovingTimeRef = useRef<boolean>(false);
   // L24 fix: track the last 'duration' event's sequence number so we can
   // ignore out-of-order events (which were causing the displayed timer to
   // occasionally jump backwards by ~1 s when a getState() poll delivered
@@ -224,11 +263,6 @@ function App(): React.ReactElement {
   const lastDurationSeqRef = useRef<number>(0);
   useEffect(() => { movingMsRef.current = movingMs; }, [movingMs]);
   useEffect(() => { elapsedMsRef.current = elapsedMs; }, [elapsedMs]);
-  useEffect(() => { autoPauseEnabledRef.current = autoPauseEnabled; }, [autoPauseEnabled]);
-  useEffect(() => { gapDetectionEnabledRef.current = gapDetectionEnabled; }, [gapDetectionEnabled]);
-  // Task 4: keep showMovingTimeRef in sync so the 'saved' handler (set up
-  // once at mount) can read the latest value at save time.
-  useEffect(() => { showMovingTimeRef.current = showMovingTime; }, [showMovingTime]);
   // U10: keep isAutoPausedRef in sync so the 'location' handler (set up once
   // at mount) can read the latest value without stale-closure issues.
   useEffect(() => { isAutoPausedRef.current = isAutoPaused; }, [isAutoPaused]);
@@ -273,83 +307,34 @@ function App(): React.ReactElement {
     } catch {
       // ignore — will retry on next poll
     }
-  }, []);
+    // T2: setFixType / setAccuracy come from useGnssMonitor (stable
+    // useCallbacks); listed to satisfy react-hooks/exhaustive-deps.
+  }, [setFixType, setAccuracy]);
 
   useEffect(() => {
     let mounted = true;
 
     (async () => {
       try {
-        // Auto-request permissions on first launch.
-        let granted = await GpsRecorder.hasPermissions();
-        if (!granted) {
-          await GpsRecorder.requestPermissions();
-          // U23: wrap r in a 0-arg arrow so setTimeout's (...args: any[])=>void
-          // type is satisfied under strict mode (r itself expects 1 arg).
-          await new Promise<void>((r) => setTimeout(() => r(), 800));
-          granted = await GpsRecorder.hasPermissions();
-        }
+        // T2: permission check extracted into usePermissions.initialCheck()
+        // (U23: 800ms wait after requestPermissions). Returns granted so the
+        // caller can start the GNSS monitor (initialCheck does NOT do it).
+        const granted = await initialCheck();
         if (!mounted) return;
-        setHasPermissions(granted);
 
-        // Load the post-process setting from native prefs.
-        try {
-          const pp = await GpsRecorder.getPostProcessEnabled();
-          if (mounted) setPostProcessEnabled(pp);
-        } catch { /* ignore */ }
-
-        // Load the Gaussian-smoothing setting from native prefs.
-        try {
-          const gs = await GpsRecorder.getGaussianSmoothingEnabled();
-          if (mounted) setGaussianSmoothingEnabled(gs);
-        } catch { /* ignore */ }
-
-        // Phase 1: load the auto-pause setting from native prefs.
-        try {
-          const ap = await GpsRecorder.getAutoPauseEnabled();
-          if (mounted) setAutoPauseEnabled(ap);
-        } catch { /* ignore */ }
-
-        // Phase 4: load the gap-detection setting from native prefs.
-        // Default is true (the previous APK always ran gap detection), so if
-        // the native side returns false here it's a real user choice.
-        try {
-          const gd = await GpsRecorder.getGapDetectionEnabled();
-          if (mounted) setGapDetectionEnabled(gd);
-        } catch { /* ignore */ }
-
-        // CODE_REVIEW_TODO Task 4: load the show-moving-time display
-        // preference. Default is false (legacy wall-clock display).
-        try {
-          const smt = await GpsRecorder.getShowMovingTimeEnabled();
-          if (mounted) setShowMovingTime(smt);
-        } catch { /* ignore */ }
-
-        // Load the three data-reduction filter settings from native prefs.
-        // Each has a boolean enabled flag + a numeric parameter.
-        try {
-          const rde = await GpsRecorder.getRadialDistanceFilterEnabled();
-          if (mounted) setRadialDistanceFilterEnabled(rde);
-          const rdt = await GpsRecorder.getRadialDistanceThresholdM();
-          if (mounted) setRadialDistanceThresholdM(rdt);
-        } catch { /* ignore */ }
-        try {
-          const tse = await GpsRecorder.getTimeSamplingEnabled();
-          if (mounted) setTimeSamplingEnabled(tse);
-          const tsn = await GpsRecorder.getTimeSamplingN();
-          if (mounted) setTimeSamplingN(tsn);
-        } catch { /* ignore */ }
-        try {
-          const dpe = await GpsRecorder.getDouglasPeuckerEnabled();
-          if (mounted) setDouglasPeuckerEnabled(dpe);
-          const dpeps = await GpsRecorder.getDouglasPeuckerEpsilonM();
-          if (mounted) setDouglasPeuckerEpsilonM(dpeps);
-        } catch { /* ignore */ }
+        // T1: load all 11 settings from native prefs (delegated to the
+        // useSettings hook). Each individual get* call is independently
+        // try/caught inside the hook so a failure on one doesn't skip the
+        // rest. The per-setState `mounted` guards from the original inline
+        // block are no longer present (the hook doesn't take a mounted flag);
+        // a setState-after-unmount would only produce a dev-mode console
+        // warning, not a crash, and is acceptable here.
+        await loadSettings();
 
         // Start the always-on GNSS monitor so the UI shows fix status even
-        // before recording starts.
+        // before recording starts. (T2: startGnssMonitor → startMonitor.)
         if (granted) {
-          try { await GpsRecorder.startGnssMonitor(); } catch { /* ignore */ }
+          try { await startMonitor(); } catch { /* ignore */ }
         }
         await syncStateFromNative();
       } catch {
@@ -360,12 +345,10 @@ function App(): React.ReactElement {
     // Event subscriptions (real-time updates)
     const subs = [
       subscribe('gnss', (ev: GpsGnssEvent) => {
-        // The monitor's status is the source of truth for the GNSS pill.
-        setFixType(ev.fixType);
-        setAccuracy(ev.accuracy);
-        setSatellitesUsed(ev.satellitesUsed);
-        setSatellitesInView(ev.satellitesInView);
-        setHasFix(ev.hasFix);
+        // T2: handleGnssEvent (from useGnssMonitor) sets all 5 GNSS state
+        // vars. The speed-pushing logic below stays in App.tsx (reads
+        // recordingStateRef + recentSpeedsRef).
+        handleGnssEvent(ev);
         // While idle (not recording), the monitor's speed is also the best
         // current-speed signal we have. While recording, the 'location' event
         // overrides it.
@@ -463,8 +446,10 @@ function App(): React.ReactElement {
           setElapsedMs(0);
           setDistance(0);
           setCurrentSpeed(null);
-          setFixType('no fix');
-          setHasFix(false);
+          // T2: resetGnss() replaces setFixType('no fix') + setHasFix(false).
+          // Also clears accuracy (minor enhancement per T2 spec — clearing
+          // accuracy when there's "no fix" is more correct).
+          resetGnss();
           // Phase 1/3/4: reset live state when recording stops.
           setIsAutoPaused(false);
           setSignalLost(false);
@@ -563,7 +548,7 @@ function App(): React.ReactElement {
         GpsRecorder.hasPermissions().then(async (g) => {
           setHasPermissions(g);
           if (g) {
-            try { await GpsRecorder.startGnssMonitor(); } catch { /* ignore */ }
+            try { await startMonitor(); } catch { /* ignore */ }
           }
         }).catch(() => { /* permission check failed, will retry on next AppState change */ });
       }
@@ -583,10 +568,28 @@ function App(): React.ReactElement {
       // U6: stopGnssMonitor() returns a Promise — wrapping it in a
       // try/catch would NOT catch an async rejection. Use .catch() so an
       // unhandled promise rejection doesn't fire if the native module
-      // rejects during teardown.
-      GpsRecorder.stopGnssMonitor().catch(() => { /* ignore */ });
+      // rejects during teardown. (T2: stopGnssMonitor → stopMonitor.)
+      stopMonitor().catch(() => { /* ignore */ });
     };
-  }, [syncStateFromNative]); // NOTE: recordingState intentionally omitted — see recordingStateRef.
+  }, [
+    syncStateFromNative,
+    // T1+T2: refs / loadSettings / initialCheck / startMonitor / stopMonitor /
+    // handleGnssEvent / resetGnss / setters from useSettings + usePermissions +
+    // useGnssMonitor. All stable — listed only to satisfy exhaustive-deps.
+    autoPauseEnabledRef,
+    gapDetectionEnabledRef,
+    showMovingTimeRef,
+    loadSettings,
+    initialCheck,
+    startMonitor,
+    stopMonitor,
+    handleGnssEvent,
+    resetGnss,
+    setHasPermissions,
+    setFixType,
+    setAccuracy,
+    setHasFix,
+  ]); // NOTE: recordingState intentionally omitted — see recordingStateRef.
 
   // U14: 2-second syncStateFromNative polling, gated by recording state.
   // The original always-on setInterval ran every 2 s for the entire app
@@ -626,7 +629,7 @@ function App(): React.ReactElement {
         }
         setHasPermissions(granted);
         if (granted) {
-          try { await GpsRecorder.startGnssMonitor(); } catch { /* ignore */ }
+          try { await startMonitor(); } catch { /* ignore */ }
         }
       }
 
@@ -678,30 +681,17 @@ function App(): React.ReactElement {
       recordingStateRef.current = 'idle';
       setRecordingState('idle');
     }
-  }, [syncStateFromNative]);
-
-  // U1: cancel handler for the permission-wait overlay. Just sets a flag —
-  // when requestPermissions() eventually resolves, handleStart checks the
-  // flag and returns to idle without proceeding. (We can't actually abort
-  // the native permission request, but we can ignore its result.)
-  const handleCancelPermissionWait = useCallback(() => {
-    cancelPermissionWaitRef.current = true;
-    setWaitingForPermissions(false);
-  }, []);
-
-  // U12: manual retry for the battery-optimization exemption. Tapping the
-  // warning banner re-opens the system dialog. We don't reset
-  // hasAskedBatteryOptRef here — that would let a subsequent handleStart
-  // auto-prompt again, which we explicitly don't want. This is purely a
-  // manual retry path.
-  const handleRetryBatteryOpt = useCallback(async () => {
-    try {
-      const granted = await GpsRecorder.requestIgnoreBatteryOptimizations();
-      setBatteryOptDenied(!granted);
-    } catch {
-      setBatteryOptDenied(true);
-    }
-  }, []);
+    // T2: cancelPermissionWaitRef / hasAskedBatteryOptRef / setters from
+    // usePermissions; startMonitor from useGnssMonitor. All stable.
+  }, [
+    syncStateFromNative,
+    cancelPermissionWaitRef,
+    hasAskedBatteryOptRef,
+    setWaitingForPermissions,
+    setHasPermissions,
+    setBatteryOptDenied,
+    startMonitor,
+  ]);
 
   const handleStop = useCallback(async () => {
     setErrorMsg(null);
@@ -726,263 +716,13 @@ function App(): React.ReactElement {
     }
   }, [syncStateFromNative]);
 
-  const handleGrantPermissions = useCallback(async () => {
-    await GpsRecorder.requestPermissions();
-    // U23: wrap r in a 0-arg arrow so setTimeout's (...args: any[])=>void
-    // type is satisfied under strict mode (r itself expects 1 arg).
-    await new Promise<void>((r) => setTimeout(() => r(), 800));
-    const granted = await GpsRecorder.hasPermissions();
-    setHasPermissions(granted);
-    if (granted) {
-      try { await GpsRecorder.startGnssMonitor(); } catch { /* ignore */ }
-    }
-  }, []);
-
-  const isRecording = recordingState === 'recording';
-  const isStopping = recordingState === 'stopping';
-  // Settings are locked (read-only) while a recording is in progress so that
-  // toggling them mid-recording cannot change the filter / smoothing behaviour
-  // halfway through the file.
-  const settingsLocked = isRecording || isStopping;
-  // U15: re-entrancy guard for settings toggles. Without this, a second tap
-  // before the first await resolves would cause the first setX(confirmed)
-  // to overwrite the second optimistic update. Each toggle handler checks
-  // this ref at entry and bails out if a previous toggle is still in flight.
-  const settingsUpdatingRef = useRef<boolean>(false);
-
-  const handleTogglePostProcess = useCallback(async () => {
-    if (settingsLocked) return; // locked during recording
-    // U15: re-entrancy guard — a second tap before the first await resolves
-    // would race with the optimistic update.
-    if (settingsUpdatingRef.current) return;
-    settingsUpdatingRef.current = true;
-    const next = !postProcessEnabled;
-    setPostProcessEnabled(next); // optimistic UI update
-    try {
-      const confirmed = await GpsRecorder.setPostProcessEnabled(next);
-      setPostProcessEnabled(confirmed);
-    } catch (e: unknown) {
-      // revert on failure
-      setPostProcessEnabled(!next);
-      setErrorMsg(e instanceof Error ? e.message : String(e));
-    } finally {
-      settingsUpdatingRef.current = false;
-    }
-  }, [postProcessEnabled, settingsLocked]);
-
-  const handleToggleGaussianSmoothing = useCallback(async () => {
-    if (settingsLocked) return; // locked during recording
-    if (settingsUpdatingRef.current) return; // U15
-    settingsUpdatingRef.current = true;
-    const next = !gaussianSmoothingEnabled;
-    setGaussianSmoothingEnabled(next); // optimistic UI update
-    try {
-      const confirmed = await GpsRecorder.setGaussianSmoothingEnabled(next);
-      setGaussianSmoothingEnabled(confirmed);
-    } catch (e: unknown) {
-      // revert on failure
-      setGaussianSmoothingEnabled(!next);
-      setErrorMsg(e instanceof Error ? e.message : String(e));
-    } finally {
-      settingsUpdatingRef.current = false;
-    }
-  }, [gaussianSmoothingEnabled, settingsLocked]);
-
-  // Phase 1: toggle the auto-pause setting. Persisted in the separate
-  // settings prefs file so it survives the per-recording state clear. Like
-  // the other two settings, it is locked during an active recording so
-  // toggling it mid-recording can't change the stop-detection behaviour
-  // halfway through the file.
-  const handleToggleAutoPause = useCallback(async () => {
-    if (settingsLocked) return;
-    if (settingsUpdatingRef.current) return; // U15
-    settingsUpdatingRef.current = true;
-    const next = !autoPauseEnabled;
-    setAutoPauseEnabled(next);
-    try {
-      const confirmed = await GpsRecorder.setAutoPauseEnabled(next);
-      setAutoPauseEnabled(confirmed);
-    } catch (e: unknown) {
-      setAutoPauseEnabled(!next);
-      setErrorMsg(e instanceof Error ? e.message : String(e));
-    } finally {
-      settingsUpdatingRef.current = false;
-    }
-  }, [autoPauseEnabled, settingsLocked]);
-
-  // Phase 4: toggle the gap-detection setting. Same persistence + lock-
-  // during-recording semantics as the other toggles. Default is on; turning
-  // it off restores the legacy pre-Phase-4 behaviour where signal outages
-  // do NOT split the track and the signal-lost UI banner never appears.
-  const handleToggleGapDetection = useCallback(async () => {
-    if (settingsLocked) return;
-    if (settingsUpdatingRef.current) return; // U15
-    settingsUpdatingRef.current = true;
-    const next = !gapDetectionEnabled;
-    setGapDetectionEnabled(next);
-    try {
-      const confirmed = await GpsRecorder.setGapDetectionEnabled(next);
-      setGapDetectionEnabled(confirmed);
-    } catch (e: unknown) {
-      setGapDetectionEnabled(!next);
-      setErrorMsg(e instanceof Error ? e.message : String(e));
-    } finally {
-      settingsUpdatingRef.current = false;
-    }
-  }, [gapDetectionEnabled, settingsLocked]);
-
-  // CODE_REVIEW_TODO Task 4: toggle the show-moving-time display preference.
-  // Pure display setting — NOT locked while recording (the user can toggle
-  // it any time, including mid-recording). The native side always emits
-  // both elapsedMs and movingMs in every duration / location / state event,
-  // so flipping this setting only changes which value the UI displays on
-  // the next event (1 Hz duration tick). Persisted in the same prefs file
-  // as the other toggles so it survives app restarts and the per-recording
-  // state clear.
-  const handleToggleShowMovingTime = useCallback(async () => {
-    // NOTE: no settingsLocked check — this toggle is intentionally unlocked
-    // during recording per Task 4 spec.
-    if (settingsUpdatingRef.current) return; // U15 shared re-entrancy guard
-    settingsUpdatingRef.current = true;
-    const prev = showMovingTimeRef.current;
-    const next = !prev;
-    setShowMovingTime(next); // optimistic UI update
-    showMovingTimeRef.current = next;
-    try {
-      const confirmed = await GpsRecorder.setShowMovingTimeEnabled(next);
-      setShowMovingTime(confirmed);
-      showMovingTimeRef.current = confirmed;
-    } catch (e: unknown) {
-      // revert on error
-      setShowMovingTime(prev);
-      showMovingTimeRef.current = prev;
-      setErrorMsg(e instanceof Error ? e.message : String(e));
-    } finally {
-      settingsUpdatingRef.current = false;
-    }
-  }, []);
-
-  // ---- Three data-reduction filter toggles + steppers ----
-  //
-  // Each filter has an enabled toggle (persisted boolean) + a numeric
-  // parameter (persisted int / double). The steppers clamp to the same
-  // ranges as the native side (see GpsRecorderModule.kt) so the UI never
-  // shows a value the native side will reject. All are locked while a
-  // recording is in progress.
-
-  const handleToggleRadialDistanceFilter = useCallback(async () => {
-    if (settingsLocked) return;
-    if (settingsUpdatingRef.current) return; // U15
-    settingsUpdatingRef.current = true;
-    const next = !radialDistanceFilterEnabled;
-    setRadialDistanceFilterEnabled(next);
-    try {
-      const confirmed = await GpsRecorder.setRadialDistanceFilterEnabled(next);
-      setRadialDistanceFilterEnabled(confirmed);
-    } catch (e: unknown) {
-      setRadialDistanceFilterEnabled(!next);
-      setErrorMsg(e instanceof Error ? e.message : String(e));
-    } finally {
-      settingsUpdatingRef.current = false;
-    }
-  }, [radialDistanceFilterEnabled, settingsLocked]);
-
-  const handleStepperRadialThreshold = useCallback(async (delta: number) => {
-    if (settingsLocked) return;
-    if (settingsUpdatingRef.current) return; // U15
-    settingsUpdatingRef.current = true;
-    const next = Math.max(0, Math.min(1000, radialDistanceThresholdM + delta));
-    if (next === radialDistanceThresholdM) {
-      settingsUpdatingRef.current = false;
-      return;
-    }
-    setRadialDistanceThresholdM(next); // optimistic
-    try {
-      const confirmed = await GpsRecorder.setRadialDistanceThresholdM(next);
-      setRadialDistanceThresholdM(confirmed);
-    } catch (e: unknown) {
-      setRadialDistanceThresholdM(radialDistanceThresholdM); // revert
-      setErrorMsg(e instanceof Error ? e.message : String(e));
-    } finally {
-      settingsUpdatingRef.current = false;
-    }
-  }, [radialDistanceThresholdM, settingsLocked]);
-
-  const handleToggleTimeSampling = useCallback(async () => {
-    if (settingsLocked) return;
-    if (settingsUpdatingRef.current) return; // U15
-    settingsUpdatingRef.current = true;
-    const next = !timeSamplingEnabled;
-    setTimeSamplingEnabled(next);
-    try {
-      const confirmed = await GpsRecorder.setTimeSamplingEnabled(next);
-      setTimeSamplingEnabled(confirmed);
-    } catch (e: unknown) {
-      setTimeSamplingEnabled(!next);
-      setErrorMsg(e instanceof Error ? e.message : String(e));
-    } finally {
-      settingsUpdatingRef.current = false;
-    }
-  }, [timeSamplingEnabled, settingsLocked]);
-
-  const handleStepperTimeSamplingN = useCallback(async (delta: number) => {
-    if (settingsLocked) return;
-    if (settingsUpdatingRef.current) return; // U15
-    settingsUpdatingRef.current = true;
-    const next = Math.max(1, Math.min(60, timeSamplingN + delta));
-    if (next === timeSamplingN) {
-      settingsUpdatingRef.current = false;
-      return;
-    }
-    setTimeSamplingN(next);
-    try {
-      const confirmed = await GpsRecorder.setTimeSamplingN(next);
-      setTimeSamplingN(confirmed);
-    } catch (e: unknown) {
-      setTimeSamplingN(timeSamplingN);
-      setErrorMsg(e instanceof Error ? e.message : String(e));
-    } finally {
-      settingsUpdatingRef.current = false;
-    }
-  }, [timeSamplingN, settingsLocked]);
-
-  const handleToggleDouglasPeucker = useCallback(async () => {
-    if (settingsLocked) return;
-    if (settingsUpdatingRef.current) return; // U15
-    settingsUpdatingRef.current = true;
-    const next = !douglasPeuckerEnabled;
-    setDouglasPeuckerEnabled(next);
-    try {
-      const confirmed = await GpsRecorder.setDouglasPeuckerEnabled(next);
-      setDouglasPeuckerEnabled(confirmed);
-    } catch (e: unknown) {
-      setDouglasPeuckerEnabled(!next);
-      setErrorMsg(e instanceof Error ? e.message : String(e));
-    } finally {
-      settingsUpdatingRef.current = false;
-    }
-  }, [douglasPeuckerEnabled, settingsLocked]);
-
-  const handleStepperDouglasPeuckerEpsilon = useCallback(async (delta: number) => {
-    if (settingsLocked) return;
-    if (settingsUpdatingRef.current) return; // U15
-    settingsUpdatingRef.current = true;
-    const next = Math.max(0, Math.min(500, douglasPeuckerEpsilonM + delta));
-    if (next === douglasPeuckerEpsilonM) {
-      settingsUpdatingRef.current = false;
-      return;
-    }
-    setDouglasPeuckerEpsilonM(next);
-    try {
-      const confirmed = await GpsRecorder.setDouglasPeuckerEpsilonM(next);
-      setDouglasPeuckerEpsilonM(confirmed);
-    } catch (e: unknown) {
-      setDouglasPeuckerEpsilonM(douglasPeuckerEpsilonM);
-      setErrorMsg(e instanceof Error ? e.message : String(e));
-    } finally {
-      settingsUpdatingRef.current = false;
-    }
-  }, [douglasPeuckerEpsilonM, settingsLocked]);
+  // T1: isRecording / isStopping / settingsLocked + all 10 settings toggle
+  // / stepper handlers + the settingsUpdatingRef re-entrancy guard + the 11
+  // settings useState declarations + the 3 mirror refs (autoPauseEnabledRef,
+  // gapDetectionEnabledRef, showMovingTimeRef) + their mirror effects were
+  // extracted into the useSettings hook above. The 'saved' event handler
+  // (set up once at mount) still reads the 3 mirror refs at save time via
+  // the destructured values.
 
   // Note: distanceFmt / smoothedSpeed / currentPace / paceTimeMs / avgPace
   // were previously computed here and used by the inlined stats JSX. They
