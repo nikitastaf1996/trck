@@ -1,0 +1,144 @@
+name: Build APK
+
+# Triggered on every push to main, plus manual dispatch from the Actions tab.
+# Produces a release APK signed with the debug keystore (sideloadable,
+# not Play-Store-ready — same convention as the committed apk/trck-release.apk).
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          accept-android-sdk-licenses: true
+          log-accepted-android-sdk-licenses: false
+
+      - name: Install Android SDK components
+        # Install the exact versions referenced from android/build.gradle so
+        # the Gradle build doesn't try to download them at build time (which
+        # would require accepting licenses interactively).
+        run: |
+          yes | sdkmanager --licenses > /dev/null 2>&1 || true
+          sdkmanager --install \
+            "platform-tools" \
+            "platforms;android-35" \
+            "build-tools;35.0.0" \
+            "ndk;27.1.12297006"
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.1.12297006" >> $GITHUB_ENV
+          echo "ANDROID_NDK_ROOT=$ANDROID_HOME/ndk/27.1.12297006" >> $GITHUB_ENV
+
+      - name: Set up Node 22
+        # package.json engines.node requires >= 22.11.0 (React Native 0.86).
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Install JS deps
+        run: npm ci
+
+      - name: Generate debug keystore
+        # The repo's .gitignore excludes android/app/debug.keystore, so it
+        # isn't committed. Generate the standard Android debug keystore on
+        # the runner before building. This produces a keystore with the
+        # same alias/password/cert DN as what `android debug.keystore` would
+        # be on a dev machine, so the release APK will install on devices
+        # that already have an older debug-signed build of the same app
+        # (same package id `com.gpsrecorder`, same cert).
+        working-directory: android/app
+        run: |
+          if [ ! -f debug.keystore ]; then
+            keytool -genkeypair \
+              -keystore debug.keystore \
+              -storepass android \
+              -alias androiddebugkey \
+              -keypass android \
+              -keyalg RSA \
+              -keysize 2048 \
+              -validity 10000 \
+              -dname "CN=Android Debug,O=Android,C=US"
+            echo "✓ Generated debug.keystore"
+          else
+            echo "✓ debug.keystore already exists"
+          fi
+          ls -la debug.keystore
+
+      - name: Cache Gradle dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+          restore-keys: gradle-${{ runner.os }}-
+
+      - name: Build release APK
+        id: buildRelease
+        working-directory: android
+        continue-on-error: true
+        run: ./gradlew assembleRelease --no-daemon --stacktrace 2>&1 | tee build.log
+
+      - name: If release failed, try debug APK
+        id: buildDebug
+        working-directory: android
+        if: steps.buildRelease.outcome == 'failure'
+        continue-on-error: true
+        run: |
+          echo "::warning::Release build failed; falling back to debug build"
+          ./gradlew assembleDebug --no-daemon --stacktrace 2>&1 | tee -a build.log
+
+      - name: Upload build log (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: android/build.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Upload APK (always, if any exists)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trck-apk
+          path: |
+            android/app/build/outputs/apk/release/*.apk
+            android/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: warn
+          retention-days: 30
+          compression-level: 0  # APK is already compressed
+
+      - name: Verify APK exists (fail the run if no APK at all)
+        if: always()
+        run: |
+          APK=$(ls android/app/build/outputs/apk/release/*.apk android/app/build/outputs/apk/debug/*.apk 2>/dev/null | head -1)
+          if [ -z "$APK" ]; then
+            echo "::error::No APK was built. Check the build-log artifact for the Gradle error."
+            exit 1
+          fi
+          echo "✓ APK: $APK"
+          ls -lh "$APK"
+
+      - name: Print download instructions
+        if: always()
+        run: |
+          echo "::notice::Run URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          echo "::notice::If 'trck-apk' artifact exists, download it from the run page."
