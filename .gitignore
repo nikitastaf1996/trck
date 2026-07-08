@@ -76,7 +76,7 @@ buck-out/
 coverage/
 __tests__/snapshots/
 
-# NOTE: The release APK under apk/ IS intentionally committed.
-# See AGENTS.md for why.
-!apk/
-!apk/**
+# APKs are now built by GitHub Actions and distributed as workflow
+# artifacts (see .github/workflows/build-apk.yml). They are no longer
+# committed to the repo.
+*.apk

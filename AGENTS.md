@@ -1,9 +1,8 @@
 # AGENTS.md
 
 Guide for any AI agent (or human) touching this repository. Explains
-**what** the project is, **how** to build the APK, **why** the APK binary
-is checked into the repo, and the **architecture** of the refactored
-codebase.
+**what** the project is, **how** APKs are built, and the **architecture**
+of the refactored codebase.
 
 ---
 
@@ -38,8 +37,9 @@ Key features:
 ├── index.js                         # RN entrypoint
 ├── app.json                         # RN app name
 ├── package.json                     # JS deps
-├── apk/
-│   └── trck-release.apk            # Built APK (committed — see below)
+├── .github/
+│   └── workflows/
+│       └── build-apk.yml            # GitHub Actions: build release APK on push
 ├── src/
 │   ├── NativeGpsRecorder.ts         # TS bridge to the native module
 │   ├── hooks/                       # Extracted React hooks
@@ -115,93 +115,116 @@ sideloaded-APK upgrades.
 
 ---
 
-## Why the APK is committed to this repo
+## How APKs are built (GitHub Actions)
 
-> **TL;DR:** The user's dev PC is broken. The committed APK is the only
-> way for them to install the app.
+> **TL;DR:** Every push to `main` triggers an automatic release-APK build
+> in GitHub Actions. Download the APK from the run's **Artifacts** section.
+> The APK is no longer committed to the repo.
 
-Normally you should never commit `.apk` files to git. This repo
-deliberately breaks that rule because:
+The workflow lives at `.github/workflows/build-apk.yml`. It:
 
-1. The user's only development machine is down.
-2. The AI agent has access to a Linux build environment with the Android
-   SDK and can build the APK on the user's behalf.
-3. The user downloads the ready-to-install APK directly from GitHub.
+1. Checks out the repo on `ubuntu-24.04`.
+2. Sets up JDK 17 (Temurin) + Android SDK 35 + NDK 27.1.12297006.
+3. Sets up Node 22 LTS (React Native 0.86 requires Node ≥ 22.11.0).
+4. Runs `npm ci` for deterministic JS dep install.
+5. Generates the standard Android `debug.keystore` on the runner (the
+   repo's `.gitignore` excludes keystores, so this is needed for every
+   fresh build).
+6. Runs `./gradlew assembleRelease --no-daemon --stacktrace`.
+7. If the release build fails, falls back to `assembleDebug` (more
+   forgiving — no ProGuard, no minification).
+8. Uploads both the APK (as `trck-apk` artifact, 30-day retention) and
+   the full Gradle log (as `build-log` artifact, 7-day retention).
+9. Fails the run only if **no APK at all** was produced.
 
-**After every meaningful source-code change, rebuild the APK and
-re-commit it.** See the workflow below.
+### To download an APK
+
+1. Open https://github.com/nikitastaf1996/symmetrical-goggles/actions
+2. Click the most recent **Build APK** run (green check = success).
+3. Scroll to the bottom — **Artifacts** section.
+4. Click `trck-apk` to download a `.zip` containing the APK.
+5. Unzip and sideload `app-release.apk` (or `app-debug.apk` if release
+   fell back) onto your phone.
+
+### Why we moved away from committing the APK
+
+Previously the APK binary was checked into the repo at
+`apk/trck-release.apk`. This was a workaround for the developer's broken
+PC — they couldn't build the APK themselves, so the agent built it and
+committed the binary. The downside: every code change bloated the git
+history with multi-MB binary diffs, and the committed APK was often
+stale relative to the source.
+
+GitHub Actions gives us a cleaner separation: source lives in the repo,
+APKs are built on demand and distributed as workflow artifacts. No git
+bloat, no staleness — every push produces a fresh APK matching the
+latest commit.
+
+### Manual trigger
+
+You can also trigger a build manually without pushing code:
+
+1. Go to https://github.com/nikitastaf1996/symmetrical-goggles/actions
+2. Select **Build APK** in the left sidebar.
+3. Click **Run workflow** → choose `main` branch → **Run workflow**.
+
+Useful when you want a fresh APK for the current `main` without
+modifying any files.
 
 ---
 
 ## What to do after every code change
 
 1. **Make your source changes** in `App.tsx`, `src/`, or `android/app/src/main/`.
-2. **Run the JS checks**:
+2. **Run the JS checks** locally if you have Node:
    ```bash
    npm install
    npx tsc --noEmit          # TypeScript typecheck
    npx jest                   # 39 tests
    npx eslint .               # lint
    ```
+   (The GitHub Actions workflow does NOT run these — only the APK build.
+   If you skip them and TS/jest fails, the Gradle build will still
+   succeed but the app will crash at runtime on a type or test error.)
 3. **Bump `versionCode`** in `android/app/build.gradle` (O25). Android
    refuses sideloaded-APK upgrades when `versionCode` does not strictly
    increase.
-4. **Set up your environment** (only once per shell session):
-   ```bash
-   export ANDROID_HOME=/path/to/android-sdk
-   export ANDROID_SDK_ROOT=$ANDROID_HOME
-   export JAVA_HOME=/path/to/jdk-21
-   export PATH=$JAVA_HOME/bin:$ANDROID_HOME/platform-tools:$PATH
-   ```
-   The SDK must contain: `platform-tools`, `platforms;android-35`,
-   `build-tools;35.0.0`, `ndk;27.1.12297006`, `cmake;3.22.1`.
-5. **Build the release APK**:
-   ```bash
-   cd android
-   chmod +x gradlew
-   ./gradlew --no-daemon assembleRelease
-   ```
-   Output: `android/app/build/outputs/apk/release/app-release.apk`
-6. **Copy the APK into the repo**:
-   ```bash
-   cp android/app/build/outputs/apk/release/app-release.apk apk/trck-release.apk
-   ```
-7. **Commit and push**:
+4. **Commit and push** to `main`:
    ```bash
    git add -A
-   git commit -m "Rebuild APK: <one-line summary>"
+   git commit -m "<one-line summary>"
    git push
    ```
+5. **Wait for the GitHub Actions build** to finish (~8–15 min on a fresh
+   runner, faster with Gradle cache hits).
+6. **Download the APK** from the run's Artifacts section (see above).
+7. **Sideload and test** on your phone.
 
-### Build environment tips
-
-- **Memory:** the native CMake build for React Native needs ~2 GB free
-  RAM. If the Gradle daemon disappears (killed by OOM), kill lingering
-  daemons (`pkill -f gradle; pkill -f kotlin`), set
-  `CMAKE_BUILD_PARALLEL_LEVEL=1`, and retry with
-  `-Dorg.gradle.jvmargs="-Xmx1536m"`.
-- **ABI filter:** on memory-constrained machines, temporarily add
-  `ndk { abiFilters "arm64-v8a" }` to `defaultConfig` in
-  `android/app/build.gradle` to build for arm64 only (most modern
-  phones). Remove it before committing if you want a multi-ABI APK.
-- **Debug keystore:** if `android/app/debug.keystore` is missing,
-  regenerate it (see O4 below).
+No more manual `./gradlew assembleRelease` + `cp` + `git add apk/` —
+the workflow handles all of that.
 
 ---
 
-## Required build environment
+## Required build environment (for the GitHub Actions runner)
 
-- **OpenJDK 21** — `java -version` reports 21.x.
+The workflow handles all of this automatically, but documenting it here
+for reference / local builds:
+
+- **JDK 17** (Temurin) — `java -version` reports 17.x.
 - **Android SDK** with:
   - `platform-tools`
   - `platforms;android-35`
   - `build-tools;35.0.0`
   - `ndk;27.1.12297006`
-  - `cmake;3.22.1` (auto-installed by Gradle on first build)
 - **Node.js 22+** and **npm**.
 - **Git** (with SSH deploy key access to the repo).
 
-### Installing the SDK from scratch
+> The previous local-build docs mentioned JDK 21 + `cmake;3.22.1`. RN
+> 0.86's Gradle plugin now auto-installs CMake, and JDK 17 is what
+> GitHub's `setup-android` action defaults to. Either JDK 17 or 21
+> works for the build; 17 is what the workflow uses.
+
+### Installing the SDK from scratch (for local builds)
 
 ```bash
 mkdir -p $ANDROID_HOME/cmdline-tools
@@ -213,6 +236,15 @@ sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0" \
            "ndk;27.1.12297006"
 ```
 
+### Local build (optional — GitHub Actions is the canonical path)
+
+```bash
+npm ci
+cd android
+./gradlew --no-daemon assembleRelease
+# Output: android/app/build/outputs/apk/release/app-release.apk
+```
+
 ---
 
 ## Signing (O3)
@@ -222,15 +254,13 @@ for debug builds. This is intentional for the user's personal sideloading
 use case.
 
 - The debug keystore is **not** in version control (O4 — in `.gitignore`).
-  Regenerate on a fresh clone:
-  ```bash
-  keytool -genkey -v -keystore android/app/debug.keystore \
-    -storepass android -alias androiddebugkey -keypass android \
-    -keyalg RSA -keysize 2048 -validity 10000 \
-    -dname "CN=Android Debug,O=Android,C=US"
-  ```
+  The GitHub Actions workflow generates a fresh one per run via `keytool`
+  with the standard Android debug cert DN
+  (`CN=Android Debug,O=Android,C=US`), so APKs built by Actions will
+  install over APKs built locally (same cert DN → same signing identity).
 - The signing certificate differs between machines. If you switch
-  machines, the user must uninstall the old APK first.
+  machines or build with a different `keytool` config, the user must
+  uninstall the old APK first.
 - Before wider distribution (Play Store, F-Droid), generate a real
   keystore and configure `signingConfigs.release` in `build.gradle`.
 

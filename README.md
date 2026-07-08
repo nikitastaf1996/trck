@@ -3,10 +3,11 @@
 A small **React Native** Android app that records GPS tracks in the background
 and saves them as `.gpx` files to the public `Downloads/trck/` folder.
 
-> The APK is committed in [`apk/trck-release.apk`](./apk/trck-release.apk)
-> because the developer's PC is down and they cannot build it themselves.
-> See [`AGENTS.md`](./AGENTS.md) for the full explanation and the rebuild
-> workflow.
+> Release APKs are built automatically by GitHub Actions on every push to
+> `main`. Download the latest from the
+> [Actions tab](https://github.com/nikitastaf1996/symmetrical-goggles/actions) —
+> click the most recent **Build APK** run, then scroll to **Artifacts**.
+> See [`AGENTS.md`](./AGENTS.md) for the full build workflow.
 
 ## Features
 
@@ -33,13 +34,14 @@ and saves them as `.gpx` files to the public `Downloads/trck/` folder.
 ## Current status
 
 **v1.3.1** — fully refactored. Every source file is under 500 lines.
-The APK at `apk/trck-release.apk` is up to date with the source.
+APKs are built by GitHub Actions; the latest successful build is always
+one click away from the [Actions tab](https://github.com/nikitastaf1996/symmetrical-goggles/actions).
 
 | Metric | Value |
 |---|---|
 | `versionCode` | 5 |
 | `versionName` | 1.3.1 |
-| APK size | 24.3 MB |
+| APK size | ~24 MB (varies slightly per build) |
 | Largest source file | 497 lines (`GpsRecorderService.kt`) |
 | TypeScript tests | 39 / 39 passing |
 | Kotlin files | 26 |
@@ -62,33 +64,43 @@ preserved. See [`CHANGELOG.md`](./CHANGELOG.md) for the full breakdown.
 
 ## How to install
 
-1. Download `apk/trck-release.apk` from this repo.
-2. On your Android phone, open the file (e.g. from the Files app or a
-   browser download notification).
-3. Allow "install from unknown sources" if prompted.
-4. Open the app, grant the location and notification permissions, and
+1. Go to the [Actions tab](https://github.com/nikitastaf1996/symmetrical-goggles/actions).
+2. Click the most recent successful **Build APK** run.
+3. Scroll to the bottom — **Artifacts** section.
+4. Click `trck-apk` to download a `.zip` containing the APK.
+5. Unzip and copy `app-release.apk` to your Android phone.
+6. Open the file (e.g. from the Files app or a browser download
+   notification).
+7. Allow "install from unknown sources" if prompted.
+8. Open the app, grant the location and notification permissions, and
    tap **СТАРТ**.
 
 GPX files will appear under `Downloads/trck/`.
 
-## How to build (for agents / future me)
+## How to build
 
-See [`AGENTS.md`](./AGENTS.md) for the full workflow. The short version:
+The canonical build path is GitHub Actions — see
+[`AGENTS.md`](./AGENTS.md) for the full workflow. Every push to `main`
+triggers a fresh release-APK build, distributed as a workflow artifact
+with 30-day retention.
+
+For local builds (optional):
 
 ```bash
-npm install
-npx tsc --noEmit && npx jest && npx eslint .   # JS checks
+npm ci
 cd android
 ./gradlew --no-daemon assembleRelease
-cp app/build/outputs/apk/release/app-release.apk ../apk/trck-release.apk
+# Output: android/app/build/outputs/apk/release/app-release.apk
 ```
 
-Requires OpenJDK 21, Android SDK (platform-tools, android-35,
-build-tools 35.0.0, NDK 27.1.12297006, CMake 3.22.1), and Node.js 22+.
+Requires JDK 17 (or 21), Android SDK (platform-tools, android-35,
+build-tools 35.0.0, NDK 27.1.12297006), and Node.js 22+. The debug
+keystore is generated automatically by the GitHub Actions workflow; for
+local builds, generate it once with `keytool` (see AGENTS.md → Signing).
 
 ## Tech stack
 
-- React Native 0.86 (Hermes JS engine)
+- React Native 0.86 (Hermes JS engine, new architecture enabled)
 - Kotlin (Android side)
 - Android `LocationManager` (no Google Play Services dependency)
 - Foreground service + `WakeLock` + `START_STICKY` for stability
@@ -96,10 +108,11 @@ build-tools 35.0.0, NDK 27.1.12297006, CMake 3.22.1), and Node.js 22+.
   legacy `Environment.DIRECTORY_DOWNLOADS` fallback for older versions
 - Pure-function GPX post-processing (Gaussian smoothing + Douglas-Peucker)
 - XmlPullParser-based GPX parsing (no regex)
+- GitHub Actions for CI / APK distribution
 
 ## Documentation
 
-- [`AGENTS.md`](./AGENTS.md) — build instructions, architecture notes,
-  code organisation principles.
+- [`AGENTS.md`](./AGENTS.md) — build workflow (GitHub Actions), architecture
+  notes, code organisation principles.
 - [`CHANGELOG.md`](./CHANGELOG.md) — version history, invariant list
   (L* / U* / O* / Task N tags), bug-fix rationales.
