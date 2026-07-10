@@ -3,10 +3,15 @@
 A small **React Native** Android app that records GPS tracks in the background
 and saves them as `.gpx` files to the public `Downloads/trck/` folder.
 
-> Release APKs are built automatically by GitHub Actions on every push to
-> `main`. Download the latest from the
-> [Actions tab](https://github.com/nikitastaf1996/symmetrical-goggles/actions) —
-> click the most recent **Build APK** run, then scroll to **Artifacts**.
+> Release APKs are built and **auto-published** by GitHub Actions on every
+> push to `main`. Download the freshest build from the
+> [Releases page](https://github.com/nikitastaf1996/symmetrical-goggles/releases/tag/latest) —
+> or use the stable URL for one-click access:
+>
+> ```
+> https://github.com/nikitastaf1996/symmetrical-goggles/releases/download/latest/trck-latest.apk
+> ```
+>
 > See [`AGENTS.md`](./AGENTS.md) for the full build workflow.
 
 ## Features
@@ -34,8 +39,11 @@ and saves them as `.gpx` files to the public `Downloads/trck/` folder.
 ## Current status
 
 **v1.3.1** — fully refactored. Every source file is under 500 lines.
-APKs are built by GitHub Actions; the latest successful build is always
-one click away from the [Actions tab](https://github.com/nikitastaf1996/symmetrical-goggles/actions).
+APKs are built and auto-published by GitHub Actions on every push to
+`main`; the latest build is always available at the stable URL
+[`…/releases/download/latest/trck-latest.apk`](https://github.com/nikitastaf1996/symmetrical-goggles/releases/download/latest/trck-latest.apk).
+Workflow artifacts (for older builds and Gradle build logs) live on the
+[Actions tab](https://github.com/nikitastaf1996/symmetrical-goggles/actions).
 
 | Metric | Value |
 |---|---|
@@ -64,16 +72,33 @@ preserved. See [`CHANGELOG.md`](./CHANGELOG.md) for the full breakdown.
 
 ## How to install
 
-1. Go to the [Actions tab](https://github.com/nikitastaf1996/symmetrical-goggles/actions).
-2. Click the most recent successful **Build APK** run.
-3. Scroll to the bottom — **Artifacts** section.
-4. Click `trck-apk` to download a `.zip` containing the APK.
-5. Unzip and copy `app-release.apk` to your Android phone.
-6. Open the file (e.g. from the Files app or a browser download
+**Easiest — direct download (always freshest APK):**
+
+1. Download
+   [`trck-latest.apk`](https://github.com/nikitastaf1996/symmetrical-goggles/releases/download/latest/trck-latest.apk)
+   directly — this URL always serves the most recent build from `main`.
+2. Transfer the `.apk` to your Android phone (or download it directly on
+   the phone).
+3. Open the file (e.g. from the Files app or a browser download
    notification).
-7. Allow "install from unknown sources" if prompted.
-8. Open the app, grant the location and notification permissions, and
+4. Allow "install from unknown sources" if prompted.
+5. Open the app, grant the location and notification permissions, and
    tap **СТАРТ**.
+
+**Alternative — browse all releases:**
+
+1. Go to the [Releases page](https://github.com/nikitastaf1996/symmetrical-goggles/releases).
+2. Open the **Latest Build** prerelease (or any older versioned release).
+3. Download the `trck-latest.apk` (or `trck-vX.Y.Z.apk`) asset.
+4. Continue from step 3 above.
+
+**For build debugging or older APKs:**
+
+1. Go to the [Actions tab](https://github.com/nikitastaf1996/symmetrical-goggles/actions).
+2. Click any past **Build APK** run.
+3. Scroll to the bottom — **Artifacts** section.
+4. Click `trck-apk` to download a `.zip` containing the APK, or
+   `build-log` for the full Gradle log.
 
 GPX files will appear under `Downloads/trck/`.
 
@@ -81,8 +106,12 @@ GPX files will appear under `Downloads/trck/`.
 
 The canonical build path is GitHub Actions — see
 [`AGENTS.md`](./AGENTS.md) for the full workflow. Every push to `main`
-triggers a fresh release-APK build, distributed as a workflow artifact
-with 30-day retention.
+triggers a fresh release-APK build that is then **auto-published** to
+the rolling [`latest` prerelease](https://github.com/nikitastaf1996/symmetrical-goggles/releases/tag/latest)
+so the stable URL (`…/releases/download/latest/trck-latest.apk`)
+always points at the freshest APK. Workflow artifacts (`trck-apk`,
+`build-log`) are also uploaded with 30-day / 7-day retention for build
+debugging.
 
 For local builds (optional):
 

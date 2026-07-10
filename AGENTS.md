@@ -118,7 +118,11 @@ sideloaded-APK upgrades.
 ## How APKs are built (GitHub Actions)
 
 > **TL;DR:** Every push to `main` triggers an automatic release-APK build
-> in GitHub Actions. Download the APK from the run's **Artifacts** section.
+> in GitHub Actions. The APK is then **auto-published** to a rolling
+> [`latest` prerelease](https://github.com/nikitastaf1996/symmetrical-goggles/releases/tag/latest)
+> so the stable URL `…/releases/download/latest/trck-latest.apk` always
+> serves the freshest build. Workflow artifacts (`trck-apk`, `build-log`)
+> are also uploaded for build debugging and older APKs.
 > The APK is no longer committed to the repo.
 
 The workflow lives at `.github/workflows/build-apk.yml`. It:
@@ -136,15 +140,46 @@ The workflow lives at `.github/workflows/build-apk.yml`. It:
 8. Uploads both the APK (as `trck-apk` artifact, 30-day retention) and
    the full Gradle log (as `build-log` artifact, 7-day retention).
 9. Fails the run only if **no APK at all** was produced.
+10. **Stages the APK** as `trck-latest.apk` (stable filename so the
+    release asset URL never changes between pushes).
+11. **Publishes / updates** the rolling `latest` prerelease via
+    `softprops/action-gh-release@v2`, attaching `trck-latest.apk` and
+    refreshing the release body with the new commit SHA + push timestamp
+    + run URL.
+
+Steps 10–11 only run on `push` events to `main` (not on
+`workflow_dispatch` manual runs). They require `permissions: contents: write`
+at the job level — without it, the release step fails with HTTP 403
+("Resource not accessible by integration") because the default
+`GITHUB_TOKEN` is read-only.
 
 ### To download an APK
 
+**Primary — stable URL (always freshest):**
+
+```
+https://github.com/nikitastaf1996/symmetrical-goggles/releases/download/latest/trck-latest.apk
+```
+
+This URL is overwritten on every push to `main`, so bookmarking it or
+sharing it always serves the latest build.
+
+**Browse all releases:**
+
+1. Open https://github.com/nikitastaf1996/symmetrical-goggles/releases
+2. Open the **Latest Build** prerelease for the freshest APK, or any
+   older versioned release for a specific version.
+3. Download the `trck-latest.apk` (or `trck-vX.Y.Z.apk`) asset attached
+   to the release.
+
+**Fallback — workflow artifacts (for build logs or APKs older than the
+`latest` release):**
+
 1. Open https://github.com/nikitastaf1996/symmetrical-goggles/actions
-2. Click the most recent **Build APK** run (green check = success).
+2. Click any past **Build APK** run (green check = success).
 3. Scroll to the bottom — **Artifacts** section.
-4. Click `trck-apk` to download a `.zip` containing the APK.
-5. Unzip and sideload `app-release.apk` (or `app-debug.apk` if release
-   fell back) onto your phone.
+4. Click `trck-apk` to download a `.zip` containing the APK, or
+   `build-log` for the full Gradle log (7-day retention).
 
 ### Why we moved away from committing the APK
 
@@ -156,9 +191,11 @@ history with multi-MB binary diffs, and the committed APK was often
 stale relative to the source.
 
 GitHub Actions gives us a cleaner separation: source lives in the repo,
-APKs are built on demand and distributed as workflow artifacts. No git
+APKs are built on demand and distributed via GitHub Releases (rolling
+`latest` prerelease) plus workflow artifacts for build debugging. No git
 bloat, no staleness — every push produces a fresh APK matching the
-latest commit.
+latest commit, published to a stable URL that always points at the
+freshest build.
 
 ### Manual trigger
 
@@ -196,12 +233,17 @@ modifying any files.
    git push
    ```
 5. **Wait for the GitHub Actions build** to finish (~8–15 min on a fresh
-   runner, faster with Gradle cache hits).
-6. **Download the APK** from the run's Artifacts section (see above).
+   runner, faster with Gradle cache hits). The APK is auto-published to
+   the rolling `latest` prerelease when the build succeeds.
+6. **Download the APK** — either from the stable URL
+   `https://github.com/nikitastaf1996/symmetrical-goggles/releases/download/latest/trck-latest.apk`
+   or from the [Releases page](https://github.com/nikitastaf1996/symmetrical-goggles/releases/tag/latest).
+   Workflow artifacts (older APKs, build logs) remain on the
+   [Actions tab](https://github.com/nikitastaf1996/symmetrical-goggles/actions).
 7. **Sideload and test** on your phone.
 
 No more manual `./gradlew assembleRelease` + `cp` + `git add apk/` —
-the workflow handles all of that.
+the workflow handles all of that, including the release publishing.
 
 ---
 
