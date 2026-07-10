@@ -12,6 +12,11 @@ jobs:
   build:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
+    # Required so the auto-generated GITHUB_TOKEN can publish releases
+    # via softprops/action-gh-release@v2. Without this, the token defaults
+    # to read-only and the release step fails with HTTP 403.
+    permissions:
+      contents: write
 
     steps:
       - name: Checkout
@@ -142,3 +147,42 @@ jobs:
         run: |
           echo "::notice::Run URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           echo "::notice::If 'trck-apk' artifact exists, download it from the run page."
+
+      # -----------------------------------------------------------------
+      # Auto-publish a rolling "latest" prerelease on every push to main.
+      # The release is overwritten (same tag, same asset name) so users
+      # always have one stable URL to the freshest APK:
+      #   https://github.com/<owner>/<repo>/releases/download/latest/trck-latest.apk
+      # -----------------------------------------------------------------
+      - name: Stage APK for release
+        if: success() && github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          APK=$(ls android/app/build/outputs/apk/release/*.apk android/app/build/outputs/apk/debug/*.apk 2>/dev/null | head -1)
+          if [ -z "$APK" ]; then
+            echo "::error::No APK to publish"
+            exit 1
+          fi
+          cp "$APK" trck-latest.apk
+          ls -lh trck-latest.apk
+
+      - name: Publish / update rolling 'latest' prerelease
+        if: success() && github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: Latest Build
+          prerelease: true
+          body: |
+            ## Latest Build
+
+            Auto-published from the most recent push to `main`.
+
+            - **Commit:** [`${{ github.sha }}`](https://github.com/${{ github.repository }}/commit/${{ github.sha }})
+            - **Pushed:** ${{ github.event.head_commit.timestamp }}
+            - **Run:** https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+            This release is overwritten on every push.
+          files: |
+            trck-latest.apk
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
