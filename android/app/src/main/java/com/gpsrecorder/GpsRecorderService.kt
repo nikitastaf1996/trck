@@ -449,9 +449,16 @@ class GpsRecorderService : Service(), LocationListener {
         // the file fallback, etc.) — otherwise the service would stay in
         // a half-stopped state with the foreground notification up forever.
         saveExecutor.execute {
-            val savedFilePath: String
-            val savedOk: Boolean
-            val finalDistanceM: Double
+            // Task 4 (M1): declared as `var` with default initializers so the
+            // catch block can reassign them AND the lambda in `finally` can
+            // capture them with definite initialization. Using `val` here
+            // would make the catch-block reassignment illegal, and leaving
+            // them uninitialized would make the lambda capture illegal
+            // (Kotlin can't prove the try or catch assigned them before the
+            // finally lambda runs).
+            var savedFilePath: String = ""
+            var savedOk: Boolean = false
+            var finalDistanceM: Double = -1.0
             try {
                 savedFilePath = gpxFileSaver.finalizeGpxFile()
                 savedOk = savedFilePath.isNotEmpty()
@@ -465,9 +472,7 @@ class GpsRecorderService : Service(), LocationListener {
                 finalDistanceM = if (savedOk) gpxFileSaver.recomputeDistanceFromSavedGpx(savedFilePath) else -1.0
             } catch (e: Throwable) {
                 Log.e(TAG, "Background GPX finalize threw — recovering UI to idle", e)
-                savedFilePath = ""
-                savedOk = false
-                finalDistanceM = -1.0
+                // Defaults already set above; just keep them.
             } finally {
                 // Post the main-thread cleanup back to the main Handler.
                 // This MUST run on the main thread because:
