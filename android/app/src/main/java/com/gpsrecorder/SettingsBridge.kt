@@ -238,8 +238,12 @@ class SettingsBridge(private val reactContext: ReactApplicationContext) {
 
     fun setDouglasPeuckerEpsilonM(epsilonM: Double, promise: Promise) {
         try {
-            // Clamp to [0.0, 500.0] — 0 keeps only segment endpoints (extreme
-            // simplification), 500 m is an absurd upper bound for walk/run.
+            // Clamp to [0.0, 500.0]. Task 6 (doc fix): an epsilon of 0
+            // DISABLES simplification and retains ALL points (see
+            // GpxPostProcessors.douglasPeuckerGpx: `epsilonM <= 0.0` is
+            // the early-return branch that returns the segment verbatim).
+            // A large epsilon (towards 500 m) is extreme simplification —
+            // only the segment's first and last points survive.
             val clamped = epsilonM.coerceIn(0.0, 500.0)
             settingsPrefs().edit().putString("douglas_peucker_epsilon_m", clamped.toString()).apply()
             Log.i(TAG, "Douglas-Peucker epsilon = $clamped m")

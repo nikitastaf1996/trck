@@ -130,7 +130,37 @@ class StateRepository(private val service: GpsRecorderService) {
         // the caller explicitly forces a save (e.g. before finalize / stop).
         // The previous version wrote SharedPreferences on every 1 Hz fix,
         // which is ~60 disk writes per minute — each touching ~10 keys —
-        // for no good reason (JS polls getState() every 2 s anyway).
+        // for no good reason.
+        //
+        // Task 8 (comment fix): the previous comment here said "JS polls
+        // getState() every 2 s anyway" as if that justified the 5 s
+        // write throttle. That reasoning is mathematically inverted: the
+        // 2 s JS poll does NOT make the 5 s stale data any fresher — if
+        // anything, polling MORE often than the write cadence just means
+        // 2–3 consecutive polls return the same stale snapshot, wasting
+        // bridge traffic for no freshness gain.
+        //
+        // The CORRECT justification for the 5 s throttle is:
+        //   - The 1 Hz 'duration' / 'location' / 'state' EVENTS are the
+        //     primary source of live UI updates (fresh to within ~1 s).
+        //     The events are emitted in-memory and never touch
+        //     SharedPreferences, so they are NOT affected by this throttle.
+        //   - getState() (read by the 2 s JS poll) is a FALLBACK for when
+        //     events are dropped (JS backgrounded, bridge stalled, etc.) —
+        //     NOT a primary source. A fallback that is up to 5 s stale is
+        //     acceptable because it only matters when the 1 Hz events
+        //     aren't arriving anyway.
+        //   - For service-restart recovery, [persistState] (called at
+        //     start/stop boundaries) and [saveLiveState]`force = true`
+        //     (called before finalize) bypass the throttle, so the
+        //     recovery snapshot is always fresh.
+        //
+        // So: 5 s throttle is fine for the fallback poll, but the JS poll
+        // cadence (2 s) and the native write cadence (5 s throttle) are
+        // INDEPENDENT — neither one justifies the other. They are tuned
+        // for their respective jobs: 2 s gives the UI a recoverable
+        // fallback within human perception thresholds; 5 s keeps disk I/O
+        // bounded at ~12 writes/min during active recording.
         val now = System.currentTimeMillis()
         if (!force && lastSaveLiveStateMs > 0L && (now - lastSaveLiveStateMs) < SAVE_LIVE_STATE_THROTTLE_MS) {
             return

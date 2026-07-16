@@ -166,6 +166,23 @@ class TempFileBuffer(
      *   3. The temp file is ALWAYS a complete, parseable GPX document
      *      (closing tags are re-written at the end of every flush) so
      *      `reloadPointsIntoBuffer()` can parse it on crash recovery.
+     *
+     * H1 fix (Task 1): when `totalSegments > tempFileFlushedSegments`, the
+     * segment that was previously "current" may still have unwritten tail
+     * points (fixes accepted after the last flush but before
+     * `createNewSegment` ran — e.g. points collected between the last 5 s
+     * flushTick and the auto-pause / gap-recovery event). The previous
+     * implementation reset `tempFileFlushedCurrentSize = 0` and started
+     * emitting the new segment's points, silently dropping the previous
+     * segment's tail. On a crash / START_STICKY restart those tail points
+     * were lost forever.
+     *
+     * We now drain the previous segment's unwritten tail BEFORE writing the
+     * `</trkseg><trkseg>` boundary marker. Intermediate segments (created by
+     * rapid auto-pause / gap-recovery cycling) are likewise drained in
+     * order so no segment's points are skipped. The XML structure remains
+     * valid: each drained tail is appended BEFORE its closing `</trkseg>`,
+     * which is exactly where it belongs.
      */
     fun flush() {
         try {
@@ -181,9 +198,41 @@ class TempFileBuffer(
             val sb = StringBuilder()
             var openedNewSegments = false
             if (totalSegments > tempFileFlushedSegments) {
+                // H1 fix (Task 1): drain the tail of the segment that was
+                // "current" before the first new segment appeared. Without
+                // this, any fixes appended after the last flush (but before
+                // createNewSegment ran) would be lost from the temp file —
+                // they live only in memory and would be lost on a crash /
+                // START_STICKY restart.
+                //
+                // The segment being closed is at index
+                // (tempFileFlushedSegments - 1); tempFileFlushedCurrentSize
+                // is how many of THAT segment's points we've already written.
+                if (tempFileFlushedSegments >= 1 && tempFileFlushedSegments - 1 < snapshot.size) {
+                    val closingSeg = snapshot[tempFileFlushedSegments - 1]
+                    if (closingSeg.size > tempFileFlushedCurrentSize) {
+                        for (i in tempFileFlushedCurrentSize until closingSeg.size) {
+                            sb.append(GpxIO.formatGpxPoint(closingSeg[i]))
+                        }
+                    }
+                }
+
+                // Append the `</trkseg><trkseg>` boundary markers for each
+                // new segment. If multiple new segments appeared at once
+                // (rare — e.g. rapid auto-pause / gap-recovery cycling),
+                // each intermediate segment is drained of whatever points
+                // it collected before being closed. The LAST segment in
+                // this loop is the new "current" segment — its points are
+                // flushed below by the currentPoints loop.
                 for (i in tempFileFlushedSegments until totalSegments) {
                     sb.append("    </trkseg>\n")
                     sb.append("    <trkseg>\n")
+                    if (i < totalSegments - 1) {
+                        val intermediate = snapshot[i]
+                        for (p in intermediate) {
+                            sb.append(GpxIO.formatGpxPoint(p))
+                        }
+                    }
                 }
                 openedNewSegments = true
                 tempFileFlushedSegments = totalSegments

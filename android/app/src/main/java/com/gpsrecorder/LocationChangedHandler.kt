@@ -72,7 +72,21 @@ class LocationChangedHandler internal constructor(
         // Maximum acceptable age of a GPS fix (ms). Fixes older than this are dropped
         // in onLocationChanged to prevent stale cached fixes from inflating the
         // distance of a fresh recording. See "starts with 9 m / 69 m" bug fix.
+        //
+        // M2 fix (Task 5): this strict 3 s gate is now applied ONLY to fixes
+        // from the GPS provider (provider == "gps") AND to the very FIRST fix
+        // of a recording (regardless of provider) — those are the cases where
+        // a stale cached fix is most likely to corrupt the track. Network /
+        // fused providers routinely deliver cached fixes 5–30 s old indoors
+        // or in deep urban canyons, and dropping them all leaves the user
+        // with no recorded points at all in those environments. For non-GPS
+        // providers, we accept fixes up to MAX_FIX_AGE_MS_RELAXED (30 s).
         internal const val MAX_FIX_AGE_MS = 3000L
+        // Relaxed age gate for network / fused providers. 30 s matches the
+        // typical Android location cache TTL and is short enough that a
+        // truly stale fix (e.g. an hour-old getLastKnownLocation seed) is
+        // still rejected.
+        internal const val MAX_FIX_AGE_MS_RELAXED = 30_000L
 
         // ---- Velocity-based filter (replaces the old 1 km static jump gate) ----
         //
@@ -133,12 +147,29 @@ class LocationChangedHandler internal constructor(
         // such a fix would poison service.prevLat/service.prevLon and inflate service.totalDistanceM on
         // the next fresh fix. This is the second half of the "starts with 9 m /
         // 69 m" fix (the first half is removing the getLastKnownLocation() seed).
+        //
+        // M2 fix (Task 5): the strict 3 s gate (MAX_FIX_AGE_MS) is now applied
+        // ONLY to fixes from the GPS provider AND to the very FIRST fix of a
+        // recording. Network / fused providers routinely deliver cached fixes
+        // 5–30 s old indoors or in deep urban canyons; applying the strict
+        // gate to them dropped legitimate fixes and left the user with no
+        // recorded points at all in those environments.
+        //
+        // The FIRST fix of a recording is always gated strictly regardless
+        // of provider — that's the case where a stale cached fix would most
+        // corrupt the track (it would seed prevLat/prevLon/lastFixTimeMs and
+        // inflate the distance of the next fresh fix). After the first fix,
+        // the velocity gate (below) catches any "impossible jump" from a
+        // stale fix, so the relaxed age gate is sufficient.
         val fixAgeMs = System.currentTimeMillis() - pt.timeMs
-        if (fixAgeMs > MAX_FIX_AGE_MS) {
+        val isFirstFix = service.lastFixTimeMs <= 0L
+        val isGpsProvider = location.provider == "gps"
+        val ageLimit = if (isFirstFix || isGpsProvider) MAX_FIX_AGE_MS else MAX_FIX_AGE_MS_RELAXED
+        if (fixAgeMs > ageLimit) {
             // L33 fix: downgrade to SafeLog.d and strip lat/lon — this was
             // the only Log.w call in the service that leaked GPS coordinates
             // in release builds.
-            SafeLog.d(GpsRecorderService.TAG, "Dropping stale fix: age=${fixAgeMs}ms")
+            SafeLog.d(GpsRecorderService.TAG, "Dropping stale fix: age=${fixAgeMs}ms provider=${location.provider} limit=${ageLimit}ms")
             return
         }
 

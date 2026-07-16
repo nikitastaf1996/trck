@@ -10,6 +10,7 @@ import android.os.IBinder
 import android.os.Looper
 import android.util.Log
 import java.util.LinkedList
+import java.util.concurrent.Executors
 
 /**
  * GpsRecorderService
@@ -103,6 +104,24 @@ class GpsRecorderService : Service(), LocationListener {
     }
 
     private var handler: Handler = Handler(Looper.getMainLooper())
+
+    // M1 fix (Task 4): single-thread executor for the slow GPX finalization
+    // (serialize + MediaStore I/O + Gaussian smoothing + Douglas-Peucker +
+    // distance recompute). Running this on the main thread risked ANRs on
+    // long tracks (a 3-hour walk at 1 Hz = ~10 800 points, plus the
+    // post-processors re-parsing the file twice). The executor is
+    // single-threaded so concurrent stop requests are serialized — the
+    // second stop sees isRecording=false and returns early (see
+    // stopRecording's first guard).
+    //
+    // The executor is NEVER shut down via shutdownNow() while a finalize
+    // is in progress — that would interrupt file I/O and corrupt the
+    // output. onDestroy() lets any in-flight task complete (the service
+    // stays alive because stopSelf() is only called from the main-thread
+    // callback that runs AFTER the finalize completes).
+    private val saveExecutor = Executors.newSingleThreadExecutor { r ->
+        Thread(r, "trck-gpx-saver").apply { isDaemon = true }
+    }
 
     // ---- Recording state (persisted to SharedPreferences for recovery) ----
     @Volatile internal var isRecording = false
@@ -402,39 +421,103 @@ class GpsRecorderService : Service(), LocationListener {
         // throttled saveLiveState doesn't drop the most recent fixes / state.
         stateRepository.saveLiveState(force = true)
 
-        // Final flush + finalize the GPX file.
-        // L5: when the buffer is empty (or no segment has ≥ 2 points),
-        // gpxFileSaver.finalizeGpxFile() returns "" — the empty sentinel. In
-        // that case we do NOT recompute distance, do NOT emit 'saved' (no
-        // 'GPX СОХРАНЁН' toast, no file in Downloads/trck/), and just emit
-        // the stopped state.
-        val savedFilePath = gpxFileSaver.finalizeGpxFile()
-        val savedOk = savedFilePath.isNotEmpty()
+        // M1 fix (Task 4): run the slow GPX finalization on a background
+        // thread. The orchestration (state cleanup, emitSaved, stopForeground,
+        // stopSelf) is posted back to the main thread via `handler.post` once
+        // the background work completes.
+        //
+        // The wake lock is held until the finalize completes — releasing it
+        // early could let the CPU sleep mid-finalize on a long track
+        // (Gaussian smoothing + Douglas-Peucker on a 3-hour recording can
+        // take several seconds).
+        //
+        // Thread-safety notes:
+        //   - segmentsSnapshot() takes the pointBufferLock, which is
+        //     thread-safe.
+        //   - GpxPostProcessors are pure string→string transforms with no
+        //     shared mutable state.
+        //   - MediaStore / ContentResolver are thread-safe.
+        //   - GpsEventEmitter.send() reads a @Volatile field and posts to
+        //     RCTDeviceEventEmitter (which is itself thread-safe).
+        //   - stateRepository.clearPersistedState() uses SharedPreferences
+        //     .edit().apply(), which is thread-safe.
+        // The `pointCount` field is @Volatile and is only read (not written)
+        // in the background task; the value is the final count.
+        //
+        // Try/finally ensures the main-thread cleanup ALWAYS runs, even if
+        // the finalize throws an unexpected exception (OOM, IO error after
+        // the file fallback, etc.) — otherwise the service would stay in
+        // a half-stopped state with the foreground notification up forever.
+        saveExecutor.execute {
+            val savedFilePath: String
+            val savedOk: Boolean
+            val finalDistanceM: Double
+            try {
+                savedFilePath = gpxFileSaver.finalizeGpxFile()
+                savedOk = savedFilePath.isNotEmpty()
+                // Recompute the final distance from the SAVED GPX file so
+                // the value the user sees matches the track length Strava
+                // / other importers will compute (matters most when
+                // Gaussian smoothing is on — smoothing shortens the track
+                // a few percent vs. the raw live-accumulated haversine
+                // distance). On failure we fall back to -1.0, which JS
+                // interprets as "keep the live-accumulated distance".
+                finalDistanceM = if (savedOk) gpxFileSaver.recomputeDistanceFromSavedGpx(savedFilePath) else -1.0
+            } catch (e: Throwable) {
+                Log.e(TAG, "Background GPX finalize threw — recovering UI to idle", e)
+                savedFilePath = ""
+                savedOk = false
+                finalDistanceM = -1.0
+            } finally {
+                // Post the main-thread cleanup back to the main Handler.
+                // This MUST run on the main thread because:
+                //   - stopForeground / stopSelf must be called from the
+                //     main thread (Service lifecycle methods).
+                //   - GpsEventEmitter.emitSaved / emitState touch the
+                //     ReactApplicationContext, which is safest to access
+                //     from the main thread.
+                //   - wakeLockManager.release() must be called from the
+                //     main thread (PowerManager.WakeLock is thread-safe
+                //     but the surrounding code expects main-thread access).
+                handler.post {
+                    // L5: only emit 'saved' when we actually wrote a file.
+                    // The empty sentinel means gpxFileSaver.finalizeGpxFile()
+                    // bailed out early because the buffer was empty —
+                    // emitting a 'saved' event in that case would make the
+                    // UI flash a 'GPX СОХРАНЁН' card with no real file
+                    // behind it.
+                    //
+                    // Task 7 (empty-save UI feedback): when the save was
+                    // empty (no usable segments), emit a NON-FATAL 'error'
+                    // event with a user-facing message so the JS UI can
+                    // surface it via the ErrorCard. Previously the
+                    // recording was silently discarded and the user was
+                    // left wondering why no GPX file appeared in
+                    // Downloads/trck/. The 'fatal=false' flag means the
+                    // JS UI does NOT reset to idle on this error (it's
+                    // already transitioning to idle via emitState below).
+                    if (savedOk) {
+                        GpsEventEmitter.emitSaved(savedFilePath, pointCount, finalDistanceM)
+                    } else {
+                        GpsEventEmitter.emitError(
+                            "Запись остановлена без сохранения: не было получено ни одной GPS-фиксации (или все точки были отфильтрованы). GPX-файл не создан.",
+                            fatal = false
+                        )
+                    }
+                    GpsEventEmitter.emitState(false, 0, 0L, false, false, 0L)
 
-        // Recompute the final distance from the SAVED GPX file so the value
-        // the user sees matches the track length Strava / other importers will
-        // compute (matters most when Gaussian smoothing is on — smoothing
-        // shortens the track a few percent vs. the raw live-accumulated
-        // haversine distance). On failure we fall back to -1.0, which JS
-        // interprets as "keep the live-accumulated distance".
-        val finalDistanceM = if (savedOk) gpxFileSaver.recomputeDistanceFromSavedGpx(savedFilePath) else -1.0
+                    // Clear persisted state + release wakelock AFTER the
+                    // finalize completes. Doing this earlier would risk
+                    // losing the recovery state if the service were killed
+                    // mid-finalize.
+                    stateRepository.clearPersistedState()
+                    wakeLockManager.release()
 
-        // Clear persisted state + release wakelock
-        stateRepository.clearPersistedState()
-        wakeLockManager.release()
-
-        // L5: only emit 'saved' when we actually wrote a file. The empty
-        // sentinel means gpxFileSaver.finalizeGpxFile() bailed out early
-        // because the buffer was empty — emitting a 'saved' event in that
-        // case would make the UI flash a 'GPX СОХРАНЁН' card with no real
-        // file behind it.
-        if (savedOk) {
-            GpsEventEmitter.emitSaved(savedFilePath, pointCount, finalDistanceM)
+                    stopForeground(STOP_FOREGROUND_REMOVE)
+                    stopSelf()
+                }
+            }
         }
-        GpsEventEmitter.emitState(false, 0, 0L, false, false, 0L)
-
-        stopForeground(STOP_FOREGROUND_REMOVE)
-        stopSelf()
     }
 
     // ------------------------------------------------------------------

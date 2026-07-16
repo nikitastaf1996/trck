@@ -57,6 +57,15 @@ export type HandleStartParams = {
   recentSpeedsRef: React.MutableRefObject<number[]>;
   startMonitor: () => Promise<boolean>;
   syncStateFromNative: () => Promise<void>;
+  // Task 9: setters used to clear stale warning flags + moving time on
+  // restart. After an error or an auto-pause-active stop, the previous
+  // implementation could leave the "АВТОПАУЗА" / "СИГНАЛ ПОТЕРЯН" banners
+  // visible for a frame before the first 'state' event from the freshly
+  // started recording arrived and cleared them. Explicitly resetting them
+  // here ensures a clean visual start.
+  setIsAutoPaused: (v: boolean) => void;
+  setSignalLost: (v: boolean) => void;
+  setMovingMs: (v: number) => void;
 };
 
 export function startRecording(p: HandleStartParams) {
@@ -118,6 +127,19 @@ export function startRecording(p: HandleStartParams) {
       p.setLastSavedSettings(null);
       // Clear the pace-smoothing window for the fresh recording.
       p.recentSpeedsRef.current = [];
+      // Task 9 (stale-flag reset): explicitly clear the auto-pause / signal-
+      // lost / moving-time flags. After an error-triggered restart, or when
+      // the previous recording ended while auto-paused / signal-lost, the
+      // native 'state' event for the new recording can take a tick to
+      // arrive — without this explicit reset the user would see stale
+      // "АВТОПАУЗА" / "СИГНАЛ ПОТЕРЯН" banners and a non-zero movingMs
+      // for a frame before the new state event clears them. The native
+      // side's startRecording() also resets these (see
+      // AutoPauseGapController.reset), so this just keeps the JS UI in
+      // sync with what the native side is about to report.
+      p.setIsAutoPaused(false);
+      p.setSignalLost(false);
+      p.setMovingMs(0);
 
       await GpsRecorder.start();
       // U18: update recordingStateRef SYNCHRONOUSLY before setRecordingState
@@ -146,8 +168,30 @@ export type HandleStopParams = {
   setRecordingState: React.Dispatch<React.SetStateAction<RecordingState>>;
   recordingStateRef: React.MutableRefObject<RecordingState>;
   stopTimeoutRef: React.MutableRefObject<number | null>;
+  // H4 fix (Task 3): hard grace-period fallback ref. Same lifecycle as
+  // stopTimeoutRef — scheduled in stopRecording, cancelled by the 'saved'
+  // event handler. Fires after STOP_HARD_FALLBACK_MS to forcibly recover
+  // the UI to 'idle' if the normal 'saved' / 1 s syncStateFromNative paths
+  // failed to do so.
+  stopHardTimeoutRef: React.MutableRefObject<number | null>;
   syncStateFromNative: () => Promise<void>;
 };
+
+// H4 fix (Task 3): hard grace-period for the "stopping" overlay. If neither
+// the 'saved' event nor the 1 s syncStateFromNative() poll has recovered
+// the UI to 'idle' within this many milliseconds, forcibly reset to 'idle'.
+//
+// 15 s is chosen as a balance:
+//   - Long enough that a normal GPX finalize (Gaussian smoothing + Douglas-
+//     Peucker on a multi-hour track) completes well within it, especially
+//     after Task 4 moves that work off the main thread.
+//   - Short enough that the user doesn't feel the app is hung if the stop
+//     intent was genuinely lost (e.g. the OS killed the service mid-stop).
+//
+// When this fires, the saved card will NOT be shown (no 'saved' event
+// arrived) but the user is at least able to press START again. The GPX
+// file (if it was written) is still in Downloads/trck/.
+const STOP_HARD_FALLBACK_MS = 15_000;
 
 export function stopRecording(p: HandleStopParams) {
   return (async () => {
@@ -165,11 +209,41 @@ export function stopRecording(p: HandleStopParams) {
         p.stopTimeoutRef.current = null;
         p.syncStateFromNative();
       }, 1000) as unknown as number;
+
+      // H4 fix (Task 3): schedule the hard grace-period fallback. If the
+      // UI is STILL in 'stopping' after STOP_HARD_FALLBACK_MS, forcibly
+      // reset to 'idle'. This handles the case where the stop intent was
+      // lost (the native service is hung or unresponsive and keeps
+      // reporting isRecording=true), which would otherwise leave the
+      // "Сохранение GPX…" overlay on screen forever.
+      //
+      // The 'saved' event handler cancels this timer (see
+      // createSavedHandler). The 1 s syncStateFromNative above does NOT
+      // cancel it — even if the 1 s poll recovers the UI to 'idle',
+      // leaving the hard timer pending is harmless (it'll just no-op
+      // because recordingStateRef.current will already be 'idle').
+      p.stopHardTimeoutRef.current = setTimeout(() => {
+        p.stopHardTimeoutRef.current = null;
+        if (p.recordingStateRef.current === 'stopping') {
+          // State correction: forcibly recover to 'idle' so the user can
+          // press START again. Don't clear errorMsg here — if the stop
+          // truly failed silently, the user should still see any prior
+          // error message.
+          p.recordingStateRef.current = 'idle';
+          p.setRecordingState('idle');
+        }
+      }, STOP_HARD_FALLBACK_MS) as unknown as number;
     } catch (e: unknown) {
       p.setErrorMsg(e instanceof Error ? e.message : String(e));
       // Revert to 'recording' so the user can try STOP again.
       p.recordingStateRef.current = 'recording';
       p.setRecordingState('recording');
+      // H4 fix: if stop() itself threw, cancel any pending hard fallback
+      // — we've already reverted to 'recording' above.
+      if (p.stopHardTimeoutRef.current != null) {
+        clearTimeout(p.stopHardTimeoutRef.current);
+        p.stopHardTimeoutRef.current = null;
+      }
     }
   })();
 }

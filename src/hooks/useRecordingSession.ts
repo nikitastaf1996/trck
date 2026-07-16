@@ -237,6 +237,13 @@ export function useRecordingSession(
   // cancel it (avoiding a UI flicker between 'stopping' and 'idle' after the
   // saved card is already shown).
   const stopTimeoutRef = useRef<number | null>(null);
+  // H4 fix (Task 3): hard grace-period fallback. If neither the 'saved'
+  // event nor the 1 s syncStateFromNative() poll has recovered the UI to
+  // 'idle' (e.g. the stop intent was lost, the native service is hung, or
+  // the GPX finalization crashed silently), forcibly reset the UI to
+  // 'idle' after STOP_HARD_FALLBACK_MS so the "Сохранение GPX…" overlay
+  // doesn't stay on screen forever.
+  const stopHardTimeoutRef = useRef<number | null>(null);
   // L24 fix: track the last 'duration' event's sequence number so we can
   // ignore out-of-order events (which were causing the displayed timer to
   // occasionally jump backwards by ~1 s when a getState() poll delivered an
@@ -260,6 +267,23 @@ export function useRecordingSession(
 
   // Sync state from native via getState(). Called on mount, on foreground, and
   // every 2 s while recording.
+  //
+  // H4 fix (Task 3): if the UI is in the 'stopping' state (waiting for the
+  // native service to acknowledge STOP and emit 'saved' or 'state:false'),
+  // and the native side reports isRecording === false, we now transition
+  // the UI back to 'idle' instead of staying locked in 'stopping' forever.
+  // The previous implementation hard-pinned 'stopping' (any non-recording
+  // poll result was converted to `prev === 'stopping' ? prev : 'idle'` —
+  // i.e. it preserved 'stopping' indefinitely), which left the
+  // "Сохранение GPX…" overlay stuck on screen when the native stop intent
+  // was dropped or the service was already gone (e.g. user swiped the app
+  // away from recents and the service was killed by the OS without ever
+  // delivering the 'saved' event).
+  //
+  // The 1 s fallback timer scheduled in stopRecording() will still fire
+  // syncStateFromNative() to perform this recovery; the 'saved' event
+  // handler cancels the timer when it arrives, so the normal happy path
+  // is unaffected.
   const syncStateFromNative = useCallback(async () => {
     try {
       const state: GpsFullState = await GpsRecorder.getState();
@@ -267,6 +291,11 @@ export function useRecordingSession(
         // U18: update recordingStateRef synchronously alongside the state
         // setter so the 'gnss' / 'location' handlers read the right value.
         setRecordingState((prev) => {
+          // H4 fix: if we were 'stopping' but the native side is reporting
+          // isRecording === true again (e.g. the stop intent was lost and
+          // the user started a NEW recording), allow the transition back
+          // to 'recording' — the alternative is to stay stuck in 'stopping'
+          // forever while the native side is actively recording.
           const next = prev === 'stopping' ? prev : 'recording';
           recordingStateRef.current = next;
           return next;
@@ -288,8 +317,20 @@ export function useRecordingSession(
           setCurrentSpeed(state.lastFix.speed);
         }
       } else {
-        setRecordingState((prev) => {
-          const next = prev === 'stopping' ? prev : 'idle';
+        setRecordingState((_) => {
+          // H4 fix (Task 3): allow the UI to recover from 'stopping' to
+          // 'idle' when the native side confirms it is no longer recording.
+          // Previously this branch was `prev === 'stopping' ? prev : 'idle'`,
+          // which kept the "Сохранение GPX…" overlay on screen forever if
+          // the 'saved' event was never delivered (stop intent dropped,
+          // service killed before emitting, etc.).
+          //
+          // We still preserve 'stopping' for one tick when the user JUST
+          // pressed STOP and the poll happens to fire within the same
+          // 2 s window — the grace is enforced by the stopTimeoutRef-based
+          // fallback in useRecordingControls.stopRecording(), not by this
+          // poll.
+          const next: RecordingState = 'idle';
           recordingStateRef.current = next;
           return next;
         });
@@ -360,6 +401,7 @@ export function useRecordingSession(
         setSignalLost,
         setMovingMs,
         stopTimeoutRef,
+        stopHardTimeoutRef,
         movingMsRef,
         elapsedMsRef,
         autoPauseEnabledRef,
@@ -433,6 +475,11 @@ export function useRecordingSession(
       recentSpeedsRef,
       startMonitor,
       syncStateFromNative,
+      // Task 9: pass the warning-flag + moving-time setters so
+      // startRecording can clear them on restart.
+      setIsAutoPaused,
+      setSignalLost,
+      setMovingMs,
     });
   }, [
     syncStateFromNative,
@@ -445,17 +492,33 @@ export function useRecordingSession(
     setRecordingState,
     recordingStateRef,
     setErrorMsg,
+    // Task 9: add the new setters to the deps array. They are stable
+    // useState setters (React guarantees this), so listing them here does
+    // not cause the callback to be recreated on re-renders — but
+    // exhaustive-deps wants them listed.
+    setElapsedMs,
+    setDistance,
+    setCurrentSpeed,
+    setLastSavedPath,
+    setLastSavedSettings,
+    setIsAutoPaused,
+    setSignalLost,
+    setMovingMs,
   ]);
 
   // ---- handleStop ----
   // Body lives in ./useRecordingControls (extracted in T5). Schedules a 1 s
   // fallback syncStateFromNative() (U16); the 'saved' event cancels it.
+  // H4 fix (Task 3): also schedules a 15 s hard fallback that forcibly
+  // resets the UI to 'idle' if neither 'saved' nor the 1 s poll recovered
+  // the state.
   const handleStop = useCallback(async () => {
     await stopRecording({
       setErrorMsg,
       setRecordingState,
       recordingStateRef,
       stopTimeoutRef,
+      stopHardTimeoutRef,
       syncStateFromNative,
     });
   }, [syncStateFromNative, setRecordingState, recordingStateRef, setErrorMsg]);

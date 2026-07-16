@@ -306,11 +306,40 @@ class AutoPauseGapController(private val service: GpsRecorderService) {
      * stationary, the auto-pause path further down in onLocationChanged
      * will immediately re-freeze movingMs via enterAutoPause(), so this is
      * safe. See CHANGELOG.md.
+     *
+     * H2 fix (Task 2): if a fix arrives JUST BEFORE the watchdog ticks
+     * (i.e. lastResumeMs is still pointing to the previous resume — meaning
+     * the watchdog hasn't fired yet and hasn't nulled lastResumeMs), the
+     * previous implementation simply overwrote `lastResumeMs = now`,
+     * silently discarding the moving-time delta accumulated between
+     * lastResumeMs and the last fix. We now commit that delta to `movingMs`
+     * (capped at lastFixTimeMs, not `now`, because the gap period is NOT
+     * moving time) BEFORE updating lastResumeMs.
      */
     fun handleGapRecovery(now: Long) {
         resetValidationCursor()
         service.segmentedBuffer.createNewSegment()
         service.signalLost = false
+        // H2 fix (Task 2): commit the active segment's elapsed moving time
+        // before resetting lastResumeMs. If the watchdog has NOT yet fired
+        // (signalLost was false on entry — gap detected via the time-delta
+        // branch in onLocationChanged), lastResumeMs is still set to the
+        // previous resume instant. Overwriting it without committing would
+        // wipe the moving-time delta between the last resume and the last
+        // accepted fix.
+        //
+        // If the watchdog HAS already fired (signalLost was true on entry),
+        // lastResumeMs is already null (the watchdog nulled it after
+        // committing movingMs up to lastFixTimeMs), so this block is a no-op.
+        // The `if (service.lastFixTimeMs > r)` guard ensures we don't add a
+        // negative delta if the last fix's timestamp somehow pre-dates the
+        // resume (which would be a clock-skew anomaly — better to skip than
+        // to subtract).
+        service.lastResumeMs?.let { r ->
+            if (service.lastFixTimeMs > r) {
+                service.movingMs += (service.lastFixTimeMs - r)
+            }
+        }
         // Resume moving-time accumulation from this instant. If the user
         // is stationary, the auto-pause path below will immediately freeze
         // it again via enterAutoPause(now) — net effect: zero gap time
@@ -326,7 +355,7 @@ class AutoPauseGapController(private val service: GpsRecorderService) {
                 signalLost = service.signalLost
             )
         )
-        Log.i(GpsRecorderService.TAG, "Gap recovered at $now — new segment started, movingMs accumulation resumed")
+        Log.i(GpsRecorderService.TAG, "Gap recovered at $now — new segment started, movingMs accumulation resumed (committed pre-gap delta)")
     }
 
     // ------------------------------------------------------------------

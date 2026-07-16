@@ -223,6 +223,10 @@ export type SavedHandlerParams = {
   setSignalLost: (v: boolean) => void;
   setMovingMs: (v: number) => void;
   stopTimeoutRef: React.MutableRefObject<number | null>;
+  // H4 fix (Task 3): hard grace-period fallback ref. Cancelled alongside
+  // stopTimeoutRef when the 'saved' event arrives — see stopRecording in
+  // useRecordingControls.ts for the rationale.
+  stopHardTimeoutRef: React.MutableRefObject<number | null>;
   movingMsRef: React.MutableRefObject<number>;
   elapsedMsRef: React.MutableRefObject<number>;
   autoPauseEnabledRef: React.MutableRefObject<boolean>;
@@ -241,6 +245,15 @@ export function createSavedHandler(p: SavedHandlerParams) {
     if (p.stopTimeoutRef.current != null) {
       clearTimeout(p.stopTimeoutRef.current);
       p.stopTimeoutRef.current = null;
+    }
+    // H4 fix (Task 3): also cancel the hard grace-period fallback — the
+    // 'saved' event has arrived, so the UI is about to transition to
+    // 'idle' via the code below. Letting the hard timer fire 15 s later
+    // would be a no-op (recordingStateRef would already be 'idle') but
+    // cancelling it is cleaner and makes the intent explicit.
+    if (p.stopHardTimeoutRef.current != null) {
+      clearTimeout(p.stopHardTimeoutRef.current);
+      p.stopHardTimeoutRef.current = null;
     }
     // Snapshot the live timing values BEFORE we reset them, so the
     // saved card can show the post-save average pace over the final
