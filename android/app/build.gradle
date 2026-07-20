@@ -82,7 +82,7 @@ android {
     defaultConfig {
         applicationId "com.gpsrecorder"
         minSdkVersion rootProject.ext.minSdkVersion
-        targetSdkVersion rootProject.ext.targetSdkVersion
+        targetSdk rootProject.ext.targetSdkVersion
         // CODE_REVIEW_TODO Tasks 1-5: bump versionCode 2 -> 3, versionName
         // 1.1 -> 1.2 per AGENTS.md O25 (Android refuses sideloaded-APK
         // upgrades when versionCode does not strictly increase).
@@ -91,6 +91,20 @@ android {
         // extracted modules. No behavior change; APK rebuild required.)
         versionCode 5
         versionName "1.3.1"
+    }
+
+    // Robolectric needs to read the merged manifest + resources at test
+    // time. This option tells the AGP to generate a `processed_manifest`
+    // for the test variant so Robolectric's ResourceMerger can find the
+    // application package + permissions.
+    testOptions {
+        unitTests {
+            includeAndroidResources = true
+            // Robolectric is a JVM test runner; we don't want the AGP to
+            // auto-mock android.* classes (the default behavior) because
+            // that would replace Robolectric's real implementations.
+            returnDefaultValues = false
+        }
     }
     signingConfigs {
         debug {
@@ -128,13 +142,18 @@ dependencies {
     }
 
     // ---- Unit tests (CODE_REVIEW_TODO Task 1) ----
-    // Plain JUnit4 + a tiny pure-Kotlin helper for the gap/pause race
-    // invariant. Robolectric is intentionally NOT added so the tests run
-    // on a stock JDK without the Android framework — they exercise a
-    // small state-machine class that mirrors the relevant fields of
-    // GpsRecorderService (isAutoPaused, signalLost, lastFixTimeMs,
-    // autoPauseResumeGraceUntilMs) without depending on Service /
-    // SharedPreferences / LocationListener.
+    // Plain JUnit4 + kotlin-test for the pure-JVM tests (TrackMath, GpxPoint,
+    // SegmentedBuffer, AutoPauseGapController constants, etc.).
+    //
+    // Robolectric is added so we can test classes that depend on the
+    // Android framework (android.util.Log, XmlPullParser, Context,
+    // SharedPreferences) without running on a real device or emulator.
+    // Robolectric provides a JVM implementation of the Android framework
+    // that's sufficient for our GPX I/O + post-processor tests.
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.jetbrains.kotlin:kotlin-test:2.1.20")
+    testImplementation("org.robolectric:robolectric:4.14.1")
+    testImplementation("androidx.test:core:1.6.1")
+    testImplementation("androidx.test.ext:junit:1.2.1")
+    testImplementation("com.google.truth:truth:1.4.4")
 }
