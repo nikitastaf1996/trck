@@ -231,4 +231,217 @@ class GapPauseRaceTest {
             sm.watchdogWouldFire(tickTime)
         )
     }
+
+    // ------------------------------------------------------------------
+    // Additional scenarios (added by the test-suite expansion).
+    // ------------------------------------------------------------------
+
+    /**
+     * The watchdog must NOT fire while `isAutoPaused=true` — stationary
+     * users legitimately have no incoming fixes by design. Showing the
+     * "signal lost" banner on top of the "auto pause" banner would be
+     * contradictory (see AutoPauseGapController.kt's `enterAutoPause`
+     * comment).
+     */
+    @Test
+    fun watchdog_doesNotFire_whileAutoPaused_evenIfLastFixIsAncient() {
+        val sm = GapPauseStateMachine(gapThresholdMs)
+        sm.enterAutoPause(0L)
+        sm.lastFixTimeMs = 0L // very stale, but auto-paused → suppress
+        sm.autoPauseResumeGraceUntilMs = 0L // grace has long expired
+
+        // Tick at t = 100_000ms (100 s since last fix). sinceLast is huge.
+        // But isAutoPaused=true → watchdog returns false.
+        assertFalse(
+            "watchdog must NOT fire while auto-paused (even with very stale lastFixTimeMs)",
+            sm.watchdogWouldFire(100_000L)
+        )
+        sm.durationTick(100_000L)
+        assertFalse("signalLost must NOT be set while auto-paused", sm.signalLost)
+    }
+
+    /**
+     * The watchdog must NOT fire a second time once `signalLost=true`.
+     * Otherwise it would re-emit the banner + re-freeze movingMs on every
+     * tick, which would be wasteful and could double-count the moving-time
+     * freeze delta (the `lastResumeMs?.let { r -> ... }` block).
+     */
+    @Test
+    fun watchdog_doesNotFire_whenSignalLostIsAlreadyTrue() {
+        val sm = GapPauseStateMachine(gapThresholdMs)
+        sm.lastFixTimeMs = 0L
+        sm.signalLost = true // already declared — watchdog should no-op
+
+        // Tick at t = 100_000ms — would normally fire, but signalLost=true.
+        assertFalse(
+            "watchdog must NOT re-fire when signalLost is already true",
+            sm.watchdogWouldFire(100_000L)
+        )
+    }
+
+    /**
+     * The watchdog must NOT fire when `gapDetectionEnabled=false`. This is
+     * the user-facing toggle (Phase 4) that lets them opt out of the
+     * signal-loss segment-split behaviour.
+     */
+    @Test
+    fun watchdog_doesNotFire_whenGapDetectionIsDisabled() {
+        val sm = GapPauseStateMachine(gapThresholdMs)
+        sm.lastFixTimeMs = 0L
+        sm.autoPauseResumeGraceUntilMs = 0L
+        assertFalse(
+            "watchdog must NOT fire when gap detection is disabled",
+            sm.watchdogWouldFire(100_000L, gapDetectionEnabled = false)
+        )
+    }
+
+    /**
+     * The watchdog must NOT fire when `lastFixTimeMs == 0L` (no fix yet
+     * received). This is the very-start-of-recording case: the watchdog
+     * can't measure "time since last fix" if there's never been a fix.
+     */
+    @Test
+    fun watchdog_doesNotFire_whenNoFixHasArrivedYet() {
+        val sm = GapPauseStateMachine(gapThresholdMs)
+        sm.lastFixTimeMs = 0L // no fix yet
+        // Tick at t = 100_000ms. sinceLast would be 100_000ms > 15_000ms
+        // threshold, but lastFixTimeMs == 0 → suppress.
+        assertFalse(
+            "watchdog must NOT fire when no fix has arrived yet (lastFixTimeMs == 0)",
+            sm.watchdogWouldFire(100_000L)
+        )
+    }
+
+    /**
+     * The watchdog must NOT fire while `now < autoPauseResumeGraceUntilMs`
+     * — the grace window that exitAutoPause sets to GAP_THRESHOLD_MS in
+     * the future, so the watchdog's next 15 s of ticks can't falsely
+     * declare signalLost on a stale lastFixTimeMs.
+     */
+    @Test
+    fun watchdog_doesNotFire_whileInsideGraceWindow() {
+        val sm = GapPauseStateMachine(gapThresholdMs)
+        sm.lastFixTimeMs = 0L // very stale
+        sm.autoPauseResumeGraceUntilMs = 30_000L // grace covers t < 30 s
+
+        // Tick at t = 29_999ms (1 ms before grace expires) — even though
+        // sinceLast is 29_999ms (way > 15_000ms threshold), the grace
+        // window forbids firing.
+        assertFalse(
+            "watchdog must NOT fire inside the grace window (now=29_999 < grace=30_000)",
+            sm.watchdogWouldFire(29_999L)
+        )
+
+        // Tick at t = 30_000ms — grace just expired. Now it fires.
+        assertTrue(
+            "watchdog fires once grace window expires (now=30_000 == grace=30_000)",
+            sm.watchdogWouldFire(30_000L)
+        )
+    }
+
+    /**
+     * The watchdog fires EXACTLY when `sinceLast` exceeds GAP_THRESHOLD_MS
+     * (i.e. when `sinceLast > GAP_THRESHOLD_MS`, strict greater-than).
+     * One ms below the threshold → no fire. One ms above → fire.
+     */
+    @Test
+    fun watchdog_fires_whenSinceLastStrictlyExceedsGapThresholdMs() {
+        val sm = GapPauseStateMachine(gapThresholdMs)
+        sm.lastFixTimeMs = 0L
+        sm.autoPauseResumeGraceUntilMs = 0L // grace expired
+
+        // sinceLast = 15_000ms exactly → NOT > 15_000 → no fire.
+        assertFalse(
+            "watchdog must NOT fire when sinceLast == gapThresholdMs (boundary, strict >)",
+            sm.watchdogWouldFire(15_000L)
+        )
+        // sinceLast = 15_001ms → > 15_000 → fire.
+        assertTrue(
+            "watchdog must fire when sinceLast = gapThresholdMs + 1 (strict >)",
+            sm.watchdogWouldFire(15_001L)
+        )
+    }
+
+    /**
+     * Multiple enter/exit auto-pause cycles must NOT leak grace or
+     * signalLost state between cycles.
+     */
+    @Test
+    fun multipleEnterExitAutoPauseCycles_doNotLeakStateBetweenCycles() {
+        val sm = GapPauseStateMachine(gapThresholdMs)
+
+        // Cycle 1: enter at t=0, exit at t=10_000.
+        sm.enterAutoPause(0L)
+        sm.lastFixTimeMs = 0L
+        sm.exitAutoPause(10_000L)
+        assertEquals(10_000L, sm.lastFixTimeMs)
+        assertEquals(10_000L + gapThresholdMs, sm.autoPauseResumeGraceUntilMs)
+        assertFalse("isAutoPaused=false after exitAutoPause", sm.isAutoPaused)
+        assertFalse("signalLost=false after enterAutoPause", sm.signalLost)
+
+        // Cycle 2: enter at t=20_000, exit at t=30_000.
+        sm.enterAutoPause(20_000L)
+        sm.lastFixTimeMs = 20_000L
+        sm.exitAutoPause(30_000L)
+        assertEquals(30_000L, sm.lastFixTimeMs)
+        assertEquals(30_000L + gapThresholdMs, sm.autoPauseResumeGraceUntilMs)
+        assertFalse(sm.isAutoPaused)
+        assertFalse(sm.signalLost)
+
+        // Cycle 3: enter at t=40_000.
+        sm.enterAutoPause(40_000L)
+        assertTrue("isAutoPaused=true after enterAutoPause", sm.isAutoPaused)
+        assertFalse("signalLost should still be false (enterAutoPause clears it)", sm.signalLost)
+    }
+
+    /**
+     * The grace window expires after exactly GAP_THRESHOLD_MS, and the
+     * watchdog then resumes normal operation. This is the "happy path"
+     * for a long-enough post-resume gap.
+     */
+    @Test
+    fun graceWindowExpiresExactly_atResumeTime_plusGapThresholdMs() {
+        val sm = GapPauseStateMachine(gapThresholdMs)
+        val resumeTime = 100_000L
+        sm.lastFixTimeMs = 0L // stale
+        sm.exitAutoPause(resumeTime)
+
+        // Tick at t = resumeTime + GAP_THRESHOLD_MS - 1 → still in grace.
+        assertFalse(
+            "watchdog must NOT fire 1ms before grace expires",
+            sm.watchdogWouldFire(resumeTime + gapThresholdMs - 1)
+        )
+        // Tick at t = resumeTime + GAP_THRESHOLD_MS → grace expired (now == grace).
+        // lastFixTimeMs was refreshed to resumeTime, so sinceLast = GAP_THRESHOLD_MS
+        // which is NOT > GAP_THRESHOLD_MS (strict >) → still no fire.
+        assertFalse(
+            "watchdog must NOT fire when sinceLast == gapThresholdMs (boundary, strict >)",
+            sm.watchdogWouldFire(resumeTime + gapThresholdMs)
+        )
+        // Tick at t = resumeTime + GAP_THRESHOLD_MS + 1 → fire.
+        assertTrue(
+            "watchdog fires 1ms after grace + threshold expires",
+            sm.watchdogWouldFire(resumeTime + gapThresholdMs + 1)
+        )
+    }
+
+    /**
+     * When the user is recording and fixes arrive regularly (every 1 s),
+     * the watchdog must NEVER fire — even after many minutes of recording.
+     * This is the "everything is fine" steady-state.
+     */
+    @Test
+    fun steadyStateRecordingWith1HzFixes_neverFiresWatchdog() {
+        val sm = GapPauseStateMachine(gapThresholdMs)
+        sm.lastFixTimeMs = 0L
+        // Simulate 1 Hz fixes for 60 s.
+        for (t in 1L..60L) {
+            sm.lastFixTimeMs = t * 1_000L // update last fix every second
+            sm.durationTick(t * 1_000L)
+            assertFalse(
+                "watchdog must NOT fire during steady 1 Hz recording (t=$t s)",
+                sm.signalLost
+            )
+        }
+    }
 }

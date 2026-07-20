@@ -6,7 +6,12 @@
     "android": "react-native run-android",
     "lint": "tsc --noEmit && eslint .",
     "start": "react-native start",
-    "test": "jest"
+    "test": "jest",
+    "test:ci": "jest --verbose --coverage --ci",
+    "test:watch": "jest --watch",
+    "test:coverage": "jest --coverage",
+    "test:kotlin": "cd android && ./gradlew testDebugUnitTest --no-daemon --stacktrace",
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "react": "19.2.3",
