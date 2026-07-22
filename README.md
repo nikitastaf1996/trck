@@ -50,25 +50,31 @@ Workflow artifacts (for older builds and Gradle build logs) live on the
 | `versionCode` | 5 |
 | `versionName` | 1.3.1 |
 | APK size | ~24 MB (varies slightly per build) |
-| Largest source file | 497 lines (`GpsRecorderService.kt`) |
-| TypeScript tests | 39 / 39 passing |
+| TypeScript tests | see TESTING.md |
 | Kotlin files | 26 |
-| TypeScript files | 22 |
+| TypeScript files | see `src/` |
 
-### What was refactored (v1.3.1)
+### What was refactored (v1.4.0 — JS state architecture)
 
-The two giant files that prompted the refactor are now both under 500
-lines:
+The JS side previously smeared recording state across `App.tsx` + four
+hooks (`useSettings`, `usePermissions`, `useGnssMonitor`,
+`useRecordingSession`) + two factory files (`useRecordingEventHandlers`,
+`useRecordingControls`) + a forest of mirror refs and `forceRerender`
+workarounds. That has been collapsed into **two Zustand stores**:
 
-| File | Before | After | Reduction |
-|---|---|---|---|
-| `GpsRecorderService.kt` | 3 445 | **497** | −86 % |
-| `App.tsx` | 2 135 | **496** | −77 % |
-| `GpsRecorderModule.kt` | 1 223 | **373** | −69 % |
+- `src/store/recordingStore.ts` — single source of truth for the
+  recording state machine, live telemetry, GNSS status, permissions,
+  and the saved-card snapshot. Native events dispatch into it; selectors
+  feed the UI.
+- `src/store/settingsStore.ts` — single source of truth for the 11
+  user-facing settings, with one generic `useSetting` hook instead of
+  11 near-identical handlers.
 
-21 new Kotlin modules and 12 new TypeScript modules were extracted. No
-behaviour changed — every invariant, threshold, and Russian string is
-preserved. See [`CHANGELOG.md`](./CHANGELOG.md) for the full breakdown.
+`src/hooks/` is gone. `App.tsx` dropped from 496 to ~250 lines (and is
+much easier to read). The "every file under 500 lines" rule was
+dropped — it had produced files that were split-but-not-abstracted,
+sharing mutable state through back-references. See
+[`CHANGELOG.md`](./CHANGELOG.md) for the full breakdown.
 
 ## How to install
 

@@ -66,11 +66,6 @@ describe('selectPaceTimeMs (pure helper)', () => {
 });
 
 describe('StatsDisplay component', () => {
-  // Helper to build a recentSpeedsRef that won't break the smoothed-pace calc.
-  function makeSpeedsRef(speeds: number[]) {
-    return { current: speeds };
-  }
-
   it('renders without crashing in the idle state', () => {
     const root = render(
       <StatsDisplay
@@ -84,7 +79,7 @@ describe('StatsDisplay component', () => {
         showMovingTime={false}
         autoPauseEnabled={false}
         gapDetectionEnabled={false}
-        recentSpeedsRef={makeSpeedsRef([])}
+        recentSpeeds={[]}
       />
     );
     expect(root).toBeDefined();
@@ -103,7 +98,7 @@ describe('StatsDisplay component', () => {
         showMovingTime={false}
         autoPauseEnabled={false}
         gapDetectionEnabled={false}
-        recentSpeedsRef={makeSpeedsRef([3.0, 3.1, 2.9])}
+        recentSpeeds={[3.0, 3.1, 2.9]}
       />
     );
     expect(root).toBeDefined();
@@ -122,7 +117,7 @@ describe('StatsDisplay component', () => {
         showMovingTime={false}
         autoPauseEnabled={false}
         gapDetectionEnabled={false}
-        recentSpeedsRef={makeSpeedsRef([])}
+        recentSpeeds={[]}
       />
     );
     expect(allText(root)).toContain('ОЖИДАНИЕ');
@@ -141,7 +136,7 @@ describe('StatsDisplay component', () => {
         showMovingTime={false}
         autoPauseEnabled={false}
         gapDetectionEnabled={false}
-        recentSpeedsRef={makeSpeedsRef([3.0])}
+        recentSpeeds={[3.0]}
       />
     );
     expect(allText(root)).toContain('ЗАПИСЬ');
@@ -160,7 +155,7 @@ describe('StatsDisplay component', () => {
         showMovingTime={false}
         autoPauseEnabled={true}
         gapDetectionEnabled={false}
-        recentSpeedsRef={makeSpeedsRef([])}
+        recentSpeeds={[]}
       />
     );
     expect(allText(root)).toContain('АВТОПАУЗА');
@@ -179,7 +174,7 @@ describe('StatsDisplay component', () => {
         showMovingTime={false}
         autoPauseEnabled={false}
         gapDetectionEnabled={true}
-        recentSpeedsRef={makeSpeedsRef([])}
+        recentSpeeds={[]}
       />
     );
     expect(allText(root)).toContain('НЕТ СИГНАЛА');
@@ -198,7 +193,7 @@ describe('StatsDisplay component', () => {
         showMovingTime={false}
         autoPauseEnabled={false}
         gapDetectionEnabled={false}
-        recentSpeedsRef={makeSpeedsRef([])}
+        recentSpeeds={[]}
       />
     );
     expect(allText(root)).toContain('ОСТАНОВКА…');
@@ -217,7 +212,7 @@ describe('StatsDisplay component', () => {
         showMovingTime={false}
         autoPauseEnabled={false}
         gapDetectionEnabled={false}
-        recentSpeedsRef={makeSpeedsRef([])}
+        recentSpeeds={[]}
       />
     );
     expect(allText(root)).toContain('ВРЕМЯ');
@@ -236,7 +231,7 @@ describe('StatsDisplay component', () => {
         showMovingTime={true}
         autoPauseEnabled={false}
         gapDetectionEnabled={false}
-        recentSpeedsRef={makeSpeedsRef([])}
+        recentSpeeds={[]}
       />
     );
     expect(allText(root)).toContain('ВРЕМЯ В ДВИЖЕНИИ');
@@ -255,7 +250,7 @@ describe('StatsDisplay component', () => {
         showMovingTime={false}
         autoPauseEnabled={true}
         gapDetectionEnabled={false}
-        recentSpeedsRef={makeSpeedsRef([])}
+        recentSpeeds={[]}
       />
     );
     const texts = allText(root);
@@ -277,7 +272,7 @@ describe('StatsDisplay component', () => {
         showMovingTime={false}
         autoPauseEnabled={false}
         gapDetectionEnabled={false}
-        recentSpeedsRef={makeSpeedsRef([])}
+        recentSpeeds={[]}
       />
     );
     expect(allText(root)).toContain('ДИСТАНЦИЯ');
@@ -296,7 +291,7 @@ describe('StatsDisplay component', () => {
         showMovingTime={false}
         autoPauseEnabled={false}
         gapDetectionEnabled={false}
-        recentSpeedsRef={makeSpeedsRef([])}
+        recentSpeeds={[]}
       />
     );
     const texts = allText(root);
@@ -317,7 +312,7 @@ describe('StatsDisplay component', () => {
         showMovingTime={false}
         autoPauseEnabled={false}
         gapDetectionEnabled={false}
-        recentSpeedsRef={makeSpeedsRef([])}
+        recentSpeeds={[]}
       />
     );
     const texts = allText(root);
@@ -338,7 +333,7 @@ describe('StatsDisplay component', () => {
         showMovingTime={false}
         autoPauseEnabled={false}
         gapDetectionEnabled={false}
-        recentSpeedsRef={makeSpeedsRef([3.0])}
+        recentSpeeds={[3.0]}
       />
     );
     const texts = allText(root);
@@ -359,7 +354,7 @@ describe('StatsDisplay component', () => {
         showMovingTime={false}
         autoPauseEnabled={true}
         gapDetectionEnabled={false}
-        recentSpeedsRef={makeSpeedsRef([])}
+        recentSpeeds={[]}
       />
     );
     const texts = allText(root);
@@ -379,7 +374,7 @@ describe('StatsDisplay component', () => {
         showMovingTime={false}
         autoPauseEnabled={false}
         gapDetectionEnabled={false}
-        recentSpeedsRef={makeSpeedsRef([3.0])}
+        recentSpeeds={[3.0]}
       />
     );
     const texts = allText(root);

@@ -33,7 +33,7 @@ Key features:
 
 ```
 .
-├── App.tsx                          # RN UI composition root (496 lines)
+├── App.tsx                          # RN UI composition root
 ├── index.js                         # RN entrypoint
 ├── app.json                         # RN app name
 ├── package.json                     # JS deps
@@ -42,13 +42,9 @@ Key features:
 │       └── build-apk.yml            # GitHub Actions: build release APK on push
 ├── src/
 │   ├── NativeGpsRecorder.ts         # TS bridge to the native module
-│   ├── hooks/                       # Extracted React hooks
-│   │   ├── useRecordingSession.ts   # 5 event subs + handleStart/Stop
-│   │   ├── useSettings.ts           # 11 settings state + 10 handlers
-│   │   ├── useRecordingEventHandlers.ts  # event handler factories
-│   │   ├── useRecordingControls.ts  # handleStart/handleStop
-│   │   ├── usePermissions.ts        # permission + battery-opt
-│   │   └── useGnssMonitor.ts        # GNSS status state
+│   ├── store/                       # Zustand stores (single source of truth)
+│   │   ├── recordingStore.ts        # recording state machine + event reducers
+│   │   └── settingsStore.ts         # 11 settings + generic useSetting hook
 │   ├── components/                  # Presentational components
 │   │   ├── StatsDisplay.tsx         # TIME/DISTANCE/TEMPO block
 │   │   ├── ToggleRow.tsx            # reusable toggle row
@@ -101,8 +97,11 @@ Key features:
                 └── values/strings.xml
 ```
 
-Every source file is **under 500 lines** — this is a deliberate design
-constraint to keep the codebase navigable.
+Files should be **tidy and cohesive** — one concept per file, no hard line
+limit. If a file grows to the point that you can no longer hold its purpose
+in your head, split it; otherwise leave it. (The previous "every file must
+be under 500 lines" rule produced files that were split-but-not-abstracted
+— the splits increased coupling rather than reducing it.)
 
 ### App-name divergence (O6)
 
@@ -338,19 +337,24 @@ regress any of these properties.
 
 ## Code organisation principles
 
-1. **Every file under 500 lines.** If a file grows beyond 500, extract a
-   cohesive module. The `wc -l` check is part of the "is the refactor
-   done?" gate.
+1. **Tidy and cohesive files, no hard line limit.** A file should own
+   one concept (GPX I/O, settings, notification, the auto-pause state
+   machine, the recording store, etc.). If you can no longer hold its
+   purpose in your head, split it. Don't split just to hit a line count
+   — that produces files which share mutable state through back-references
+   and increase coupling rather than reducing it.
 
-2. **Single responsibility per module.** Each `.kt` / `.ts` file owns one
-   concept (GPX I/O, settings, notification, auto-pause state machine,
-   etc.). Cross-cutting state lives on the service / App.tsx and is
-   accessed via `service.` / hook-destructure.
+2. **State has a single owner.** JS-side state lives in a Zustand store
+   (`src/store/`). Native-side state lives in the service or (better) in
+   a dedicated state-machine class with private fields. Mirror refs,
+   `forceRerender`, and the like are a smell — they appear when state is
+   smeared across closures that can't see each other.
 
-3. **Invariants are tagged** with `L*` (numbered fixes), `U*` (UI fixes),
-   `O*` (organisation fixes), or `Task N` (code-review tasks). When
-   refactoring, search for these tags and preserve the behaviour they
-   document. See CHANGELOG.md for the full list.
+3. **Bug fixes are just bug fixes.** The old `L*` / `U*` / `O*` / `Task N`
+   tag system was useful when there were five of them; at 268 occurrences
+   it became a parallel language readers had to learn before they could
+   read the code. New fixes get a normal commit message explaining the
+   "why"; only the genuinely-surprising invariants get an inline comment.
 
 4. **Privacy:** `SafeLog.d` / `SafeLog.v` are no-ops in release builds
   (they would leak lat/lon). `Log.i` / `Log.w` / `Log.e` are
