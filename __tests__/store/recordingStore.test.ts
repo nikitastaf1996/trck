@@ -8,9 +8,10 @@
  * needed.
  */
 
-import { useRecordingStore, SPEED_WINDOW } from '../../src/store/recordingStore';
+import { useRecordingStore, SPEED_WINDOW, subscribeAllNativeEvents } from '../../src/store/recordingStore';
 import { useSettingsStore } from '../../src/store/settingsStore';
 import { gpsMock, clearGpsMock, resetStores } from '../helpers';
+import { DeviceEventEmitter } from 'react-native';
 
 describe('recordingStore — initial state', () => {
   beforeEach(() => {
@@ -549,5 +550,94 @@ describe('recordingStore — UI dismiss actions', () => {
   it('setError sets errorMsg (used by settingsStore for revert-on-error)', () => {
     useRecordingStore.getState().setError('boom');
     expect(useRecordingStore.getState().errorMsg).toBe('boom');
+  });
+});
+
+describe('recordingStore — subscribeAllNativeEvents', () => {
+  let handle: ReturnType<typeof subscribeAllNativeEvents>;
+
+  beforeEach(() => {
+    resetStores();
+    clearGpsMock();
+    handle = subscribeAllNativeEvents();
+  });
+
+  afterEach(() => {
+    if (handle) handle.remove();
+  });
+
+  it('dispatches a location event into the store', () => {
+    DeviceEventEmitter.emit('location', {
+      lat: 55, lon: 37, alt: 100, speed: 1.5, accuracy: 5,
+      fixType: '3D fix', distance: 42, timestamp: 0,
+      pointCount: 1, isAutoPaused: false, signalLost: false, movingMs: 0,
+    });
+    expect(useRecordingStore.getState().distance).toBe(42);
+    expect(useRecordingStore.getState().fixType).toBe('3D fix');
+  });
+
+  it('dispatches a duration event into the store', () => {
+    DeviceEventEmitter.emit('duration', { elapsedMs: 7000, movingMs: 6000, seq: 1 });
+    expect(useRecordingStore.getState().elapsedMs).toBe(7000);
+    expect(useRecordingStore.getState().movingMs).toBe(6000);
+  });
+
+  it('dispatches a state event into the store', () => {
+    DeviceEventEmitter.emit('state', {
+      isRecording: true, pointCount: 5, elapsedMs: 10000,
+      isAutoPaused: false, signalLost: false, movingMs: 9000,
+    });
+    expect(useRecordingStore.getState().recordingState).toBe('recording');
+  });
+
+  it('dispatches a saved event into the store', () => {
+    useRecordingStore.setState({ recordingState: 'stopping', elapsedMs: 5000, movingMs: 4000 });
+    DeviceEventEmitter.emit('saved', { filePath: '/test.gpx', pointCount: 100, finalDistanceM: 1234 });
+    expect(useRecordingStore.getState().lastSavedPath).toBe('/test.gpx');
+    expect(useRecordingStore.getState().lastSavedDistance).toBe(1234);
+    expect(useRecordingStore.getState().recordingState).toBe('idle');
+  });
+
+  it('dispatches an error event into the store (fatal resets to idle)', () => {
+    useRecordingStore.setState({ recordingState: 'recording' });
+    DeviceEventEmitter.emit('error', { message: 'boom', fatal: true });
+    expect(useRecordingStore.getState().recordingState).toBe('idle');
+    expect(useRecordingStore.getState().errorMsg).toBe('boom');
+  });
+
+  it('dispatches a gnss event into the store', () => {
+    DeviceEventEmitter.emit('gnss', {
+      fixType: '3D fix', accuracy: 8, satellitesUsed: 12, satellitesInView: 24,
+      hasFix: true, lat: 55, lon: 37, alt: 100, speed: 1.5, timestamp: 0,
+    });
+    expect(useRecordingStore.getState().fixType).toBe('3D fix');
+    expect(useRecordingStore.getState().satellitesUsed).toBe(12);
+  });
+
+  it('pushes gnss speed into the smoothing window when not recording (U4)', () => {
+    // recordingState is 'idle' by default after resetStores
+    DeviceEventEmitter.emit('gnss', {
+      fixType: '3D fix', accuracy: 8, satellitesUsed: 12, satellitesInView: 24,
+      hasFix: true, lat: 55, lon: 37, alt: 100, speed: 2.5, timestamp: 0,
+    });
+    expect(useRecordingStore.getState().currentSpeed).toBe(2.5);
+    expect(useRecordingStore.getState().recentSpeeds).toEqual([2.5]);
+  });
+
+  it('does NOT push gnss speed when recording (location event is source of truth)', () => {
+    useRecordingStore.setState({ recordingState: 'recording' });
+    DeviceEventEmitter.emit('gnss', {
+      fixType: '3D fix', accuracy: 8, satellitesUsed: 12, satellitesInView: 24,
+      hasFix: true, lat: 55, lon: 37, alt: 100, speed: 2.5, timestamp: 0,
+    });
+    expect(useRecordingStore.getState().recentSpeeds).toEqual([]);
+  });
+
+  it('remove() tears down all 6 subscriptions', () => {
+    handle.remove();
+    handle = null as never; // prevent double-remove in afterEach
+    // Emit events — they should NOT update the store anymore.
+    DeviceEventEmitter.emit('duration', { elapsedMs: 9999, seq: 99 });
+    expect(useRecordingStore.getState().elapsedMs).toBe(0);
   });
 });

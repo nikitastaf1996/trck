@@ -8,9 +8,10 @@
  * rather than one per setting.
  */
 
-import { useSettingsStore, SETTINGS_SPEC, type SettingKey } from '../../src/store/settingsStore';
+import { useSettingsStore, SETTINGS_SPEC, useSettingsLocked, type SettingKey } from '../../src/store/settingsStore';
 import { useRecordingStore } from '../../src/store/recordingStore';
 import { gpsMock, clearGpsMock, resetStores } from '../helpers';
+import { renderHook } from '../helpers/renderHook';
 
 describe('settingsStore — SETTINGS_SPEC', () => {
   it('defines all 11 settings', () => {
@@ -260,27 +261,38 @@ describe('settingsStore — loadAll', () => {
   });
 });
 
-describe('settingsStore — useSettingsLocked', () => {
+describe('settingsStore — useSettingsLocked hook', () => {
   beforeEach(() => {
     resetStores();
   });
 
-  it('returns false when idle', () => {
-    // We can't easily test the hook without a React host, but we can
-    // verify the underlying logic via the recording state.
+  it('returns false when recordingState is idle', () => {
     useRecordingStore.setState({ recordingState: 'idle' });
-    const recordingState = useRecordingStore.getState().recordingState;
-    const locked = recordingState === 'recording' || recordingState === 'stopping';
-    expect(locked).toBe(false);
+    const { result } = renderHook(() => useSettingsLocked());
+    expect(result.current).toBe(false);
   });
 
-  it('returns true when recording or stopping', () => {
+  it('returns true when recordingState is recording', () => {
     useRecordingStore.setState({ recordingState: 'recording' });
-    let s = useRecordingStore.getState().recordingState;
-    expect(s === 'recording' || s === 'stopping').toBe(true);
+    const { result } = renderHook(() => useSettingsLocked());
+    expect(result.current).toBe(true);
+  });
 
+  it('returns true when recordingState is stopping', () => {
     useRecordingStore.setState({ recordingState: 'stopping' });
-    s = useRecordingStore.getState().recordingState;
-    expect(s === 'recording' || s === 'stopping').toBe(true);
+    const { result } = renderHook(() => useSettingsLocked());
+    expect(result.current).toBe(true);
+  });
+
+  it('updates when the recording state changes', () => {
+    useRecordingStore.setState({ recordingState: 'idle' });
+    const { result, rerender } = renderHook(() => useSettingsLocked());
+    expect(result.current).toBe(false);
+    useRecordingStore.setState({ recordingState: 'recording' });
+    rerender();
+    expect(result.current).toBe(true);
+    useRecordingStore.setState({ recordingState: 'idle' });
+    rerender();
+    expect(result.current).toBe(false);
   });
 });
