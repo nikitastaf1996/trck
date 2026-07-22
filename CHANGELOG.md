@@ -7,6 +7,101 @@ source code have been moved here so the code stays readable while the
 
 ---
 
+## v1.4.0 (2026-07-23) — JS state architecture refactor
+
+### Summary
+
+The previous JS-side state design smeared recording state across `App.tsx`
++ four hooks (`useSettings`, `usePermissions`, `useGnssMonitor`,
+`useRecordingSession`) + two factory files (`useRecordingEventHandlers`,
+`useRecordingControls`) + a forest of mirror refs (`recordingStateRef`,
+`movingMsRef`, `elapsedMsRef`, `isAutoPausedRef`, `autoPauseEnabledRef`,
+`gapDetectionEnabledRef`, `showMovingTimeRef`, `recentSpeedsRef`,
+`lastDurationSeqRef`, `cancelPermissionWaitRef`, `hasAskedBatteryOptRef`,
+`stopTimeoutRef`, `stopHardTimeoutRef`) and a `forceRerender` hammer
+(because `recentSpeedsRef.current.push()` mutates in place and React
+can't see it).
+
+That has been collapsed into **two Zustand stores**:
+
+- `src/store/recordingStore.ts` — single source of truth for the
+  recording state machine, live telemetry, GNSS status, permissions,
+  saved-card snapshot, error message, and the pace-smoothing window.
+  Event handlers read `useRecordingStore.getState()` at call time, which
+  is always fresh — no mirror refs needed.
+- `src/store/settingsStore.ts` — single source of truth for the 11
+  user-facing settings, with one `SETTINGS_SPEC` table describing each
+  setting's type / default / clamp range / lock-while-recording flag /
+  native getter+setter. One generic `toggle(key)` action and one
+  generic `step(key, delta)` action replace the previous 11 near-
+  identical handlers.
+
+`src/hooks/` is gone (6 files, ~2,000 lines deleted). `App.tsx` dropped
+from 496 to ~330 lines and is now mostly wiring: selectors → components.
+The "every file under 500 lines" rule was dropped — it had produced
+files that were split-but-not-abstracted, sharing mutable state through
+back-references (see AGENTS.md → Code organisation principles).
+
+### Files added
+
+| File | Responsibility |
+|---|---|
+| `src/store/recordingStore.ts` | Zustand store: recording state machine + event reducers + permission/start/stop actions. |
+| `src/store/settingsStore.ts` | Zustand store + `SETTINGS_SPEC` table + generic `toggle` / `step` actions. |
+| `__tests__/store/recordingStore.test.ts` | ~45 tests covering event reducers, syncFromNative, handleStart/Stop, permissions. |
+| `__tests__/store/settingsStore.test.ts` | ~25 tests covering SETTINGS_SPEC, toggle/step, lock check, re-entrancy, loadAll. |
+
+### Files deleted
+
+| File | Was |
+|---|---|
+| `src/hooks/useRecordingSession.ts` | 560 lines, 19-param hook, recording state machine. |
+| `src/hooks/useRecordingEventHandlers.ts` | 330 lines, 5 factory functions with 10-20 params each. |
+| `src/hooks/useRecordingControls.ts` | 249 lines, start/stop factories. |
+| `src/hooks/useSettings.ts` | 482 lines, 11 near-identical handlers. |
+| `src/hooks/useGnssMonitor.ts` | 124 lines, GNSS state hook. |
+| `src/hooks/usePermissions.ts` | 162 lines, permission/battery-opt hook. |
+| `__tests__/hooks/useRecordingSession.test.ts` (and 4 others) | ~118 hook tests, replaced by store tests. |
+| `__tests__/helpers/renderHook.tsx` | renderHook helper, no longer needed. |
+
+### Behavioural invariants preserved
+
+All behavioural invariants from the previous design are preserved by
+the store reducers. The `L*` / `U*` / `Task N` tags are now referenced
+in inline comments where they're still load-bearing (mostly in the
+event reducers and the stop fallbacks), but the previous "every fix
+gets a tag, every tag is permanent" discipline has been dropped — see
+AGENTS.md → Code organisation principles #3.
+
+### Why zustand
+
+- ~1 KB dependency, zero boilerplate, no provider component needed.
+- `getState()` is stable, so event handlers wired up once at mount
+  can read fresh state without subscribing — eliminates the mirror-ref
+  pattern entirely.
+- Selectors with `useStore(s => s.foo)` re-render only when the
+  selected slice changes — no `forceRerender` needed for in-place
+  array mutations (the store replaces arrays on update).
+- The store IS the single source of truth — no parallel "ref mirror"
+  system to keep in sync.
+
+### Test count change
+
+- Before: ~315 TS tests + ~80 Kotlin tests = ~395 total.
+- After: 269 TS tests + ~80 Kotlin tests = ~349 total.
+- The drop is from deleting ~118 hook tests (which tested implementation
+  structure rather than user-facing behaviour). The new store tests
+  cover the same behavioural invariants more concisely.
+
+### Build
+
+- `versionCode` and `versionName` will be bumped in a follow-up commit
+  before merging to main (so the APK auto-publish fires once, on the
+  final merged state).
+- One new runtime dependency: `zustand@^5` (~1 KB).
+
+---
+
 ## v1.3.1 (2026-07-02) — Refactor: every file under 500 lines
 
 ### Summary

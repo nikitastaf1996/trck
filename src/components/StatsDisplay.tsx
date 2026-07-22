@@ -42,8 +42,8 @@ export interface StatsDisplayProps {
   showMovingTime: boolean;
   autoPauseEnabled: boolean;
   gapDetectionEnabled: boolean;
-  /** Ref to the recent-speeds window. Mutated in-place by the parent. */
-  recentSpeedsRef: React.MutableRefObject<number[]>;
+  /** Sliding window of recent GPS speeds for smoothed pace display. */
+  recentSpeeds: number[];
 }
 
 /**
@@ -98,21 +98,22 @@ export function StatsDisplay({
   showMovingTime,
   autoPauseEnabled,
   gapDetectionEnabled,
-  recentSpeedsRef,
+  recentSpeeds,
 }: StatsDisplayProps): React.ReactElement {
   const isRecording = recordingState === 'recording';
   const isStopping = recordingState === 'stopping';
 
   const distanceFmt = formatDistance(distance);
 
-  // Smoothed current pace: average of the last few GPS speeds. See App.tsx
-  // comment (lines 987-1010) for the full rationale.
+  // Smoothed current pace: average of the last few GPS speeds.
+  // The window is owned by the recording store (replaced immutably on
+  // each push), so this re-runs whenever it changes — no forceRerender
+  // needed.
   const smoothedSpeed = (() => {
     if (isAutoPaused) return null;
-    const w = recentSpeedsRef.current;
-    if (w.length > 0) {
-      const sum = w.reduce((a, b) => a + b, 0);
-      return sum / w.length;
+    if (recentSpeeds.length > 0) {
+      const sum = recentSpeeds.reduce((a, b) => a + b, 0);
+      return sum / recentSpeeds.length;
     }
     return currentSpeed;
   })();

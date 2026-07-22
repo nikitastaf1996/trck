@@ -1,30 +1,33 @@
 /**
  * trck — a no-frills GPS recorder for runners.
  *
- * UI inspired by minimalist running watches / running apps: large, centered
- * numbers, generous whitespace, one accent color, no clutter.
- *
+ * UI: large centered numbers, generous whitespace, one accent color.
  *   - Big circular START / STOP button at the bottom
  *   - Pre-recording GNSS status pill (always visible, updates live)
  *   - TIME · DISTANCE · PACE · AVG PACE
- *   - Saved-file toast when a recording finishes
+ *   - Saved-file card when a recording finishes
  *
  * Stability / lifecycle: recording is owned by a native foreground service
- * (GpsRecorderService.kt) that survives backgrounding, swipe-away, screen-off,
- * and (best effort) memory kills. START_STICKY + PARTIAL_WAKE_LOCK. Points are
- * flushed to a temp file every 5 s. The JS side is purely informational.
+ * (GpsRecorderService.kt) that survives backgrounding, swipe-away, screen-
+ * off, and (best effort) memory kills. START_STICKY + PARTIAL_WAKE_LOCK.
+ * Points are flushed to a temp file every 5 s. The JS side is reactive
+ * over the recording store — events drive the store, selectors drive the
+ * UI.
  *
- * Architecture (T1 / T2 / T4): the original monolithic App.tsx (~1100 lines)
- * is split into four focused hooks (useSettings, usePermissions,
- * useGnssMonitor, useRecordingSession). App.tsx owns only: recordingState +
- * recordingStateRef (lifted out of useRecordingSession so settingsLocked can be
- * computed BEFORE useSettings — see the "Call-order note" in
- * useRecordingSession), errorMsg, the mount effect ('gnss' subscription +
- * AppState listener), and the JSX. The other 5 event subscriptions and the
- * 2-second polling effect live inside useRecordingSession.
+ * Architecture (v1.4.0): all JS-side state lives in two Zustand stores
+ * (src/store/). App.tsx is purely wiring:
+ *   - mount effect: initial permission check, load settings, start the
+ *     GNSS monitor, sync state from native, subscribe to all 6 native
+ *     events, AppState listener for foreground re-sync, 2 s recording-
+ *     gated poll.
+ *   - JSX: selectors feed the presentational components.
+ * There are no hooks, no mirror refs, no forceRerender, no 19-param
+ * factory functions. The store is the single source of truth — event
+ * handlers read `useRecordingStore.getState()` at call time, which is
+ * always fresh.
  */
 
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect } from 'react';
 import {
   AppState,
   Pressable,
@@ -35,9 +38,7 @@ import {
 } from 'react-native';
 import {
   GpsRecorder,
-  subscribe,
   isNativeModuleAvailable,
-  type GpsGnssEvent,
 } from './src/NativeGpsRecorder';
 // O19: react-native-safe-area-context (the built-in SafeAreaView is
 // unreliable on Android notches).
@@ -58,212 +59,137 @@ import {
 import {
   COLOR,
   pluralRu,
-  type RecordingState,
 } from './src/styles';
 import { appStyles as styles } from './src/styles/appStyles';
-// T1/T2/T4: four focused hooks own disjoint slices of the original monolithic
-// App.tsx state machine. See individual hook files for what each owns.
-import { useSettings } from './src/hooks/useSettings';
-import { usePermissions } from './src/hooks/usePermissions';
-import { useGnssMonitor } from './src/hooks/useGnssMonitor';
-import { useRecordingSession } from './src/hooks/useRecordingSession';
+import {
+  useRecordingStore,
+  subscribeAllNativeEvents,
+} from './src/store/recordingStore';
+import {
+  useSettingsStore,
+  useSettingsLocked,
+} from './src/store/settingsStore';
 
 function App(): React.ReactElement {
-  // recordingState + recordingStateRef are owned by App.tsx (NOT
-  // useRecordingSession) so settingsLocked can be computed BEFORE useSettings
-  // — see useRecordingSession's "Call-order note". U18: the ref is updated
-  // SYNCHRONOUSLY by useRecordingSession so the 'gnss' subscription below
-  // reads the right value.
-  const [recordingState, setRecordingState] = useState<RecordingState>('idle');
-  const recordingStateRef = useRef<RecordingState>('idle');
+  // ---- Recording store selectors ----
+  const recordingState = useRecordingStore((s) => s.recordingState);
+  const elapsedMs = useRecordingStore((s) => s.elapsedMs);
+  const distance = useRecordingStore((s) => s.distance);
+  const currentSpeed = useRecordingStore((s) => s.currentSpeed);
+  const isAutoPaused = useRecordingStore((s) => s.isAutoPaused);
+  const signalLost = useRecordingStore((s) => s.signalLost);
+  const movingMs = useRecordingStore((s) => s.movingMs);
+  const recentSpeeds = useRecordingStore((s) => s.recentSpeeds);
 
-  // errorMsg stays in App.tsx — shared by useSettings, useRecordingSession,
-  // and ErrorCard.
-  const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const fixType = useRecordingStore((s) => s.fixType);
+  const accuracy = useRecordingStore((s) => s.accuracy);
+  const satellitesUsed = useRecordingStore((s) => s.satellitesUsed);
+  const satellitesInView = useRecordingStore((s) => s.satellitesInView);
+  const hasFix = useRecordingStore((s) => s.hasFix);
 
+  const hasPermissions = useRecordingStore((s) => s.hasPermissions);
+  const waitingForPermissions = useRecordingStore((s) => s.waitingForPermissions);
+  const batteryOptDenied = useRecordingStore((s) => s.batteryOptDenied);
+
+  const lastSavedPath = useRecordingStore((s) => s.lastSavedPath);
+  const lastSavedDistance = useRecordingStore((s) => s.lastSavedDistance);
+  const lastSavedMovingMs = useRecordingStore((s) => s.lastSavedMovingMs);
+  const lastSavedElapsedMs = useRecordingStore((s) => s.lastSavedElapsedMs);
+  const lastSavedSettings = useRecordingStore((s) => s.lastSavedSettings);
+
+  const errorMsg = useRecordingStore((s) => s.errorMsg);
+
+  // ---- Settings store selectors ----
+  const postProcessEnabled = useSettingsStore((s) => s.postProcessEnabled);
+  const gaussianSmoothingEnabled = useSettingsStore((s) => s.gaussianSmoothingEnabled);
+  const autoPauseEnabled = useSettingsStore((s) => s.autoPauseEnabled);
+  const gapDetectionEnabled = useSettingsStore((s) => s.gapDetectionEnabled);
+  const showMovingTime = useSettingsStore((s) => s.showMovingTime);
+  const radialDistanceFilterEnabled = useSettingsStore((s) => s.radialDistanceFilterEnabled);
+  const radialDistanceThresholdM = useSettingsStore((s) => s.radialDistanceThresholdM);
+  const timeSamplingEnabled = useSettingsStore((s) => s.timeSamplingEnabled);
+  const timeSamplingN = useSettingsStore((s) => s.timeSamplingN);
+  const douglasPeuckerEnabled = useSettingsStore((s) => s.douglasPeuckerEnabled);
+  const douglasPeuckerEpsilonM = useSettingsStore((s) => s.douglasPeuckerEpsilonM);
+
+  // Derived.
   const isRecording = recordingState === 'recording';
   const isStopping = recordingState === 'stopping';
-  // Locked (read-only) while recording so toggling them mid-recording can't
-  // change the filter / smoothing behaviour halfway through.
-  const settingsLocked = isRecording || isStopping;
+  const settingsLocked = useSettingsLocked();
 
-  // useSettings: 11 settings + 3 mirror refs + 10 handlers + loadSettings.
-  const {
-    postProcessEnabled,
-    gaussianSmoothingEnabled,
-    autoPauseEnabled,
-    gapDetectionEnabled,
-    showMovingTime,
-    radialDistanceFilterEnabled,
-    radialDistanceThresholdM,
-    timeSamplingEnabled,
-    timeSamplingN,
-    douglasPeuckerEnabled,
-    douglasPeuckerEpsilonM,
-    autoPauseEnabledRef,
-    gapDetectionEnabledRef,
-    showMovingTimeRef,
-    handleTogglePostProcess,
-    handleToggleGaussianSmoothing,
-    handleToggleAutoPause,
-    handleToggleGapDetection,
-    handleToggleShowMovingTime,
-    handleToggleRadialDistanceFilter,
-    handleStepperRadialThreshold,
-    handleToggleTimeSampling,
-    handleStepperTimeSamplingN,
-    handleToggleDouglasPeucker,
-    handleStepperDouglasPeuckerEpsilon,
-    loadSettings,
-  } = useSettings(settingsLocked, setErrorMsg);
-
-  // usePermissions: 3 state + 2 refs + 3 setters + 3 handlers + initialCheck.
-  const {
-    hasPermissions,
-    waitingForPermissions,
-    batteryOptDenied,
-    cancelPermissionWaitRef,
-    hasAskedBatteryOptRef,
-    setHasPermissions,
-    setWaitingForPermissions,
-    setBatteryOptDenied,
-    handleCancelPermissionWait,
-    handleRetryBatteryOpt,
-    handleGrantPermissions,
-    initialCheck,
-  } = usePermissions(recordingStateRef);
-
-  // useGnssMonitor: 5 GNSS state + 3 setters + 4 methods.
-  const {
-    fixType,
-    accuracy,
-    satellitesUsed,
-    satellitesInView,
-    hasFix,
-    setFixType,
-    setAccuracy,
-    setHasFix,
-    handleGnssEvent,
-    resetGnss,
-    startMonitor,
-    stopMonitor,
-  } = useGnssMonitor(recordingStateRef);
-
-  // useRecordingSession: recording state machine + 5 subscriptions + 2-second
-  // polling + handleStart / handleStop / syncStateFromNative + pushIdleSpeed
-  // (called by App.tsx's 'gnss' subscription when not recording).
-  const {
-    elapsedMs,
-    distance,
-    currentSpeed,
-    isAutoPaused,
-    signalLost,
-    movingMs,
-    lastSavedPath,
-    lastSavedDistance,
-    lastSavedMovingMs,
-    lastSavedElapsedMs,
-    lastSavedSettings,
-    recentSpeedsRef,
-    handleStart,
-    handleStop,
-    syncStateFromNative,
-    setLastSavedPath,
-    pushIdleSpeed,
-  } = useRecordingSession({
-    recordingState,
-    setRecordingState,
-    recordingStateRef,
-    hasPermissions,
-    setHasPermissions,
-    setWaitingForPermissions,
-    cancelPermissionWaitRef,
-    hasAskedBatteryOptRef,
-    setBatteryOptDenied,
-    autoPauseEnabledRef,
-    gapDetectionEnabledRef,
-    showMovingTimeRef,
-    setErrorMsg,
-    startMonitor,
-    resetGnss,
-    setFixType,
-    setAccuracy,
-    setHasFix,
-  });
-
-  // Mount effect: 'gnss' subscription + AppState listener. The other 5
-  // subscriptions and the 2-second polling are owned by useRecordingSession.
+  // ---- Mount effect: subscribe to events, sync state, AppState listener ----
+  // Subscriptions are set up ONCE; handlers read fresh state from the store
+  // via getState(), so they don't need to be torn down and recreated when
+  // state changes. (The previous design's mirror refs existed precisely to
+  // work around this — they're gone now.)
   useEffect(() => {
     let mounted = true;
+    const recordingStore = useRecordingStore;
+    const settingsStore = useSettingsStore;
 
     (async () => {
       try {
-        const granted = await initialCheck(); // T2: + 800ms wait (U23)
+        const granted = await recordingStore.getState().initialPermissionCheck();
         if (!mounted) return;
-        await loadSettings(); // T1: load all 11 settings from native prefs.
-        // Start the always-on GNSS monitor so the UI shows fix status even
-        // before recording starts.
+        await settingsStore.getState().loadAll();
         if (granted) {
-          try { await startMonitor(); } catch { /* ignore */ }
+          try { await GpsRecorder.startGnssMonitor(); } catch { /* ignore */ }
         }
-        await syncStateFromNative();
+        // Initial sync from native (covers the START_STICKY recovery case
+        // where the service is already recording when JS launches).
+        try {
+          const state = await GpsRecorder.getState();
+          recordingStore.getState().syncFromNative(state);
+        } catch { /* ignore */ }
       } catch {
         // ignore
       }
     })();
 
-    const subs = [
-      subscribe('gnss', (ev: GpsGnssEvent) => {
-        handleGnssEvent(ev);
-        // U4: while NOT recording, push the GNSS speed into the smoothing
-        // window (so the pace display is smoothed). While recording, the
-        // 'location' event is the source of truth — we DON'T push gnss
-        // speeds then to avoid double-counting.
-        if (recordingStateRef.current !== 'recording') {
-          pushIdleSpeed(ev.speed);
-        }
-      }),
-    ];
+    // Subscribe to all 6 native events once. Each handler dispatches into
+    // the recording store.
+    const subs = subscribeAllNativeEvents();
 
     // Re-sync when coming back to foreground.
     const appStateSub = AppState.addEventListener('change', (state) => {
       if (state === 'active') {
-        syncStateFromNative();
-        // U6: .catch() so an unhandled promise rejection doesn't fire if
-        // hasPermissions() throws during cold start.
-        GpsRecorder.hasPermissions().then(async (g) => {
-          setHasPermissions(g);
-          if (g) {
-            try { await startMonitor(); } catch { /* ignore */ }
-          }
-        }).catch(() => { /* will retry on next AppState change */ });
+        GpsRecorder.getState()
+          .then((s) => recordingStore.getState().syncFromNative(s))
+          .catch(() => { /* will retry on next AppState change */ });
+        GpsRecorder.hasPermissions()
+          .then((g) => {
+            recordingStore.getState().setHasPermissions(g);
+            if (g) {
+              GpsRecorder.startGnssMonitor().catch(() => { /* ignore */ });
+            }
+          })
+          .catch(() => { /* will retry on next AppState change */ });
       }
     });
 
     return () => {
       mounted = false;
-      subs.forEach((s) => s.remove());
+      subs.remove();
       appStateSub.remove();
-      // U6: stopMonitor() returns a Promise — use .catch() (try/catch won't
-      // catch async rejections).
-      stopMonitor().catch(() => { /* ignore */ });
+      GpsRecorder.stopGnssMonitor().catch(() => { /* ignore */ });
     };
-  }, [
-    syncStateFromNative,
-    pushIdleSpeed,
-    // T1+T2+T4: all stable — listed only to satisfy exhaustive-deps.
-    loadSettings,
-    initialCheck,
-    startMonitor,
-    stopMonitor,
-    handleGnssEvent,
-    setHasPermissions,
-    recordingStateRef,
-    recentSpeedsRef,
-  ]); // NOTE: recordingState intentionally omitted — see recordingStateRef.
+  }, []);
 
-  // O14: if the native module is not loaded, the fallback object makes every
-  // method a no-op. All hooks above run unconditionally so this is safe.
+  // ---- 2-second recording-gated polling ----
+  // Fallback for when events are dropped (JS backgrounded, bridge stalled).
+  // Only polls while a recording is in progress — no need to cross the
+  // bridge every 2 s while the user is just looking at the idle screen.
+  useEffect(() => {
+    if (recordingState !== 'recording') return;
+    const id = setInterval(() => {
+      GpsRecorder.getState()
+        .then((s) => useRecordingStore.getState().syncFromNative(s))
+        .catch(() => { /* ignore — will retry next tick */ });
+    }, 2000);
+    return () => clearInterval(id);
+  }, [recordingState]);
+
+  // ---- Native-module-missing fallback ----
   if (!isNativeModuleAvailable) {
     return (
       <View style={styles.nativeMissingContainer}>
@@ -304,17 +230,29 @@ function App(): React.ReactElement {
           showMovingTime={showMovingTime}
           autoPauseEnabled={autoPauseEnabled}
           gapDetectionEnabled={gapDetectionEnabled}
-          recentSpeedsRef={recentSpeedsRef}
+          recentSpeeds={recentSpeeds}
         />
 
         {batteryOptDenied && !isRecording && !isStopping && (
-          <BatteryOptBanner onPress={handleRetryBatteryOpt} />
+          <BatteryOptBanner
+            onPress={() => {
+              useRecordingStore.getState().handleRetryBatteryOpt();
+            }}
+          />
         )}
 
         <StartStopButton
           recordingState={recordingState}
-          onStart={handleStart}
-          onStop={handleStop}
+          onStart={() => {
+            useRecordingStore.getState().handleStart().then(({ granted }) => {
+              if (granted) {
+                GpsRecorder.startGnssMonitor().catch(() => { /* ignore */ });
+              }
+            });
+          }}
+          onStop={() => {
+            useRecordingStore.getState().handleStop();
+          }}
         />
 
         {/* Settings section header + "locked" notice */}
@@ -335,7 +273,7 @@ function App(): React.ReactElement {
               : 'Выключена: запись сырых GPS-данных без изменений'
           }
           value={postProcessEnabled}
-          onPress={handleTogglePostProcess}
+          onPress={() => useSettingsStore.getState().toggle('postProcessEnabled')}
           disabled={settingsLocked}
         />
 
@@ -347,7 +285,7 @@ function App(): React.ReactElement {
               : 'Выключено: GPX сохраняется как есть, без финального сглаживания'
           }
           value={gaussianSmoothingEnabled}
-          onPress={handleToggleGaussianSmoothing}
+          onPress={() => useSettingsStore.getState().toggle('gaussianSmoothingEnabled')}
           disabled={settingsLocked}
         />
 
@@ -359,7 +297,7 @@ function App(): React.ReactElement {
               : 'Выключена: запись идёт непрерывно, даже когда вы стоите на месте'
           }
           value={autoPauseEnabled}
-          onPress={handleToggleAutoPause}
+          onPress={() => useSettingsStore.getState().toggle('autoPauseEnabled')}
           disabled={settingsLocked}
         />
 
@@ -371,7 +309,7 @@ function App(): React.ReactElement {
               : 'Выключено: провалы сигнала игнорируются, трек пишётся одним сегментом (как в прежних версиях)'
           }
           value={gapDetectionEnabled}
-          onPress={handleToggleGapDetection}
+          onPress={() => useSettingsStore.getState().toggle('gapDetectionEnabled')}
           disabled={settingsLocked}
         />
 
@@ -383,7 +321,7 @@ function App(): React.ReactElement {
               : 'Выключено: верхний таймер и средний темп считаются по общему времени (включая паузы). Можно менять во время записи.'
           }
           value={showMovingTime}
-          onPress={handleToggleShowMovingTime}
+          onPress={() => useSettingsStore.getState().toggle('showMovingTime')}
         />
 
         {/* ---- Three data-reduction filters (user-requested) ----
@@ -396,56 +334,61 @@ function App(): React.ReactElement {
           subtitleOn={`Включён: точка пропускается, если она ближе ${radialDistanceThresholdM} м к последней сохранённой`}
           subtitleOff="Выключен: каждая принятая точка сохраняется в трек"
           value={radialDistanceFilterEnabled}
-          onToggle={handleToggleRadialDistanceFilter}
+          onToggle={() => useSettingsStore.getState().toggle('radialDistanceFilterEnabled')}
           stepperLabel="Мин. расстояние"
           stepperValue={radialDistanceThresholdM}
           stepperUnit="м"
           stepperMin={0}
           stepperMax={1000}
-          onDecrement={() => handleStepperRadialThreshold(-1)}
-          onIncrement={() => handleStepperRadialThreshold(+1)}
+          onDecrement={() => useSettingsStore.getState().step('radialDistanceThresholdM', -1)}
+          onIncrement={() => useSettingsStore.getState().step('radialDistanceThresholdM', +1)}
           settingsLocked={settingsLocked}
         />
 
-<FilterSettingGroup
+        <FilterSettingGroup
           title="Децимация по времени (на лету)"
           subtitleOn={`Включена: сохраняется каждая ${timeSamplingN}-я точка (≈ раз в ${timeSamplingN} с при 1 Гц)`}
           subtitleOff="Выключена: сохраняются все принятые точки"
           value={timeSamplingEnabled}
-          onToggle={handleToggleTimeSampling}
+          onToggle={() => useSettingsStore.getState().toggle('timeSamplingEnabled')}
           stepperLabel="Шаг N"
           stepperValue={timeSamplingN}
           stepperUnit={pluralRu(timeSamplingN, ['точка', 'точки', 'точек'])}
           stepperMin={1}
           stepperMax={60}
-          onDecrement={() => handleStepperTimeSamplingN(-1)}
-          onIncrement={() => handleStepperTimeSamplingN(+1)}
+          onDecrement={() => useSettingsStore.getState().step('timeSamplingN', -1)}
+          onIncrement={() => useSettingsStore.getState().step('timeSamplingN', +1)}
           settingsLocked={settingsLocked}
         />
 
-<FilterSettingGroup
+        <FilterSettingGroup
           title="Douglas-Peucker (постобработка)"
           subtitleOn={`Включён: трек упрощается, точки ближе ${douglasPeuckerEpsilonM} м от линии сегмента удаляются`}
           subtitleOff="Выключен: GPX сохраняется как есть, без финального упрощения"
           value={douglasPeuckerEnabled}
-          onToggle={handleToggleDouglasPeucker}
+          onToggle={() => useSettingsStore.getState().toggle('douglasPeuckerEnabled')}
           stepperLabel="Эпсилон (допуск)"
           stepperValue={douglasPeuckerEpsilonM}
           stepperUnit="м"
           stepperMin={0}
           stepperMax={500}
-          onDecrement={() => handleStepperDouglasPeuckerEpsilon(-1)}
-          onIncrement={() => handleStepperDouglasPeuckerEpsilon(+1)}
+          onDecrement={() => useSettingsStore.getState().step('douglasPeuckerEpsilonM', -1)}
+          onIncrement={() => useSettingsStore.getState().step('douglasPeuckerEpsilonM', +1)}
           settingsLocked={settingsLocked}
         />
-        {/* CODE_REVIEW_TODO Task 3: over-filter warning — informational only,
-            does NOT block enabling all three. */}
+        {/* Over-filter warning — informational only, does NOT block
+            enabling all three. */}
         {radialDistanceFilterEnabled &&
           timeSamplingEnabled &&
           douglasPeuckerEnabled && <OverFilterWarning />}
 
         {!hasPermissions && (
-          <Pressable style={styles.permissionButton} onPress={handleGrantPermissions}>
+          <Pressable
+            style={styles.permissionButton}
+            onPress={() => {
+              useRecordingStore.getState().handleGrantPermissions();
+            }}
+          >
             <Text style={styles.permissionButtonText}>
               Разрешить доступ к местоположению и уведомлениям
             </Text>
@@ -459,7 +402,7 @@ function App(): React.ReactElement {
             movingMs={lastSavedMovingMs}
             elapsedMs={lastSavedElapsedMs}
             settings={lastSavedSettings}
-            onDismiss={() => setLastSavedPath(null)}
+            onDismiss={() => useRecordingStore.getState().dismissSavedCard()}
           />
         )}
 
@@ -467,7 +410,7 @@ function App(): React.ReactElement {
           <ErrorCard
             message={errorMsg}
             hasPermissions={hasPermissions}
-            onDismiss={() => setErrorMsg(null)}
+            onDismiss={() => useRecordingStore.getState().dismissError()}
             onOpenSettings={() => {
               GpsRecorder.openAppSettings().catch(() => { /* ignore */ });
             }}
@@ -485,7 +428,7 @@ function App(): React.ReactElement {
 
       <PermissionWaitOverlay
         visible={waitingForPermissions}
-        onCancel={handleCancelPermissionWait}
+        onCancel={() => useRecordingStore.getState().handleCancelPermissionWait()}
       />
 
       <StopOverlay visible={isStopping} />
