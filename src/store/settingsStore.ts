@@ -291,36 +291,8 @@ export const useSettingsStore = create<SettingsStoreState>((set, get) => ({
 }));
 
 // ---------------------------------------------------------------------------
-// Convenience hook: typed access to a single setting + its toggle/step fn.
+// Convenience hook: settingsLocked badge for App.tsx.
 // ---------------------------------------------------------------------------
-
-/**
- * Use a single boolean setting. Returns `[value, toggle]`.
- *
- *   const [autoPause, toggleAutoPause] = useToggleSetting('autoPauseEnabled');
- *
- * Re-renders only when this specific setting changes (zustand selector).
- */
-export function useToggleSetting(key: SettingKey): [boolean, () => Promise<void>] {
-  const value = useSettingsStore((s) => s[key] as boolean);
-  const toggle = useSettingsStore((s) => s.toggle);
-  return [value, () => toggle(key)];
-}
-
-/**
- * Use a single numeric setting. Returns `[value, step]`.
- *
- *   const [threshold, stepThreshold] = useNumberSetting('radialDistanceThresholdM');
- *   stepThreshold(+1); // increment
- *   stepThreshold(-1); // decrement
- */
-export function useNumberSetting(
-  key: SettingKey,
-): [number, (delta: number) => Promise<void>] {
-  const value = useSettingsStore((s) => s[key] as number);
-  const step = useSettingsStore((s) => s.step);
-  return [value, (delta: number) => step(key, delta)];
-}
 
 /**
  * Returns true if settings are currently locked (a recording is in
