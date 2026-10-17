@@ -75,8 +75,14 @@ jobs:
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
         with:
-          accept-android-sdk-license: true
+          accept-android-sdk-licenses: true
           log-accepted-android-sdk-licenses: false
+          # The action's default is `tools platform-tools`, but Google removed
+          # the legacy `tools` package from the SDK repository index, so
+          # `sdkmanager tools` now exits 1 and fails the whole step. Only ask
+          # for packages that still exist; the rest are installed explicitly
+          # in the next step.
+          packages: 'platform-tools'
 
       - name: Install Android SDK components
         run: |
