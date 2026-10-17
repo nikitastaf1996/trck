@@ -357,6 +357,16 @@ describe('recordingStore — handleStart', () => {
     clearGpsMock();
   });
 
+  afterEach(() => {
+    // The U12 test below calls handleStop(), which schedules real
+    // stop-fallback timers (1 s / 15 s). They're normally cancelled by the
+    // 'saved' event, which we don't fire here — clear them so they don't
+    // keep Jest's event loop alive (open handles).
+    const s = useRecordingStore.getState();
+    if (s._stopFallbackTimer) clearTimeout(s._stopFallbackTimer);
+    if (s._stopHardFallbackTimer) clearTimeout(s._stopHardFallbackTimer);
+  });
+
   it('returns granted:true and transitions to recording when permissions already granted', async () => {
     gpsMock.hasPermissions.mockResolvedValue(true);
     gpsMock.requestIgnoreBatteryOptimizations.mockResolvedValue(true);

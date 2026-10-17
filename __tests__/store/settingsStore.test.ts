@@ -226,18 +226,25 @@ describe('settingsStore — set (numeric direct set)', () => {
     clearGpsMock();
   });
 
-  it('sets and clamps a numeric value directly', async () => {
+  it('sets a numeric value directly and adopts the confirmed value', async () => {
     gpsMock.setAutoPauseSpeedThresholdMps.mockResolvedValue(0.5);
     await useSettingsStore.getState().set('autoPauseSpeedThresholdMps', 0.5);
     expect(useSettingsStore.getState().autoPauseSpeedThresholdMps).toBe(0.5);
     expect(gpsMock.setAutoPauseSpeedThresholdMps).toHaveBeenCalledWith(0.5);
   });
 
-  it('clamps to min/max on direct set', async () => {
-    gpsMock.getAutoPauseWindowMs.mockResolvedValue(1000);
-    gpsMock.setAutoPauseWindowMs.mockResolvedValue(1000);
-    await useSettingsStore.getState().set('autoPauseWindowMs', 500);
-    expect(useSettingsStore.getState().autoPauseWindowMs).toBe(1000); // clamped to min
+  it('does NOT clamp on direct set (deliberate — free-form text input)', async () => {
+    // The auto-pause values are entered only via AutoPauseTextInput
+    // (free text), and clamping would make the field snap to a boundary
+    // and fight the user's keystrokes. So set() passes the raw value
+    // straight to native and adopts whatever native confirms — even out
+    // of the reference range. Do not "fix" this into clamping
+    // (see the INTENTIONAL comment on settingsStore.set and history
+    // commits 3cf19e4 / 4a98b11).
+    gpsMock.setAutoPauseSpeedThresholdMps.mockResolvedValue(9.9); // > max 5
+    await useSettingsStore.getState().set('autoPauseSpeedThresholdMps', 9.9);
+    expect(gpsMock.setAutoPauseSpeedThresholdMps).toHaveBeenCalledWith(9.9); // not clamped to 5
+    expect(useSettingsStore.getState().autoPauseSpeedThresholdMps).toBe(9.9);
   });
 
   it('skips direct set when locked during recording', async () => {

@@ -196,6 +196,12 @@ export type RecordingStoreState = {
   _stopHardFallbackTimer: ReturnType<typeof setTimeout> | null;
 };
 
+// Incremented at the top of every handleStart(). The permission request
+// that outlives its generation (superseded by a newer START tap) must not
+// touch the shared state: the newer call owns the wait overlay, the
+// hasPermissions flag, and the error surface.
+let startGeneration = 0;
+
 export const useRecordingStore = create<RecordingStoreState>((set, get) => ({
   // ---- Initial state ----
   recordingState: 'idle',
@@ -383,11 +389,14 @@ export const useRecordingStore = create<RecordingStoreState>((set, get) => ({
 
   syncFromNative: (state) => {
     if (state.isRecording) {
-      // H4 fix: if we were 'stopping' but the native side is reporting
-      // isRecording === true again (e.g. the stop intent was lost and
-      // the user started a NEW recording), allow the transition back
-      // to 'recording' — the alternative is to stay stuck in 'stopping'
-      // forever while the native side is actively recording.
+      // If we were 'stopping' but the native side still reports
+      // isRecording === true, KEEP 'stopping'. This is the normal case
+      // during finalization (the service is technically still
+      // "recording" while the GPX is being written) and flipping back
+      // to 'recording' here would make the "Сохранение GPX…" overlay
+      // flicker on every 2 s poll. The 'saved' / 'state' events and
+      // the 1 s / 15 s stop fallbacks in handleStop() are what recover
+      // the UI from 'stopping' — see handleStop.
       const prev = get().recordingState;
       const next: RecordingState = prev === 'stopping' ? prev : 'recording';
       set((s) => ({
@@ -429,8 +438,16 @@ export const useRecordingStore = create<RecordingStoreState>((set, get) => ({
   // ---- Recording control ----
 
   handleStart: async () => {
+    const generation = ++startGeneration;
     set({ errorMsg: null });
-    let granted = await GpsRecorder.hasPermissions();
+    let granted: boolean;
+    try {
+      granted = await GpsRecorder.hasPermissions();
+    } catch {
+      // Bridge error — treat as not granted and go through the request
+      // path below (requestPermissions re-checks on the native side).
+      granted = false;
+    }
     if (!granted) {
       // U1: show a spinner overlay with a Cancel button while the system
       // permission dialog is on screen. requestPermissions() resolves
@@ -438,9 +455,19 @@ export const useRecordingStore = create<RecordingStoreState>((set, get) => ({
       set({ cancelPermissionWait: false, waitingForPermissions: true });
       try {
         granted = await GpsRecorder.requestPermissions();
-      } finally {
-        set({ waitingForPermissions: false });
+      } catch {
+        // Rejected — typically "superseded" by a newer request, or the
+        // dialog launch failed. Either way this call must not drive the
+        // UI any further.
+        granted = false;
       }
+      if (generation !== startGeneration) {
+        // A newer handleStart() has taken over (it owns the wait
+        // overlay and the hasPermissions flag). Bail out WITHOUT
+        // touching any shared state — the newer call drives the UI.
+        return { granted: false };
+      }
+      set({ waitingForPermissions: false });
       // If the user pressed "Отмена" while the dialog was up, bail out
       // without proceeding to startRecording — return to idle silently.
       if (get().cancelPermissionWait) {
@@ -484,7 +511,19 @@ export const useRecordingStore = create<RecordingStoreState>((set, get) => ({
       recordingState: 'recording',
     });
 
-    await GpsRecorder.start();
+    try {
+      await GpsRecorder.start();
+    } catch (e: unknown) {
+      // Native start failed (permission revoked in the race window,
+      // startForegroundService threw, ...). Roll the optimistic
+      // 'recording' state back to idle and surface the error — without
+      // this the UI would show "recording" forever with no native
+      // service behind it (the service's own fatal-error events never
+      // fire because the service was never started).
+      const msg = e instanceof Error ? e.message : String(e);
+      set({ recordingState: 'idle', errorMsg: msg });
+      return { granted: false };
+    }
     return { granted: true };
   },
 
@@ -531,12 +570,27 @@ export const useRecordingStore = create<RecordingStoreState>((set, get) => ({
   // ---- Manual permission / battery-opt retry ----
 
   initialPermissionCheck: async () => {
-    let granted = await GpsRecorder.hasPermissions();
-    if (!granted) {
-      await GpsRecorder.requestPermissions();
-      // U23: 800 ms settle wait so the native side has time to update.
-      await new Promise<void>((r) => setTimeout(() => r(), PERMISSION_SETTLE_MS));
+    let granted = false;
+    try {
       granted = await GpsRecorder.hasPermissions();
+    } catch {
+      granted = false;
+    }
+    if (!granted) {
+      try {
+        await GpsRecorder.requestPermissions();
+      } catch {
+        // Rejected — typically a newer request superseded this one
+        // (the native side rejects the older promise with
+        // "superseded"). The re-check below picks up the real state.
+      }
+      try {
+        // U23: 800 ms settle wait so the native side has time to update.
+        await new Promise<void>((r) => setTimeout(() => r(), PERMISSION_SETTLE_MS));
+        granted = await GpsRecorder.hasPermissions();
+      } catch {
+        granted = false;
+      }
     }
     set({ hasPermissions: granted });
     return granted;

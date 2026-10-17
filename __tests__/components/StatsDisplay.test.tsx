@@ -5,7 +5,6 @@
  * exported from this module.
  */
 import React from 'react';
-import { Text } from 'react-native';
 import {
   StatsDisplay,
   getStatusText,

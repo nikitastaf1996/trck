@@ -361,6 +361,16 @@ class SettingsBridge(private val reactContext: ReactApplicationContext) {
     }
 
     // ---- Auto-pause variables (exposed to user as text inputs) ----
+    // INTENTIONALLY UNCLAMPED — do not "fix" this. These three values
+    // are entered ONLY via the free-form AutoPauseTextInput, and
+    // clamping makes the field snap back to a boundary and fight the
+    // user's keystrokes (the resolved value round-trips into the UI).
+    // Out-of-range values degrade gracefully (0 window → speed-only
+    // pause, huge displacement → speed-dominant, 0 threshold → pause
+    // off) and a "1.2.3" NaN self-heals to the default on the next
+    // read (toDoubleOrNull("NaN") → null → default). History: commits
+    // 3cf19e4 ("no clamp limits") and 4a98b11 ("remove native clamps
+    // for autopause vars"). JS side: settingsStore.set() — same rule.
 
     fun setAutoPauseSpeedThresholdMps(threshold: Double, promise: Promise) {
         try {

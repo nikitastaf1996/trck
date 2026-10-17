@@ -14,9 +14,11 @@ import java.util.TimeZone
  * GpsRecorderService.kt.
  *
  * Every function in this object is pure (no Android service state, no
- * SharedPreferences, no side effects except logging) and main-thread-safe
- * via the shared [ISO_SDF] / [FILENAME_SDF] SimpleDateFormat instances
- * (see L32 comment below).
+ * SharedPreferences, no side effects except logging) and thread-safe:
+ * the [ISO_SDF] / [FILENAME_SDF] SimpleDateFormat instances are
+ * per-thread (ThreadLocal) because finalization runs on a background
+ * executor while the main thread formats points during temp-file
+ * flushes.
  *
  * The service delegates to these helpers via `GpxIO.xxx(...)`. Extracted
  * to shrink GpsRecorderService.kt and make the GPX layer unit-testable.
@@ -25,16 +27,26 @@ object GpxIO {
 
     private const val TAG = "GpsRecorderService"
 
-    // ---- L32: shared SimpleDateFormat instances ----
-    // SimpleDateFormat is not thread-safe, but every call site in
-    // this service runs on the main thread (location callbacks, tick
-    // handlers, lifecycle methods), so a single shared instance per
-    // format is safe. If we ever call from a background thread,
-    // switch to ThreadLocal.
-    val ISO_SDF: SimpleDateFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US).apply {
-        timeZone = TimeZone.getTimeZone("UTC")
+    // ---- Date formatters (thread-safe) ----
+    // SimpleDateFormat is NOT thread-safe. GPX finalization runs on a
+    // background executor (GpxFileSaver.finalizeGpxFile /
+    // recomputeDistanceFromSavedGpx on GpsRecorderService.saveExecutor)
+    // while the main thread formats points on every 5 s temp-file
+    // flush — a single shared instance per format would let the two
+    // threads interleave inside SimpleDateFormat and corrupt the
+    // timestamps (or throw). Each thread gets its own instance via
+    // ThreadLocal; the format string itself never changes, so this is
+    // safe and allocates once per thread.
+    private val ISO_SDF = object : ThreadLocal<SimpleDateFormat>() {
+        override fun initialValue(): SimpleDateFormat =
+            SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US).apply {
+                timeZone = TimeZone.getTimeZone("UTC")
+            }
     }
-    val FILENAME_SDF: SimpleDateFormat = SimpleDateFormat("yyyy-MM-dd_HH-mm-ss", Locale.US)
+    private val FILENAME_SDF = object : ThreadLocal<SimpleDateFormat>() {
+        override fun initialValue(): SimpleDateFormat =
+            SimpleDateFormat("yyyy-MM-dd_HH-mm-ss", Locale.US)
+    }
 
     // ---- L26: append-only temp file ----
     // Closing tags written at the end of every flush so the temp
@@ -298,17 +310,21 @@ object GpxIO {
     }
 
     fun isoTime(ms: Long): String {
-        // L32 fix: use the shared singleton SimpleDateFormat instead
-        // of allocating a new one on every call.
-        return ISO_SDF.format(Date(ms))
+        return ISO_SDF.get().format(Date(ms))
+    }
+
+    /**
+     * Formats a recording start time as the GPX file-name stamp
+     * ("yyyy-MM-dd_HH-mm-ss"). Thread-safe (see [FILENAME_SDF]).
+     */
+    fun formatFileName(ms: Long): String {
+        return FILENAME_SDF.get().format(Date(ms))
     }
 
     fun parseIsoTime(iso: String?): Long? {
-        // L32 fix: use the shared singleton SimpleDateFormat instead
-        // of allocating a new one on every call.
         if (iso == null) return null
         return try {
-            ISO_SDF.parse(iso)?.time
+            ISO_SDF.get().parse(iso)?.time
         } catch (e: Exception) {
             null
         }

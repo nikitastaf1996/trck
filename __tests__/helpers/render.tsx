@@ -26,7 +26,7 @@
  */
 import React from 'react';
 import TestRenderer, { act } from 'react-test-renderer';
-import { Pressable, Text } from 'react-native';
+import { Text } from 'react-native';
 
 type Root = TestRenderer.ReactTestInstance;
 

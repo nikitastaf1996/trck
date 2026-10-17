@@ -10,7 +10,7 @@
 import React from 'react';
 import { Text } from 'react-native';
 import { ErrorBoundary } from '../../src/components/ErrorBoundary';
-import { render, press, allText, allPressables } from '../helpers/render';
+import { render, allText } from '../helpers/render';
 
 function Boom({ shouldThrow }: { shouldThrow: boolean }): React.ReactElement {
   if (shouldThrow) {
@@ -85,7 +85,6 @@ describe('ErrorBoundary', () => {
     // fallback, we throw an object that is NOT an Error instance and has
     // no `.message` property.
     function ThrowNonError(): React.ReactElement {
-      // eslint-disable-next-line no-throw-literal
       throw { notAnError: true };
     }
     const root = render(

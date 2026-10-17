@@ -28,8 +28,6 @@ import java.io.RandomAccessFile
  *     in-memory segmented buffer (under the service's `pointBufferLock`).
  *   - `setBuffer` — callback to replace the in-memory buffer with the
  *     reloaded segments (used by [reloadPointsIntoBuffer]).
- *   - `setAppendState` — callback to reset / sync the append-only state
- *     after a reload or abort.
  *
  * L26 invariant preserved: every flush produces a complete, parseable GPX
  * document. If anything goes wrong (file deleted, IO error, state
@@ -42,7 +40,6 @@ class TempFileBuffer(
     private val service: GpsRecorderService,
     private val segmentsSnapshot: () -> List<List<GpsPoint>>,
     private val setBuffer: (List<List<GpsPoint>>, Int) -> Unit,
-    private val setAppendState: (initialized: Boolean, flushedSegments: Int, flushedCurrentSize: Int) -> Unit,
 ) {
 
     companion object {
@@ -298,7 +295,6 @@ class TempFileBuffer(
                 )
                 setBuffer(emptyList(), 0)
                 resetState()
-                setAppendState(false, 0, 0)
                 return
             }
             if (parseResult.skippedPointCount > 0) {
@@ -313,7 +309,6 @@ class TempFileBuffer(
                 Log.w(tag, "reloadPointsIntoBuffer: no <trkseg> blocks in temp file")
                 setBuffer(emptyList(), 0)
                 resetState()
-                setAppendState(false, 0, 0)
                 return
             }
             // Convert GpxIO.GpxTrkPt → GpsPoint (same fields) and pass to
