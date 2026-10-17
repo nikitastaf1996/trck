@@ -322,18 +322,22 @@ class GpsRecorderModule(private val reactContext: ReactApplicationContext) :
                 putBoolean("signalLost", sigLost)
                 putDouble("movingMs", movMs.toDouble())
 
-                val lastLat = prefs.getString("last_lat", null)
-                val lastLon = prefs.getString("last_lon", null)
+                // toDoubleOrNull (not toDouble): a single corrupt value
+                // must not reject the whole getState() call — that would
+                // silently kill the JS 2 s fallback polling, which is
+                // the only safety net when events are dropped.
+                val lastLat = prefs.getString("last_lat", null)?.toDoubleOrNull()
+                val lastLon = prefs.getString("last_lon", null)?.toDoubleOrNull()
                 if (lastLat != null && lastLon != null) {
                     val fix = Arguments.createMap().apply {
-                        putDouble("lat", lastLat.toDouble())
-                        putDouble("lon", lastLon.toDouble())
-                        val alt = prefs.getString("last_alt", "")?.takeIf { it.isNotEmpty() }
-                        if (alt != null) putDouble("alt", alt.toDouble()) else putNull("alt")
-                        val spd = prefs.getString("last_speed", "")?.takeIf { it.isNotEmpty() }
-                        if (spd != null) putDouble("speed", spd.toDouble()) else putNull("speed")
-                        val acc = prefs.getString("last_accuracy", "")?.takeIf { it.isNotEmpty() }
-                        if (acc != null) putDouble("accuracy", acc.toDouble()) else putNull("accuracy")
+                        putDouble("lat", lastLat)
+                        putDouble("lon", lastLon)
+                        val alt = prefs.getString("last_alt", "")?.takeIf { it.isNotEmpty() }?.toDoubleOrNull()
+                        if (alt != null) putDouble("alt", alt) else putNull("alt")
+                        val spd = prefs.getString("last_speed", "")?.takeIf { it.isNotEmpty() }?.toDoubleOrNull()
+                        if (spd != null) putDouble("speed", spd) else putNull("speed")
+                        val acc = prefs.getString("last_accuracy", "")?.takeIf { it.isNotEmpty() }?.toDoubleOrNull()
+                        if (acc != null) putDouble("accuracy", acc) else putNull("accuracy")
                         putString("fixType", fixType)
                         putDouble("distance", distance)
                         putDouble("timestamp", prefs.getLong("last_time_ms", 0L).toDouble())

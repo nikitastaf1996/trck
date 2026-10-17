@@ -19,7 +19,7 @@ describe('COLOR palette', () => {
   const HEX_RE = /^#[0-9a-fA-F]{3,8}$/;
 
   it('every entry is a hex color string', () => {
-    for (const [key, value] of Object.entries(COLOR)) {
+    for (const [_key, value] of Object.entries(COLOR)) {
       expect(typeof value).toBe('string');
       expect(value).toMatch(HEX_RE);
       // Sanity: keep the test name meaningful when one fails.

@@ -202,7 +202,6 @@ describe('subscribe', () => {
     const handler = jest.fn();
     // Cast to bypass the typed signature — we're explicitly testing
     // the runtime behavior with an unknown event name.
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     expect(() => subscribe('unknown-event' as any, handler)).not.toThrow();
   });
 });

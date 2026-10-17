@@ -66,7 +66,6 @@ class GpsRecorderService : Service(), LocationListener {
                 pointCount = totalPoints
             }
         },
-        setAppendState = { init, segs, size -> },
     )
     internal val gpxFileSaver = GpxFileSaver(
         service = this,
@@ -461,7 +460,11 @@ class GpsRecorderService : Service(), LocationListener {
             var finalDistanceM: Double = -1.0
             try {
                 savedFilePath = gpxFileSaver.finalizeGpxFile()
-                savedOk = savedFilePath.isNotEmpty()
+                // Non-empty is NOT sufficient: finalizeGpxFile returns
+                // "Save failed: …" when even the cache-dir fallback
+                // threw. Treating that as a save would make the UI show
+                // a "GPX СОХРАНЁН" card for a file that does not exist.
+                savedOk = savedFilePath.isNotEmpty() && !savedFilePath.startsWith("Save failed:")
                 // Recompute the final distance from the SAVED GPX file so
                 // the value the user sees matches the track length Strava
                 // / other importers will compute (matters most when

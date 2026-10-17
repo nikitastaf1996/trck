@@ -95,10 +95,68 @@ AGENTS.md → Code organisation principles #3.
 
 ### Build
 
-- `versionCode` and `versionName` will be bumped in a follow-up commit
-  before merging to main (so the APK auto-publish fires once, on the
-  final merged state).
+- `versionCode` 5 → 6 and `versionName` 1.3.1 → 1.4.0 (bumped here, on
+  the final state, as this entry's original note intended — so the APK
+  auto-publish fires once for v1.4.0).
 - One new runtime dependency: `zustand@^5` (~1 KB).
+
+### Code review fixes (2026-10-17)
+
+A full code-review pass. **No GUI or outward behaviour change** — the
+fixes are internal correctness, safety, and test/lint hygiene.
+
+**Kotlin (Android)**
+- `GpxIO`: the `SimpleDateFormat` instances are now `ThreadLocal` (the
+  shared, mutable formatters were a data race under concurrent GPX
+  reads/writes) and the ISO formatter is pinned to UTC. Added
+  `formatFileName(ms)` as the single filename-stamp helper.
+- `GpxFileSaver`: uses `GpxIO.formatFileName()`; clears the stale
+  `KEY_LAST_SAVED_URI` before writing a cache fallback so a failed
+  MediaStore save can't leave a dangling URI.
+- `GpsRecorderService`: the "saved" success check now excludes the
+  `"Save failed:"` sentinel, so a failed save is no longer reported to
+  the UI as success.
+- `GpsRecorderModule.getState()`: parses the last-fix values with
+  `toDoubleOrNull()` instead of `toDouble()` — one corrupt pref can no
+  longer reject the whole `getState()` call (which would have silently
+  killed the JS 2 s fallback polling).
+- `TempFileBuffer`: removed the dead `setAppendState` callback (the
+  service passed a no-op; the buffer already manages that state).
+- `SettingsBridge`: the three auto-pause setters are **intentionally
+  unclamped** — this was confirmed as a deliberate design (free-form
+  text input; clamping made the field snap to a boundary and fight the
+  user's keystrokes) and documented so it isn't "fixed" later. See the
+  "INTENTIONALLY UNCLAMPED" comment and history commits `3cf19e4` /
+  `4a98b11`.
+
+**JS (React Native)**
+- `settingsStore.set()`: fixed the no-op revert-on-error (it read the
+  already-optimistic value). Kept and documented the deliberate no-clamp
+  behaviour for the auto-pause values (free-form text input).
+- `recordingStore.handleStart()`: made start race-safe (a superseded
+  start no longer clobbers a newer session) and wrapped `start()` in
+  try/catch so a failure returns to `idle` with an error instead of
+  getting stuck in `recording`.
+- `recordingStore.initialPermissionCheck()`: made reject-proof.
+- `App.tsx`: mount now runs `loadAll()` first and each init step is
+  independently try/caught, so one failure can't skip the rest.
+- `AutoPauseTextInput`: local text now re-syncs when the store value
+  changes from outside (loadAll / revert-on-error) without fighting free
+  typing or a `1.2.3` NaN typo.
+- `NativeGpsRecorder.ts`: typed the `removeListeners` fallback to match
+  its declared signature.
+
+**Tests / lint / tooling**
+- Fixed the pre-existing ESLint failure (49 errors / 8 warnings): added
+  a jest-env override for `jest.setup.js` / `jest.config.js`, removed
+  stale `eslint-disable` comments, and cleaned up unused test imports.
+- `recordingStore.test.ts`: the `handleStart` block now clears the real
+  stop-fallback timers in `afterEach` (fixes the Jest "did not exit"
+  open-handles warning). `settingsStore.test.ts` now locks in the
+  deliberate no-clamp `set()` behaviour.
+
+After this pass: `npx tsc --noEmit` clean · `npx jest --ci` 286/286 with
+no open handles · `npx eslint .` clean (0 errors, 0 warnings).
 
 ---
 

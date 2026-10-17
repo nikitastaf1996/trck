@@ -70,7 +70,7 @@ class GpxFileSaver(
             return ""
         }
 
-        val timestamp = GpxIO.FILENAME_SDF.format(Date(startTimeMs()))
+        val timestamp = GpxIO.formatFileName(startTimeMs())
         val fileName = "trck_$timestamp.gpx"
 
         val rawGpxContent = GpxIO.serializeSegmentsToGpx("GPS Recording $timestamp", segmentsSnapshot())
@@ -108,6 +108,16 @@ class GpxFileSaver(
             }
         } catch (e: Exception) {
             Log.e(tag, "finalizeGpxFile failed; falling back to cache", e)
+            // This save did NOT go through MediaStore, so the persisted
+            // KEY_LAST_SAVED_URI (set by a previous saveViaMediaStore) is
+            // now stale. Clear it so recomputeDistanceFromSavedGpx
+            // resolves the ACTUAL file via its path instead of opening
+            // the previous save through the old MediaStore URI.
+            try {
+                service.getSharedPreferences(StateRepository.PREFS_NAME, Context.MODE_PRIVATE).edit()
+                    .remove(StateRepository.KEY_LAST_SAVED_URI)
+                    .apply()
+            } catch (_: Exception) { /* best-effort */ }
             try {
                 val f = File(service.externalCacheDir ?: service.cacheDir, fileName)
                 FileOutputStream(f).use { it.write(rawBytes) }

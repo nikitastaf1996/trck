@@ -12,7 +12,6 @@ import { NativeModules } from 'react-native';
  * Every test that asserts on native-module interactions should call
  * `clearGpsMock()` at the top of its `beforeEach`.
  */
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
 export const gpsMock = (globalThis as any).__gpsRecorderMock as {
   [k: string]: jest.Mock;
 };
@@ -91,18 +90,15 @@ export function clearGpsMock(): void {
 
 /** Force the native module to look "not loaded" by deleting NativeModules.GpsRecorder. */
 export function hideNativeModule(): void {
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   (globalThis as any).__gpsRecorderCache = NativeModules.GpsRecorder;
   delete NativeModules.GpsRecorder;
 }
 
 /** Restore NativeModules.GpsRecorder after a hideNativeModule() call. */
 export function restoreNativeModule(): void {
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const cache = (globalThis as any).__gpsRecorderCache;
   if (cache !== undefined) {
     NativeModules.GpsRecorder = cache as typeof NativeModules.GpsRecorder;
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     delete (globalThis as any).__gpsRecorderCache;
   }
 }
@@ -128,9 +124,7 @@ export function flushMicrotasks(): Promise<void> {
 export function resetStores(): void {
   // Lazy require so the helpers file doesn't pull in the stores (and
   // therefore the native module mock) at import time.
-  // eslint-disable-next-line @typescript-eslint/no-require-imports
   const { useRecordingStore } = require('../../src/store/recordingStore');
-  // eslint-disable-next-line @typescript-eslint/no-require-imports
   const { useSettingsStore } = require('../../src/store/settingsStore');
   useRecordingStore.setState({
     recordingState: 'idle',

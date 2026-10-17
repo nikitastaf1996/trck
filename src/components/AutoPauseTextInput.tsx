@@ -4,7 +4,7 @@
  * store when text is non-empty. No clamp limits.
  */
 
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { StyleSheet, Text, TextInput, View } from 'react-native';
 import { COLOR } from '../styles';
 
@@ -26,6 +26,34 @@ export function AutoPauseTextInput({
   onChange,
 }: AutoPauseTextInputProps): React.ReactElement {
   const [text, setText] = useState(displayValue ? displayValue(value) : String(value));
+
+  // Keep the local text in sync with the store value when it changes
+  // OUTSIDE of a keystroke:
+  //   - loadAll() replacing the spec default (the field's initial state)
+  //     with the persisted value,
+  //   - a failed native-set reverting to the previous value.
+  // Without this the field would keep showing the spec default even after
+  // loadAll filled the store with the real persisted value.
+  //
+  // While typing this is a no-op: set() deliberately does NOT clamp
+  // (free-form text input — see the INTENTIONAL comment on
+  // settingsStore.set), so the store value equals the parsed local text
+  // and we keep `prev` untouched (cursor stays put). We also skip
+  // non-finite values: a "1.2.3" typo briefly makes the store NaN, and
+  // rewriting would replace the user's in-progress text with "NaN". The
+  // field keeps showing what the user typed until they fix it; the value
+  // self-heals to the default on the next loadAll.
+  useEffect(() => {
+    if (!Number.isFinite(value)) return; // NaN typo — keep the user's text
+    setText((prev) => {
+      const parsed = prev === '' ? NaN : Number(prev);
+      return Number.isFinite(parsed) && parsed === value
+        ? prev
+        : displayValue
+          ? displayValue(value)
+          : String(value);
+    });
+  }, [value, displayValue]);
 
   return (
     <View style={[styles.row, disabled && styles.rowDisabled]}>

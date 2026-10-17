@@ -132,22 +132,29 @@ function App(): React.ReactElement {
     const settingsStore = useSettingsStore;
 
     (async () => {
+      // Load settings FIRST — it is independent of the permission flow
+      // and must run even if the permission check below rejects (e.g.
+      // the mount-time request gets superseded by a later START tap);
+      // otherwise the UI would silently keep the spec defaults while
+      // native uses the persisted values.
       try {
-        const granted = await recordingStore.getState().initialPermissionCheck();
-        if (!mounted) return;
         await settingsStore.getState().loadAll();
-        if (granted) {
-          try { await GpsRecorder.startGnssMonitor(); } catch { /* ignore */ }
-        }
-        // Initial sync from native (covers the START_STICKY recovery case
-        // where the service is already recording when JS launches).
-        try {
-          const state = await GpsRecorder.getState();
-          recordingStore.getState().syncFromNative(state);
-        } catch { /* ignore */ }
-      } catch {
-        // ignore
+      } catch { /* spec defaults remain */ }
+      if (!mounted) return;
+      let granted = false;
+      try {
+        granted = await recordingStore.getState().initialPermissionCheck();
+      } catch { /* initialPermissionCheck is reject-proof — defensive */ }
+      if (!mounted) return;
+      if (granted) {
+        try { await GpsRecorder.startGnssMonitor(); } catch { /* ignore */ }
       }
+      // Initial sync from native (covers the START_STICKY recovery case
+      // where the service is already recording when JS launches).
+      try {
+        const state = await GpsRecorder.getState();
+        recordingStore.getState().syncFromNative(state);
+      } catch { /* ignore */ }
     })();
 
     // Subscribe to all 6 native events once. Each handler dispatches into

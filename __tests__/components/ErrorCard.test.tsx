@@ -9,7 +9,6 @@
  *   - The "open settings" button calls onOpenSettings when pressed.
  */
 import React from 'react';
-import { Text } from 'react-native';
 import { ErrorCard } from '../../src/components/ErrorCard';
 import { render, press, allText, allPressables } from '../helpers/render';
 

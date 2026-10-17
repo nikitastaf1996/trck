@@ -45,8 +45,12 @@ type ToggleSpec = {
 };
 
 /**
- * A numeric setting with a clamp range, e.g. `radialDistanceThresholdM`.
- *  - `min` / `max`: clamp range, matches the native side.
+ * A numeric setting with a documented range, e.g. `radialDistanceThresholdM`.
+ *  - `min` / `max`: range. `step()` (the ± stepper) clamps to it, and the
+ *    native side enforces the same range for most numeric settings. For the
+ *    three auto-pause keys it is ADVISORY only — `set()` deliberately does
+ *    NOT clamp them (they are entered via free-form text; see the
+ *    "INTENTIONAL" comment on `set`).
  *  - `locked`: cannot be changed while a recording is in progress.
  */
 type NumberSpec = {
@@ -154,6 +158,10 @@ export const SETTINGS_SPEC = {
   },
   // Auto-pause variables — exposed to user as text inputs (not +/−) so
   // decimal values like 0.35 can be typed directly.
+  // The three auto-pause variables below: their `min`/`max` are for
+  // reference only. `set()` deliberately does NOT clamp them (free-form
+  // text input — see the "INTENTIONAL" comment on `set()`); `step()` is
+  // unused for these because they are edited via AutoPauseTextInput.
   autoPauseSpeedThresholdMps: {
     type: 'number',
     default: 0.35,
@@ -324,17 +332,35 @@ export const useSettingsStore = create<SettingsStoreState>((set, get) => ({
     if (get()._updating) return;
     set({ _updating: true });
 
-    const clamped = value; // no clamp — user can enter any value
-    if (clamped === get()[key]) {
+    const current = get()[key] as number;
+    // INTENTIONAL: no min/max clamp and no NaN filter here — do NOT
+    // "fix" this. These auto-pause values are entered ONLY through the
+    // free-form AutoPauseTextInput (never a ± stepper), and clamping
+    // makes the field snap to a boundary and fight the user's
+    // keystrokes the moment an entry exceeds max / drops below min
+    // (the confirmed value round-trips back and rewrites the field).
+    // Out-of-range values degrade gracefully — 0 window → speed-only
+    // pause, huge displacement → speed-dominant, 0 threshold → pause
+    // effectively off — and a mistyped "1.2.3" (NaN) only disables
+    // pausing for that session (every x < NaN comparison is false);
+    // the next loadAll self-heals to the spec default via
+    // toFloatOrNull("NaN") → null → default. History: commits
+    // 3cf19e4 ("no clamp limits") and 4a98b11 ("remove native clamps
+    // for autopause vars"). step() still clamps — for a stepper that
+    // is the natural contract.
+    const next = value;
+    if (next === current) {
       set({ _updating: false });
       return;
     }
-    set({ [key]: clamped } as Partial<SettingsStoreState>); // optimistic
+    set({ [key]: next } as Partial<SettingsStoreState>); // optimistic
     try {
-      const confirmed = await spec.nativeSet(clamped);
+      const confirmed = await spec.nativeSet(next);
       set({ [key]: confirmed } as Partial<SettingsStoreState>);
     } catch (e: unknown) {
-      set({ [key]: get()[key] } as Partial<SettingsStoreState>); // revert
+      // Revert to the value from BEFORE this call. Reading get()[key]
+      // here would yield the optimistic value — a no-op "revert".
+      set({ [key]: current } as Partial<SettingsStoreState>);
       useRecordingStore.getState().setError(e instanceof Error ? e.message : String(e));
     } finally {
       set({ _updating: false });

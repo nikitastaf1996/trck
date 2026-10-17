@@ -6,7 +6,6 @@
  * lost intervals) or elapsedMs (wall-clock).
  */
 import React from 'react';
-import { Text } from 'react-native';
 import { SavedCard, selectPaceTimeMs } from '../../src/components/SavedCard';
 import { render, press, allText, allPressables } from '../helpers/render';
 

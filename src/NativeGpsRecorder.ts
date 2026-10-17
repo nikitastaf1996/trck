@@ -230,7 +230,7 @@ const NativeGpsRecorder = (NativeModules.GpsRecorder as GpsRecorderNativeType) |
   setAutoPauseWindowMs: async (_windowMs: number) => 10000,
   getAutoPauseWindowMs: async () => 10000,
   addListener: () => {},
-  removeListeners: () => {},
+  removeListeners: (_count: number) => {},
 };
 
 export const GpsRecorder = {
